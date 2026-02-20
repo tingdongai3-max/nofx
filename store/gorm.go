@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/glebarez/sqlite" // Pure-Go SQLite (no CGO required)
 	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -49,6 +49,27 @@ func InitGorm(dbPath string) (*gorm.DB, error) {
 	return db, nil
 }
 
+// InitGormPostgresFromURL initializes GORM with PostgreSQL using a connection URL (e.g. DATABASE_URL from Railway)
+func InitGormPostgresFromURL(databaseURL string) (*gorm.DB, error) {
+	db, err := gorm.Open(postgres.Open(databaseURL), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+		NowFunc: func() time.Time {
+			return time.Now().UTC()
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to open PostgreSQL (DATABASE_URL): %w", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	sqlDB.SetMaxOpenConns(25)
+	sqlDB.SetMaxIdleConns(5)
+	gormDB = db
+	return db, nil
+}
+
 // InitGormPostgres initializes GORM with PostgreSQL
 func InitGormPostgres(host string, port int, user, password, dbname, sslmode string) (*gorm.DB, error) {
 	dsn := fmt.Sprintf(
@@ -80,8 +101,12 @@ func InitGormPostgres(host string, port int, user, password, dbname, sslmode str
 }
 
 // InitGormWithConfig initializes GORM with provided configuration
-// Uses DBConfig from driver.go
+// Supports DatabaseURL (Railway DATABASE_URL) or DBConfig
 func InitGormWithConfig(cfg DBConfig) (*gorm.DB, error) {
+	// DATABASE_URL takes precedence (Railway one-click deploy)
+	if cfg.DatabaseURL != "" {
+		return InitGormPostgresFromURL(cfg.DatabaseURL)
+	}
 	switch cfg.Type {
 	case DBTypeSQLite:
 		return InitGorm(cfg.Path)

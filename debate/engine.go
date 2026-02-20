@@ -302,18 +302,24 @@ func (e *DebateEngine) buildMarketContext(session *store.DebateSessionWithDetail
 		return nil, fmt.Errorf("no candidate coins found")
 	}
 
-	// Get timeframe settings
 	timeframes := config.Indicators.Klines.SelectedTimeframes
 	primaryTimeframe := config.Indicators.Klines.PrimaryTimeframe
-	klineCount := config.Indicators.Klines.PrimaryCount
-	if klineCount <= 0 {
-		klineCount = 50
+	if primaryTimeframe == "" {
+		primaryTimeframe = timeframes[0]
+	}
+	counts := make(map[string]int)
+	for _, tf := range timeframes {
+		if n, ok := config.Indicators.Klines.TimeframeCounts[tf]; ok && n > 0 {
+			counts[tf] = n
+		} else {
+			counts[tf] = market.DefaultCountForTimeframe(tf)
+		}
 	}
 
-	// Fetch market data for each candidate
+	opts := kernel.IndicatorParamsFromConfig(config.Indicators)
 	marketDataMap := make(map[string]*market.Data)
 	for _, coin := range candidates {
-		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, klineCount)
+		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, counts, opts)
 		if err != nil {
 			logger.Warnf("Failed to get market data for %s: %v", coin.Symbol, err)
 			continue
@@ -960,8 +966,8 @@ func (e *DebateEngine) ExecuteConsensus(sessionID string, executor TraderExecuto
 		return fmt.Errorf("action '%s' does not require execution", action)
 	}
 
-	// Get current market price
-	marketData, err := market.Get(session.Symbol)
+	// Get current market price (nil opts => default indicator params)
+	marketData, err := market.Get(session.Symbol, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get market data: %w", err)
 	}

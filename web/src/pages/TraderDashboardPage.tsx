@@ -610,12 +610,21 @@ export function TraderDashboardPage({
                                                 </tr>
                                             </thead>
                                             <tbody>
-                                                {paginatedPositions.map((pos, i) => (
+                                                {paginatedPositions.map((pos, i) => {
+                                                    const entryPrice = Number(pos.entry_price) || 0
+                                                    const markPrice = Number(pos.mark_price) || 0
+                                                    const quantity = Number(pos.quantity) || 0
+                                                    const unrealizedPnl = Number(pos.unrealized_pnl) || 0
+                                                    const leverage = Number(pos.leverage) || 0
+                                                    const liquidationPrice = Number(pos.liquidation_price) || 0
+                                                    const side = (pos.side ?? 'long').toString().toLowerCase()
+                                                    const symbol = (pos.symbol ?? '').toString()
+                                                    return (
                                                     <tr
-                                                        key={i}
+                                                        key={`${symbol}-${side}-${i}`}
                                                         className="border-b border-white/5 last:border-0 transition-all hover:bg-white/5 cursor-pointer group/row"
                                                         onClick={() => {
-                                                            setSelectedChartSymbol(pos.symbol)
+                                                            setSelectedChartSymbol(symbol)
                                                             setChartUpdateKey(Date.now())
                                                             if (chartSectionRef.current) {
                                                                 chartSectionRef.current.scrollIntoView({
@@ -626,13 +635,13 @@ export function TraderDashboardPage({
                                                         }}
                                                     >
                                                         <td className="px-1 py-3 font-mono font-semibold whitespace-nowrap text-left text-nofx-text-main group-hover/row:text-white transition-colors">
-                                                            {pos.symbol}
+                                                            {symbol}
                                                         </td>
                                                         <td className="px-1 py-3 whitespace-nowrap text-center">
                                                             <span
-                                                                className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${pos.side === 'long' ? 'bg-nofx-green/10 text-nofx-green shadow-[0_0_8px_rgba(14,203,129,0.2)]' : 'bg-nofx-red/10 text-nofx-red shadow-[0_0_8px_rgba(246,70,93,0.2)]'}`}
+                                                                className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${side === 'long' ? 'bg-nofx-green/10 text-nofx-green shadow-[0_0_8px_rgba(14,203,129,0.2)]' : 'bg-nofx-red/10 text-nofx-red shadow-[0_0_8px_rgba(246,70,93,0.2)]'}`}
                                                             >
-                                                                {t(pos.side === 'long' ? 'long' : 'short', language)}
+                                                                {t(side === 'long' ? 'long' : 'short', language)}
                                                             </span>
                                                         </td>
                                                         <td className="px-1 py-3 whitespace-nowrap text-center">
@@ -640,13 +649,13 @@ export function TraderDashboardPage({
                                                                 type="button"
                                                                 onClick={(e) => {
                                                                     e.stopPropagation()
-                                                                    handleClosePosition(pos.symbol, pos.side.toUpperCase())
+                                                                    handleClosePosition(symbol, side.toUpperCase())
                                                                 }}
-                                                                disabled={closingPosition === pos.symbol}
+                                                                disabled={closingPosition === symbol}
                                                                 className="inline-flex items-center gap-1 px-2 py-1 rounded text-[10px] font-semibold transition-all hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed mx-auto bg-nofx-red/10 text-nofx-red border border-nofx-red/30 hover:bg-nofx-red/20"
                                                                 title={language === 'zh' ? '平仓' : 'Close Position'}
                                                             >
-                                                                {closingPosition === pos.symbol ? (
+                                                                {closingPosition === symbol ? (
                                                                     <Loader2 className="w-3 h-3 animate-spin" />
                                                                 ) : (
                                                                     <LogOut className="w-3 h-3" />
@@ -654,23 +663,24 @@ export function TraderDashboardPage({
                                                                 {language === 'zh' ? '平仓' : 'Close'}
                                                             </button>
                                                         </td>
-                                                        <td className="px-1 py-3 font-mono whitespace-nowrap text-right text-nofx-text-main hidden md:table-cell">{formatPrice(pos.entry_price)}</td>
-                                                        <td className="px-1 py-3 font-mono whitespace-nowrap text-right text-nofx-text-main hidden md:table-cell">{formatPrice(pos.mark_price)}</td>
-                                                        <td className="px-1 py-3 font-mono whitespace-nowrap text-right text-nofx-text-main">{formatQuantity(pos.quantity)}</td>
-                                                        <td className="px-1 py-3 font-mono font-bold whitespace-nowrap text-right text-nofx-text-main hidden md:table-cell">{(pos.quantity * pos.mark_price).toFixed(2)}</td>
-                                                        <td className="px-1 py-3 font-mono whitespace-nowrap text-center text-nofx-gold hidden md:table-cell">{pos.leverage}x</td>
+                                                        <td className="px-1 py-3 font-mono whitespace-nowrap text-right text-nofx-text-main hidden md:table-cell">{formatPrice(entryPrice)}</td>
+                                                        <td className="px-1 py-3 font-mono whitespace-nowrap text-right text-nofx-text-main hidden md:table-cell">{formatPrice(markPrice)}</td>
+                                                        <td className="px-1 py-3 font-mono whitespace-nowrap text-right text-nofx-text-main">{formatQuantity(quantity)}</td>
+                                                        <td className="px-1 py-3 font-mono font-bold whitespace-nowrap text-right text-nofx-text-main hidden md:table-cell">{(quantity * markPrice).toFixed(2)}</td>
+                                                        <td className="px-1 py-3 font-mono whitespace-nowrap text-center text-nofx-gold hidden md:table-cell">{leverage}x</td>
                                                         <td className="px-1 py-3 font-mono whitespace-nowrap text-right">
                                                             <span
-                                                                className={`font-bold ${pos.unrealized_pnl >= 0 ? 'text-nofx-green shadow-nofx-green' : 'text-nofx-red shadow-nofx-red'}`}
-                                                                style={{ textShadow: pos.unrealized_pnl >= 0 ? '0 0 10px rgba(14,203,129,0.3)' : '0 0 10px rgba(246,70,93,0.3)' }}
+                                                                className={`font-bold ${unrealizedPnl >= 0 ? 'text-nofx-green shadow-nofx-green' : 'text-nofx-red shadow-nofx-red'}`}
+                                                                style={{ textShadow: unrealizedPnl >= 0 ? '0 0 10px rgba(14,203,129,0.3)' : '0 0 10px rgba(246,70,93,0.3)' }}
                                                             >
-                                                                {pos.unrealized_pnl >= 0 ? '+' : ''}
-                                                                {pos.unrealized_pnl.toFixed(2)}
+                                                                {unrealizedPnl >= 0 ? '+' : ''}
+                                                                {unrealizedPnl.toFixed(2)}
                                                             </span>
                                                         </td>
-                                                        <td className="px-1 py-3 font-mono whitespace-nowrap text-right text-nofx-text-muted hidden md:table-cell">{formatPrice(pos.liquidation_price)}</td>
+                                                        <td className="px-1 py-3 font-mono whitespace-nowrap text-right text-nofx-text-muted hidden md:table-cell">{formatPrice(liquidationPrice)}</td>
                                                     </tr>
-                                                ))}
+                                                    )
+                                                })}
                                             </tbody>
                                         </table>
                                     </div>

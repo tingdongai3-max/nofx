@@ -336,9 +336,6 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 
 	timeframes := config.Indicators.Klines.SelectedTimeframes
 	primaryTimeframe := config.Indicators.Klines.PrimaryTimeframe
-	klineCount := config.Indicators.Klines.PrimaryCount
-
-	// Compatible with old configuration
 	if len(timeframes) == 0 {
 		if primaryTimeframe != "" {
 			timeframes = append(timeframes, primaryTimeframe)
@@ -352,15 +349,21 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 	if primaryTimeframe == "" {
 		primaryTimeframe = timeframes[0]
 	}
-	if klineCount <= 0 {
-		klineCount = 30
+
+	// 各周期 K 线数量：优先用 TimeframeCounts，否则用默认梯队（小周期多、大周期少）
+	counts := make(map[string]int)
+	for _, tf := range timeframes {
+		if n, ok := config.Indicators.Klines.TimeframeCounts[tf]; ok && n > 0 {
+			counts[tf] = n
+		} else {
+			counts[tf] = market.DefaultCountForTimeframe(tf)
+		}
 	}
+	logger.Infof("📊 Strategy timeframes: %v, Primary: %s, counts: %v", timeframes, primaryTimeframe, counts)
 
-	logger.Infof("📊 Strategy timeframes: %v, Primary: %s, Kline count: %d", timeframes, primaryTimeframe, klineCount)
-
-	// 1. First fetch data for position coins (must fetch)
+	opts := IndicatorParamsFromConfig(engine.config.Indicators)
 	for _, pos := range ctx.Positions {
-		data, err := market.GetWithTimeframes(pos.Symbol, timeframes, primaryTimeframe, klineCount)
+		data, err := market.GetWithTimeframes(pos.Symbol, timeframes, primaryTimeframe, counts, opts)
 		if err != nil {
 			logger.Infof("⚠️  Failed to fetch market data for position %s: %v", pos.Symbol, err)
 			continue
@@ -368,36 +371,16 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 		ctx.MarketDataMap[pos.Symbol] = data
 	}
 
-	// 2. Fetch data for all candidate coins
-	positionSymbols := make(map[string]bool)
-	for _, pos := range ctx.Positions {
-		positionSymbols[pos.Symbol] = true
-	}
-
-	const minOIThresholdMillions = 15.0 // 15M USD minimum open interest value
-
+	// 2. Fetch data for all candidate coins（已废弃 OI 过滤：配置中的币种无条件拉取 K 线与指标）
 	for _, coin := range ctx.CandidateCoins {
 		if _, exists := ctx.MarketDataMap[coin.Symbol]; exists {
 			continue
 		}
 
-		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, klineCount)
+		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, counts, opts)
 		if err != nil {
 			logger.Infof("⚠️  Failed to fetch market data for %s: %v", coin.Symbol, err)
 			continue
-		}
-
-		// Liquidity filter (skip for xyz dex assets - they don't have OI data from Binance)
-		isExistingPosition := positionSymbols[coin.Symbol]
-		isXyzAsset := market.IsXyzDexAsset(coin.Symbol)
-		if !isExistingPosition && !isXyzAsset && data.OpenInterest != nil && data.CurrentPrice > 0 {
-			oiValue := data.OpenInterest.Latest * data.CurrentPrice
-			oiValueInMillions := oiValue / 1_000_000
-			if oiValueInMillions < minOIThresholdMillions {
-				logger.Infof("⚠️  %s OI value too low (%.2fM USD < %.1fM), skipping coin",
-					coin.Symbol, oiValueInMillions, minOIThresholdMillions)
-				continue
-			}
 		}
 
 		ctx.MarketDataMap[coin.Symbol] = data
@@ -644,9 +627,41 @@ func (e *StrategyEngine) getOILowCoins(limit int) ([]CandidateCoin, error) {
 // External & Quant Data
 // ============================================================================
 
-// FetchMarketData fetches market data based on strategy configuration
+// IndicatorParamsFromConfig 将策略指标配置转为 market.IndicatorParams，供 Get/GetWithTimeframes 动态计算指标（供 debate/api 等调用）
+func IndicatorParamsFromConfig(c store.IndicatorConfig) *market.IndicatorParams {
+	opts := &market.IndicatorParams{
+		EMAPeriods:  c.EMAPeriods,
+		RSIPeriods:  c.RSIPeriods,
+		ATRPeriods:  c.ATRPeriods,
+		BOLLPeriods: c.BOLLPeriods,
+		MACDFast:    12,
+		MACDSlow:    26,
+		MACDSignal:  9,
+	}
+	if len(opts.EMAPeriods) == 0 {
+		opts.EMAPeriods = []int{20, 50}
+	}
+	if len(opts.RSIPeriods) == 0 {
+		opts.RSIPeriods = []int{7, 14}
+	}
+	if len(opts.ATRPeriods) == 0 {
+		opts.ATRPeriods = []int{14}
+	}
+	if c.EnableADX {
+		opts.ADXPeriods = c.ADXPeriods
+		if len(opts.ADXPeriods) == 0 {
+			opts.ADXPeriods = []int{14}
+		}
+	}
+	if len(opts.BOLLPeriods) == 0 {
+		opts.BOLLPeriods = []int{20}
+	}
+	return opts
+}
+
+// FetchMarketData fetches market data based on strategy configuration (uses DynamicIndicators from strategy params)
 func (e *StrategyEngine) FetchMarketData(symbol string) (*market.Data, error) {
-	return market.Get(symbol)
+	return market.Get(symbol, IndicatorParamsFromConfig(e.config.Indicators))
 }
 
 // FetchExternalData fetches external data sources
@@ -1137,11 +1152,21 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 	sb.WriteString(fmt.Sprintf("Time: %s | Period: #%d | Runtime: %d minutes\n\n",
 		ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes))
 
-	// BTC market
+	// BTC market (MACD/RSI 来自 DynamicIndicators，与策略配置一致)
 	if btcData, hasBTC := ctx.MarketDataMap["BTCUSDT"]; hasBTC {
+		macd, rsi := 0.0, 0.0
+		if btcData.DynamicIndicators != nil {
+			if v, ok := btcData.DynamicIndicators["macd"]; ok {
+				macd = v
+			}
+			if v, ok := btcData.DynamicIndicators["rsi_7"]; ok {
+				rsi = v
+			} else if v, ok := btcData.DynamicIndicators["rsi_14"]; ok {
+				rsi = v
+			}
+		}
 		sb.WriteString(fmt.Sprintf("BTC: %.2f (1h: %+.2f%%, 4h: %+.2f%%) | MACD: %.4f | RSI: %.2f\n\n",
-			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h,
-			btcData.CurrentMACD, btcData.CurrentRSI7))
+			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h, macd, rsi))
 	}
 
 	// Account information
@@ -1396,20 +1421,35 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 	// 明确标注币种
 	sb.WriteString(fmt.Sprintf("=== %s Market Data ===\n\n", data.Symbol))
 	sb.WriteString(fmt.Sprintf("current_price = %.4f", data.CurrentPrice))
-
-	if indicators.EnableEMA {
-		sb.WriteString(fmt.Sprintf(", current_ema20 = %.3f", data.CurrentEMA20))
+	// 使用 DynamicIndicators 透传用户配置的指标（如 EMA200、RSI14）给 AI
+	if len(data.DynamicIndicators) > 0 {
+		keys := make([]string, 0, len(data.DynamicIndicators))
+		for k := range data.DynamicIndicators {
+			keys = append(keys, k)
+		}
+		for _, k := range keys {
+			v := data.DynamicIndicators[k]
+			readable := strings.ReplaceAll(k, "_", "")
+			sb.WriteString(fmt.Sprintf(", current_%s = %.3f", readable, v))
+		}
 	}
-
-	if indicators.EnableMACD {
-		sb.WriteString(fmt.Sprintf(", current_macd = %.3f", data.CurrentMACD))
-	}
-
-	if indicators.EnableRSI {
-		sb.WriteString(fmt.Sprintf(", current_rsi7 = %.3f", data.CurrentRSI7))
-	}
-
 	sb.WriteString("\n\n")
+
+	if indicators.EnableFibonacci && len(data.Fibonacci) > 0 {
+		sb.WriteString("Fibonacci levels (resistance/support from recent range): ")
+		if v, ok := data.Fibonacci["high"]; ok {
+			sb.WriteString(fmt.Sprintf("high = %.4f, ", v))
+		}
+		if v, ok := data.Fibonacci["low"]; ok {
+			sb.WriteString(fmt.Sprintf("low = %.4f", v))
+		}
+		for _, k := range []string{"0.236", "0.382", "0.5", "0.618", "0.786"} {
+			if v, ok := data.Fibonacci[k]; ok {
+				sb.WriteString(fmt.Sprintf(", %s = %.4f", k, v))
+			}
+		}
+		sb.WriteString("\n\n")
+	}
 
 	if indicators.EnableOI || indicators.EnableFundingRate {
 		sb.WriteString(fmt.Sprintf("Additional data for %s:\n\n", data.Symbol))
@@ -1520,33 +1560,26 @@ func (e *StrategyEngine) formatTimeframeSeriesData(sb *strings.Builder, data *ma
 		}
 	}
 
-	if indicators.EnableEMA {
-		if len(data.EMA20Values) > 0 {
-			sb.WriteString(fmt.Sprintf("EMA20: %s\n", formatFloatSlice(data.EMA20Values)))
-		}
-		if len(data.EMA50Values) > 0 {
-			sb.WriteString(fmt.Sprintf("EMA50: %s\n", formatFloatSlice(data.EMA50Values)))
-		}
+	// 只要有数据就输出 EMA/RSI/MACD/BOLL/ATR，不因 Enable* 标志而漏掉，避免 AI 抱怨无指标数据
+	if len(data.EMA20Values) > 0 {
+		sb.WriteString(fmt.Sprintf("EMA20: %s\n", formatFloatSlice(data.EMA20Values)))
 	}
-
-	if indicators.EnableMACD && len(data.MACDValues) > 0 {
+	if len(data.EMA50Values) > 0 {
+		sb.WriteString(fmt.Sprintf("EMA50: %s\n", formatFloatSlice(data.EMA50Values)))
+	}
+	if len(data.MACDValues) > 0 {
 		sb.WriteString(fmt.Sprintf("MACD: %s\n", formatFloatSlice(data.MACDValues)))
 	}
-
-	if indicators.EnableRSI {
-		if len(data.RSI7Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI7: %s\n", formatFloatSlice(data.RSI7Values)))
-		}
-		if len(data.RSI14Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI14: %s\n", formatFloatSlice(data.RSI14Values)))
-		}
+	if len(data.RSI7Values) > 0 {
+		sb.WriteString(fmt.Sprintf("RSI7: %s\n", formatFloatSlice(data.RSI7Values)))
 	}
-
-	if indicators.EnableATR && data.ATR14 > 0 {
+	if len(data.RSI14Values) > 0 {
+		sb.WriteString(fmt.Sprintf("RSI14: %s\n", formatFloatSlice(data.RSI14Values)))
+	}
+	if data.ATR14 > 0 {
 		sb.WriteString(fmt.Sprintf("ATR14: %.4f\n", data.ATR14))
 	}
-
-	if indicators.EnableBOLL && len(data.BOLLUpper) > 0 {
+	if len(data.BOLLUpper) > 0 {
 		sb.WriteString(fmt.Sprintf("BOLL Upper: %s\n", formatFloatSlice(data.BOLLUpper)))
 		sb.WriteString(fmt.Sprintf("BOLL Middle: %s\n", formatFloatSlice(data.BOLLMiddle)))
 		sb.WriteString(fmt.Sprintf("BOLL Lower: %s\n", formatFloatSlice(data.BOLLLower)))

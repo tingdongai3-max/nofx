@@ -271,14 +271,42 @@ func (t *OKXTrader) SyncOrdersFromOKX(traderID string, exchangeID string, exchan
 	return nil
 }
 
-// StartOrderSync starts background order sync task for OKX
+const (
+	okxSyncIntervalLive   = 30 * time.Second
+	okxSyncIntervalDemo   = 2 * time.Minute  // 模拟盘强制 2 分钟，避免 50111 限频
+	okxSyncCooldown50111  = 5 * time.Minute // 50111 后静默冷却，不再轮询
+	okxSyncBackoffCode    = "50111"
+	okxSyncInvalidKeyCode = "Invalid OK-ACCESS-KEY"
+)
+
+// StartOrderSync starts background order sync task for OKX.
+// 模拟盘强制 2 分钟间隔；50111 后冷却 5 分钟并只打一次日志，彻底阻断疯狂轮询。
 func (t *OKXTrader) StartOrderSync(traderID string, exchangeID string, exchangeType string, st *store.Store, interval time.Duration) {
+	if t.IsTestnet() && interval < okxSyncIntervalDemo {
+		interval = okxSyncIntervalDemo
+	}
+	if interval < okxSyncIntervalLive {
+		interval = okxSyncIntervalLive
+	}
 	ticker := time.NewTicker(interval)
 	go func() {
+		last50111Log := time.Time{}
 		for range ticker.C {
-			if err := t.SyncOrdersFromOKX(traderID, exchangeID, exchangeType, st); err != nil {
-				logger.Infof("⚠️  OKX order sync failed: %v", err)
+			err := t.SyncOrdersFromOKX(traderID, exchangeID, exchangeType, st)
+			if err == nil {
+				continue
 			}
+			errStr := err.Error()
+			is50111 := strings.Contains(errStr, okxSyncBackoffCode) || strings.Contains(errStr, okxSyncInvalidKeyCode)
+			if is50111 {
+				if time.Since(last50111Log) > okxSyncCooldown50111 {
+					logger.Warnf("⚠️ OKX order sync 50111/Invalid KEY, cooling down %v (no more attempts until then)", okxSyncCooldown50111)
+					last50111Log = time.Now()
+				}
+				time.Sleep(okxSyncCooldown50111)
+				continue
+			}
+			logger.Infof("⚠️  OKX order sync failed: %v", err)
 		}
 	}()
 	logger.Infof("🔄 OKX order sync started (interval: %v)", interval)

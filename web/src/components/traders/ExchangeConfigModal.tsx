@@ -587,6 +587,24 @@ export function ExchangeConfigModal({
                     </div>
                   )}
 
+                  {(currentExchangeType === 'binance' || currentExchangeType === 'okx') && (
+                    <div className="flex items-center gap-3 p-3 rounded-xl" style={{ background: '#0B0E11', border: '1px solid #2B3139' }}>
+                      <input
+                        type="checkbox"
+                        id="exchange-testnet"
+                        checked={testnet}
+                        onChange={(e) => setTestnet(e.target.checked)}
+                        className="w-4 h-4 rounded accent-yellow-500"
+                      />
+                      <label htmlFor="exchange-testnet" className="text-sm font-medium" style={{ color: '#EAECEF' }}>
+                        {language === 'zh' ? '模拟盘 (Testnet)' : 'Testnet / Paper Trading'}
+                      </label>
+                      <span className="text-xs" style={{ color: '#848E9C' }}>
+                        {language === 'zh' ? '使用交易所测试网，无真实资金' : 'Use exchange testnet, no real funds'}
+                      </span>
+                    </div>
+                  )}
+
                   {currentExchangeType === 'binance' && (
                     <div className="p-4 rounded-xl" style={{ background: 'rgba(240, 185, 11, 0.1)', border: '1px solid rgba(240, 185, 11, 0.2)' }}>
                       <div className="text-sm font-semibold mb-2" style={{ color: '#F0B90B' }}>

@@ -679,6 +679,7 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 	case "binance":
 		traderConfig.BinanceAPIKey = string(exchangeCfg.APIKey)
 		traderConfig.BinanceSecretKey = string(exchangeCfg.SecretKey)
+		traderConfig.BinanceTestnet = exchangeCfg.Testnet
 	case "bybit":
 		traderConfig.BybitAPIKey = string(exchangeCfg.APIKey)
 		traderConfig.BybitSecretKey = string(exchangeCfg.SecretKey)
@@ -686,6 +687,7 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 		traderConfig.OKXAPIKey = string(exchangeCfg.APIKey)
 		traderConfig.OKXSecretKey = string(exchangeCfg.SecretKey)
 		traderConfig.OKXPassphrase = string(exchangeCfg.Passphrase)
+		traderConfig.OKXTestnet = exchangeCfg.Testnet
 	case "bitget":
 		traderConfig.BitgetAPIKey = string(exchangeCfg.APIKey)
 		traderConfig.BitgetSecretKey = string(exchangeCfg.SecretKey)

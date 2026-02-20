@@ -133,18 +133,17 @@ type IndicatorConfig struct {
 	EnableMACD        bool `json:"enable_macd"`
 	EnableRSI         bool `json:"enable_rsi"`
 	EnableATR         bool `json:"enable_atr"`
-	EnableBOLL        bool `json:"enable_boll"`         // Bollinger Bands
+	EnableADX         bool `json:"enable_adx"`         // ADX (Average Directional Index)
+	EnableBOLL        bool `json:"enable_boll"`        // Bollinger Bands
+	EnableFibonacci   bool `json:"enable_fibonacci"`    // 斐波那契回撤位写入 AI Prompt
 	EnableVolume      bool `json:"enable_volume"`
-	EnableOI          bool `json:"enable_oi"`           // open interest
-	EnableFundingRate bool `json:"enable_funding_rate"` // funding rate
-	// EMA period configuration
-	EMAPeriods []int `json:"ema_periods,omitempty"` // default [20, 50]
-	// RSI period configuration
-	RSIPeriods []int `json:"rsi_periods,omitempty"` // default [7, 14]
-	// ATR period configuration
-	ATRPeriods []int `json:"atr_periods,omitempty"` // default [14]
-	// BOLL period configuration (period, standard deviation multiplier is fixed at 2)
-	BOLLPeriods []int `json:"boll_periods,omitempty"` // default [20] - can select multiple timeframes
+	EnableOI          bool `json:"enable_oi"`
+	EnableFundingRate bool `json:"enable_funding_rate"`
+	EMAPeriods        []int `json:"ema_periods,omitempty"`
+	RSIPeriods        []int `json:"rsi_periods,omitempty"`
+	ATRPeriods        []int `json:"atr_periods,omitempty"`
+	ADXPeriods        []int `json:"adx_periods,omitempty"` // default [14]
+	BOLLPeriods       []int `json:"boll_periods,omitempty"`
 	// external data sources
 	ExternalDataSources []ExternalDataSource `json:"external_data_sources,omitempty"`
 
@@ -171,22 +170,24 @@ type IndicatorConfig struct {
 	EnablePriceRanking   bool   `json:"enable_price_ranking"`             // whether to enable price ranking data
 	PriceRankingDuration string `json:"price_ranking_duration,omitempty"` // durations: "1h" or "1h,4h,24h"
 	PriceRankingLimit    int    `json:"price_ranking_limit,omitempty"`    // number of entries per ranking (default 10)
+
+	// 动态指标移动止盈止损（硬风控狗）：不经过 AI，价格跌破/突破指定指标线即市价平仓
+	EnableIndicatorTrailing bool   `json:"enable_indicator_trailing"`   // 是否开启指标追踪止盈止损
+	TrailingIndicator       string  `json:"trailing_indicator,omitempty"`   // 平仓线指标，如 "ema_20", "ema_50", "boll_middle_20"
+	TrailingTimeframe       string  `json:"trailing_timeframe,omitempty"`   // 风控计算周期，如 "1m","5m","15m","1h","4h"，默认 "5m"
+	TrailingOffsetPercent   float64 `json:"trailing_offset_percent"`       // 触发偏移量(%)，多单跌破均线-偏移%才平仓，空单突破均线+偏移%才平仓，防插针，默认 0
 }
 
 // KlineConfig K-line configuration
 type KlineConfig struct {
-	// primary timeframe: "1m", "3m", "5m", "15m", "1h", "4h"
-	PrimaryTimeframe string `json:"primary_timeframe"`
-	// primary timeframe K-line count
-	PrimaryCount int `json:"primary_count"`
-	// longer timeframe
-	LongerTimeframe string `json:"longer_timeframe,omitempty"`
-	// longer timeframe K-line count
-	LongerCount int `json:"longer_count,omitempty"`
-	// whether to enable multi-timeframe analysis
-	EnableMultiTimeframe bool `json:"enable_multi_timeframe"`
-	// selected timeframe list (new: supports multi-timeframe selection)
-	SelectedTimeframes []string `json:"selected_timeframes,omitempty"`
+	PrimaryTimeframe     string         `json:"primary_timeframe"`
+	PrimaryCount         int            `json:"primary_count"`
+	LongerTimeframe      string         `json:"longer_timeframe,omitempty"`
+	LongerCount          int            `json:"longer_count,omitempty"`
+	EnableMultiTimeframe bool           `json:"enable_multi_timeframe"`
+	SelectedTimeframes   []string       `json:"selected_timeframes,omitempty"`
+	// 各周期 K 线数量（如 {"1m": 200, "15m": 50, "1d": 10}），未设置的周期使用默认梯队
+	TimeframeCounts map[string]int `json:"timeframe_counts,omitempty"`
 }
 
 // ExternalDataSource external data source configuration
@@ -275,12 +276,15 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 			EnableRSI:         false,
 			EnableATR:         false,
 			EnableBOLL:        false,
+			EnableADX:         false,
+			EnableFibonacci:   false,
 			EnableVolume:      true,
 			EnableOI:          true,
 			EnableFundingRate: true,
 			EMAPeriods:        []int{20, 50},
 			RSIPeriods:        []int{7, 14},
 			ATRPeriods:        []int{14},
+			ADXPeriods:        []int{14},
 			BOLLPeriods:       []int{20},
 			// NofxOS unified API key
 			NofxOSAPIKey: "cm_568c67eae410d912c54c",
@@ -300,6 +304,11 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 			EnablePriceRanking:   true,
 			PriceRankingDuration: "1h,4h,24h",
 			PriceRankingLimit:    10,
+			// 指标移动止盈止损（风控狗）
+			EnableIndicatorTrailing: false,
+			TrailingIndicator:       "ema_20",
+			TrailingTimeframe:       "5m",
+			TrailingOffsetPercent:   0,
 		},
 		RiskControl: RiskControlConfig{
 			MaxPositions:                    3,   // Max 3 coins simultaneously (CODE ENFORCED)

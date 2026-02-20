@@ -534,13 +534,16 @@ export interface IndicatorConfig {
   enable_macd: boolean;
   enable_rsi: boolean;
   enable_atr: boolean;
+  enable_adx: boolean;
   enable_boll: boolean;
+  enable_fibonacci: boolean;
   enable_volume: boolean;
   enable_oi: boolean;
   enable_funding_rate: boolean;
   ema_periods?: number[];
   rsi_periods?: number[];
   atr_periods?: number[];
+  adx_periods?: number[];
   boll_periods?: number[];
   external_data_sources?: ExternalDataSource[];
 
@@ -567,6 +570,12 @@ export interface IndicatorConfig {
   enable_price_ranking?: boolean;
   price_ranking_duration?: string;  // "1h", "4h", "24h" or "1h,4h,24h"
   price_ranking_limit?: number;
+
+  // 动态指标移动止盈止损（硬风控狗）
+  enable_indicator_trailing?: boolean;
+  trailing_indicator?: string;  // 平仓线指标，如 "ema_20", "ema_50", "boll_middle_20"
+  trailing_timeframe?: string; // 风控计算周期，如 "1m","5m","15m","1h","4h"，默认 "5m"
+  trailing_offset_percent?: number; // 触发偏移量(%)，防插针，默认 0
 }
 
 export interface KlineConfig {
@@ -575,8 +584,9 @@ export interface KlineConfig {
   longer_timeframe?: string;
   longer_count?: number;
   enable_multi_timeframe: boolean;
-  // 新增：支持选择多个时间周期
   selected_timeframes?: string[];
+  /** 各周期 K 线数量，如 { "1m": 200, "5m": 100, "1h": 50 }，未设置则用默认梯队 */
+  timeframe_counts?: Record<string, number>;
 }
 
 export interface ExternalDataSource {

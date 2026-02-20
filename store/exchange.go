@@ -48,12 +48,21 @@ func NewExchangeStore(db *gorm.DB) *ExchangeStore {
 }
 
 func (s *ExchangeStore) initTables() error {
-	// For PostgreSQL with existing table, skip AutoMigrate
+	// For PostgreSQL with existing table, skip AutoMigrate but ensure testnet column exists
 	if s.db.Dialector.Name() == "postgres" {
 		var tableExists int64
 		s.db.Raw(`SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'exchanges'`).Scan(&tableExists)
 		if tableExists > 0 {
-			// Still run data migrations
+			// 确保 testnet 列存在（老表可能没有该列，导致勾选模拟盘无法入库）
+			var colExists int64
+			s.db.Raw(`SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'exchanges' AND column_name = 'testnet'`).Scan(&colExists)
+			if colExists == 0 {
+				if err := s.db.Exec(`ALTER TABLE exchanges ADD COLUMN testnet BOOLEAN NOT NULL DEFAULT FALSE`).Error; err != nil {
+					logger.Warnf("Failed to add exchanges.testnet column: %v", err)
+				} else {
+					logger.Infof("✓ Added exchanges.testnet column for PostgreSQL")
+				}
+			}
 			s.migrateToMultiAccount()
 			s.db.Model(&Exchange{}).Where("account_name = '' OR account_name IS NULL").Update("account_name", "Default")
 			return nil

@@ -48,6 +48,9 @@ func getBrOrderID() string {
 type FuturesTrader struct {
 	client *futures.Client
 
+	// isTestnet: true 时强制使用 testnet.binancefuture.com，防止 hook 等覆盖 BaseURL
+	isTestnet bool
+
 	// Balance cache
 	cachedBalance     map[string]interface{}
 	balanceCacheTime  time.Time
@@ -62,19 +65,30 @@ type FuturesTrader struct {
 	cacheDuration time.Duration
 }
 
-// NewFuturesTrader creates futures trader
-func NewFuturesTrader(apiKey, secretKey string, userId string) *FuturesTrader {
+const binanceFuturesTestnetURL = "https://testnet.binancefuture.com"
+
+// NewFuturesTrader creates futures trader. isTestnet: true 使用 testnet.binancefuture.com 模拟盘，BaseURL 在 hook 后再次强制覆盖
+func NewFuturesTrader(apiKey, secretKey string, userId string, isTestnet bool) *FuturesTrader {
 	client := futures.NewClient(apiKey, secretKey)
+	if isTestnet {
+		client.BaseURL = binanceFuturesTestnetURL
+		logger.Infof("✓ Binance Futures using testnet: %s", client.BaseURL)
+	}
 
 	hookRes := hook.HookExec[hook.NewBinanceTraderResult](hook.NEW_BINANCE_TRADER, userId, client)
 	if hookRes != nil && hookRes.GetResult() != nil {
 		client = hookRes.GetResult()
+	}
+	// 全局强制：若为模拟盘，防止 hook 覆盖 BaseURL，确保余额/下单等所有请求走测试网
+	if isTestnet && client != nil {
+		client.BaseURL = binanceFuturesTestnetURL
 	}
 
 	// Sync time to avoid "Timestamp ahead" error
 	syncBinanceServerTime(client)
 	trader := &FuturesTrader{
 		client:        client,
+		isTestnet:     isTestnet,
 		cacheDuration: 15 * time.Second, // 15-second cache
 	}
 
@@ -238,8 +252,8 @@ func (t *FuturesTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 	}
 
 	if err != nil {
-		// If error message contains "No need to change", margin mode is already set to target value
-		if contains(err.Error(), "No need to change margin type") {
+		// 币安 -4046: "No need to change margin type" 表示已是目标模式，忽略并继续
+		if contains(err.Error(), "No need to change margin type") || contains(err.Error(), "-4046") || contains(err.Error(), "4046") {
 			logger.Infof("  ✓ %s margin mode is already %s", symbol, marginModeStr)
 			return nil
 		}

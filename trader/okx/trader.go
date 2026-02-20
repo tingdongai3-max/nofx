@@ -46,6 +46,9 @@ type OKXTrader struct {
 	// Margin mode setting
 	isCrossMargin bool
 
+	// Simulated trading: true = 模拟盘，请求头 x-simulated-trading: 1
+	isTestnet bool
+
 	// Position mode: "long_short_mode" (hedge) or "net_mode" (one-way)
 	positionMode string
 
@@ -69,6 +72,19 @@ type OKXTrader struct {
 
 	// Cache duration
 	cacheDuration time.Duration
+}
+
+// IsTestnet returns whether the trader is using OKX simulated (demo) environment
+func (t *OKXTrader) IsTestnet() bool {
+	return t.isTestnet
+}
+
+// tdMode 返回 OKX 请求用的保证金模式：全仓 cross / 逐仓 isolated，与策略配置一致
+func (t *OKXTrader) tdMode() string {
+	if t.isCrossMargin {
+		return "cross"
+	}
+	return "isolated"
 }
 
 // OKXInstrument OKX instrument info
@@ -104,8 +120,8 @@ func genOkxClOrdID() string {
 	return orderID
 }
 
-// NewOKXTrader creates OKX trader
-func NewOKXTrader(apiKey, secretKey, passphrase string) *OKXTrader {
+// NewOKXTrader creates OKX trader. isCrossMargin: true=全仓(cross), false=逐仓(isolated). isTestnet: true=模拟盘(x-simulated-trading: 1)
+func NewOKXTrader(apiKey, secretKey, passphrase string, isCrossMargin bool, isTestnet bool) *OKXTrader {
 	// Use default transport which respects system proxy settings
 	// OKX requires proxy in China due to DNS pollution
 	httpClient := &http.Client{
@@ -117,9 +133,14 @@ func NewOKXTrader(apiKey, secretKey, passphrase string) *OKXTrader {
 		apiKey:           apiKey,
 		secretKey:        secretKey,
 		passphrase:       passphrase,
+		isCrossMargin:    isCrossMargin,
+		isTestnet:        isTestnet,
 		httpClient:       httpClient,
 		cacheDuration:    15 * time.Second,
 		instrumentsCache: make(map[string]*OKXInstrument),
+	}
+	if isTestnet {
+		logger.Infof("✓ OKX using simulated trading (x-simulated-trading: 1)")
 	}
 
 	// Get current position mode first
@@ -215,8 +236,12 @@ func (t *OKXTrader) doRequest(method, path string, body interface{}) ([]byte, er
 	req.Header.Set("OK-ACCESS-TIMESTAMP", timestamp)
 	req.Header.Set("OK-ACCESS-PASSPHRASE", t.passphrase)
 	req.Header.Set("Content-Type", "application/json")
-	// Set request header
-	req.Header.Set("x-simulated-trading", "0")
+	// 模拟盘全局拦截：所有 OKX 请求均经 doRequest，此处统一设置环境头，避免 50101 环境不匹配
+	if t.isTestnet {
+		req.Header.Set("x-simulated-trading", "1")
+	} else {
+		req.Header.Set("x-simulated-trading", "0")
+	}
 
 	resp, err := t.httpClient.Do(req)
 	if err != nil {
@@ -608,7 +633,7 @@ func (t *OKXTrader) OpenLong(symbol string, quantity float64, leverage int) (map
 
 	body := map[string]interface{}{
 		"instId":  instId,
-		"tdMode":  "cross",
+		"tdMode":  t.tdMode(),
 		"side":    "buy",
 		"posSide": "long",
 		"ordType": "market",
@@ -685,7 +710,7 @@ func (t *OKXTrader) OpenShort(symbol string, quantity float64, leverage int) (ma
 
 	body := map[string]interface{}{
 		"instId":  instId,
-		"tdMode":  "cross",
+		"tdMode":  t.tdMode(),
 		"side":    "sell",
 		"posSide": "short",
 		"ordType": "market",
@@ -1007,7 +1032,7 @@ func (t *OKXTrader) SetStopLoss(symbol string, positionSide string, quantity, st
 
 	body := map[string]interface{}{
 		"instId":      instId,
-		"tdMode":      "cross",
+		"tdMode":      t.tdMode(),
 		"side":        side,
 		"posSide":     posSide,
 		"ordType":     "conditional",
@@ -1050,7 +1075,7 @@ func (t *OKXTrader) SetTakeProfit(symbol string, positionSide string, quantity, 
 
 	body := map[string]interface{}{
 		"instId":      instId,
-		"tdMode":      "cross",
+		"tdMode":      t.tdMode(),
 		"side":        side,
 		"posSide":     posSide,
 		"ordType":     "conditional",

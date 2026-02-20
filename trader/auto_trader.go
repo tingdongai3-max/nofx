@@ -1,6 +1,7 @@
 package trader
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -36,17 +37,19 @@ type AutoTraderConfig struct {
 	ExchangeID string // Exchange account UUID (for multi-account support)
 
 	// Binance API configuration
-	BinanceAPIKey    string
-	BinanceSecretKey string
+	BinanceAPIKey     string
+	BinanceSecretKey  string
+	BinanceTestnet    bool   // true = 使用 testnet.binancefuture.com 模拟盘
 
 	// Bybit API configuration
 	BybitAPIKey    string
 	BybitSecretKey string
 
 	// OKX API configuration
-	OKXAPIKey    string
-	OKXSecretKey string
-	OKXPassphrase string
+	OKXAPIKey      string
+	OKXSecretKey   string
+	OKXPassphrase  string
+	OKXTestnet     bool   // true = 模拟盘，请求头 x-simulated-trading: 1
 
 	// Bitget API configuration
 	BitgetAPIKey    string
@@ -142,6 +145,8 @@ type AutoTrader struct {
 	lastBalanceSyncTime   time.Time          // Last balance sync time
 	userID                string             // User ID
 	gridState             *GridState         // Grid trading state (only used when StrategyType == "grid_trading")
+	watchdogCtx           context.Context    // Context for risk watchdog (cancelled on Stop)
+	watchdogCancel        context.CancelFunc // Cancel risk watchdog on Stop
 }
 
 // NewAutoTrader creates an automatic trader
@@ -241,14 +246,14 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 
 	switch config.Exchange {
 	case "binance":
-		logger.Infof("🏦 [%s] Using Binance Futures trading", config.Name)
-		trader = binance.NewFuturesTrader(config.BinanceAPIKey, config.BinanceSecretKey, userID)
+		logger.Infof("🏦 [%s] Using Binance Futures trading (testnet=%v)", config.Name, config.BinanceTestnet)
+		trader = binance.NewFuturesTrader(config.BinanceAPIKey, config.BinanceSecretKey, userID, config.BinanceTestnet)
 	case "bybit":
 		logger.Infof("🏦 [%s] Using Bybit Futures trading", config.Name)
 		trader = bybit.NewBybitTrader(config.BybitAPIKey, config.BybitSecretKey)
 	case "okx":
-		logger.Infof("🏦 [%s] Using OKX Futures trading", config.Name)
-		trader = okx.NewOKXTrader(config.OKXAPIKey, config.OKXSecretKey, config.OKXPassphrase)
+		logger.Infof("🏦 [%s] Using OKX Futures trading (testnet=%v)", config.Name, config.OKXTestnet)
+		trader = okx.NewOKXTrader(config.OKXAPIKey, config.OKXSecretKey, config.OKXPassphrase, config.IsCrossMargin, config.OKXTestnet)
 	case "bitget":
 		logger.Infof("🏦 [%s] Using Bitget Futures trading", config.Name)
 		trader = bitget.NewBitgetTrader(config.BitgetAPIKey, config.BitgetSecretKey, config.BitgetPassphrase)
@@ -409,11 +414,15 @@ func (at *AutoTrader) Run() error {
 		}
 	}
 
-	// Start OKX order sync if using OKX exchange
+	// Start OKX order sync if using OKX exchange（模拟盘拉取 fills 易触发 50111 限频，间隔改为 2 分钟）
 	if at.exchange == "okx" {
 		if okxTrader, ok := at.trader.(*okx.OKXTrader); ok && at.store != nil {
-			okxTrader.StartOrderSync(at.id, at.exchangeID, at.exchange, at.store, 30*time.Second)
-			logger.Infof("🔄 [%s] OKX order+position sync enabled (every 30s)", at.name)
+			interval := 30 * time.Second
+			if okxTrader.IsTestnet() {
+				interval = 2 * time.Minute
+			}
+			okxTrader.StartOrderSync(at.id, at.exchangeID, at.exchange, at.store, interval)
+			logger.Infof("🔄 [%s] OKX order+position sync enabled (interval: %v)", at.name, interval)
 		}
 	}
 
@@ -462,6 +471,18 @@ func (at *AutoTrader) Run() error {
 
 	// Check if this is a grid trading strategy
 	isGridStrategy := at.IsGridStrategy()
+	// 脱机风控狗：指标移动止盈止损（不经过 AI，仅 AI 策略且开启时启动）
+	if !isGridStrategy && at.config.StrategyConfig != nil && at.config.StrategyConfig.Indicators.EnableIndicatorTrailing {
+		at.watchdogCtx, at.watchdogCancel = context.WithCancel(context.Background())
+		indicatorName := at.config.StrategyConfig.Indicators.TrailingIndicator
+		if indicatorName == "" {
+			indicatorName = "ema_20"
+		}
+		RunRiskWatchdog(at.watchdogCtx, at.trader, func() *store.StrategyConfig { return at.config.StrategyConfig }, func() string { return at.GetExchange() }, func(symbol, action string, order map[string]interface{}, quantity, exitPrice, entryPrice float64) {
+			at.recordAndConfirmOrder(order, symbol, action, quantity, exitPrice, 0, entryPrice)
+		})
+		logger.Infof("🛡️ [%s] Risk Watchdog (Trailing Indicator) started, indicator=%s", at.name, indicatorName)
+	}
 	if isGridStrategy {
 		logger.Infof("🔲 [%s] Grid trading strategy detected, initializing grid...", at.name)
 		if err := at.InitializeGrid(); err != nil {
@@ -520,6 +541,10 @@ func (at *AutoTrader) Stop() {
 	at.isRunning = false
 	at.isRunningMutex.Unlock()
 
+	if at.watchdogCancel != nil {
+		at.watchdogCancel()
+		at.watchdogCancel = nil
+	}
 	close(at.stopMonitorCh) // Notify monitoring goroutine to stop
 	at.monitorWg.Wait()     // Wait for monitoring goroutine to finish
 	logger.Info("⏹ Automatic trading system stopped")
@@ -1049,11 +1074,66 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *kernel.Decision, actio
 	case "close_short":
 		return at.executeCloseShortWithRecord(decision, actionRecord)
 	case "hold", "wait":
-		// No execution needed, just record
+		// 动态止盈止损：若已有持仓且 AI 给出新 TP/SL，先撤旧单再挂新单
+		if (decision.TakeProfit > 0 || decision.StopLoss > 0) && at.updateTpSlForExistingPosition(decision) {
+			// 已更新 TP/SL，仅记录
+		}
 		return nil
 	default:
 		return fmt.Errorf("unknown action: %s", decision.Action)
 	}
+}
+
+// updateTpSlForExistingPosition 当已有持仓且 AI 给出新止盈/止损时：先撤旧 TP/SL 再挂新单。返回 true 表示已处理（含无持仓或失败仅打日志）
+func (at *AutoTrader) updateTpSlForExistingPosition(decision *kernel.Decision) bool {
+	positions, err := at.trader.GetPositions()
+	if err != nil {
+		logger.Infof("  ⚠️ [updateTpSl] get positions failed: %v", err)
+		return false
+	}
+	var quantity float64
+	var posSide string // "long" or "short"
+	for _, pos := range positions {
+		if pos["symbol"] != decision.Symbol {
+			continue
+		}
+		side, _ := pos["side"].(string)
+		if side != "long" && side != "short" {
+			continue
+		}
+		if amt, ok := pos["positionAmt"].(float64); ok && amt > 0 {
+			quantity = amt
+			posSide = side
+			break
+		}
+	}
+	if quantity <= 0 || posSide == "" {
+		return false
+	}
+	sideUpper := strings.ToUpper(posSide)
+	logger.Infof("  📍 [updateTpSl] %s 已有 %s 持仓 qty=%.4f，撤旧 TP/SL 并挂新单 TP=%.4f SL=%.4f",
+		decision.Symbol, posSide, quantity, decision.TakeProfit, decision.StopLoss)
+	if err := at.trader.CancelTakeProfitOrders(decision.Symbol); err != nil {
+		logger.Infof("  ⚠️ [updateTpSl] cancel take profit orders: %v", err)
+	}
+	if err := at.trader.CancelStopLossOrders(decision.Symbol); err != nil {
+		logger.Infof("  ⚠️ [updateTpSl] cancel stop loss orders: %v", err)
+	}
+	if decision.StopLoss > 0 {
+		if err := at.trader.SetStopLoss(decision.Symbol, sideUpper, quantity, decision.StopLoss); err != nil {
+			logger.Infof("  ⚠️ [updateTpSl] set stop loss: %v", err)
+		} else {
+			logger.Infof("  ✓ [updateTpSl] stop loss set: %.4f", decision.StopLoss)
+		}
+	}
+	if decision.TakeProfit > 0 {
+		if err := at.trader.SetTakeProfit(decision.Symbol, sideUpper, quantity, decision.TakeProfit); err != nil {
+			logger.Infof("  ⚠️ [updateTpSl] set take profit: %v", err)
+		} else {
+			logger.Infof("  ✓ [updateTpSl] take profit set: %.4f", decision.TakeProfit)
+		}
+	}
+	return true
 }
 
 // ExecuteDecision executes a trading decision from external sources (e.g., debate consensus)
@@ -1106,7 +1186,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 	}
 
 	// Get current price
-	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
+	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange, nil)
 	if err != nil {
 		return err
 	}
@@ -1223,7 +1303,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 	}
 
 	// Get current price
-	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
+	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange, nil)
 	if err != nil {
 		return err
 	}
@@ -1322,7 +1402,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 	logger.Infof("  🔄 Close long: %s", decision.Symbol)
 
 	// Get current price
-	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
+	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange, nil)
 	if err != nil {
 		return err
 	}
@@ -1386,7 +1466,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 	logger.Infof("  🔄 Close short: %s", decision.Symbol)
 
 	// Get current price
-	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
+	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange, nil)
 	if err != nil {
 		return err
 	}

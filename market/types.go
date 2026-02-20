@@ -8,15 +8,31 @@ type Data struct {
 	CurrentPrice      float64
 	PriceChange1h     float64 // 1-hour price change percentage
 	PriceChange4h     float64 // 4-hour price change percentage
-	CurrentEMA20      float64
-	CurrentMACD       float64
-	CurrentRSI7       float64
-	OpenInterest      *OIData
+	DynamicIndicators map[string]float64 `json:"dynamic_indicators,omitempty"`
+	// Fibonacci 回撤/扩展位（主周期 K 线区间内最高、最低及 0.236/0.382/0.5/0.618/0.786），专供 AI 阻力/支撑参考
+	Fibonacci map[string]float64 `json:"fibonacci,omitempty"`
+	OpenInterest *OIData
 	FundingRate       float64
 	IntradaySeries    *IntradayData
 	LongerTermContext *LongerTermData
 	// Multi-timeframe data (new)
 	TimeframeData map[string]*TimeframeSeriesData `json:"timeframe_data,omitempty"`
+}
+
+// IndicatorParams 策略侧传入的指标参数，用于动态计算 DynamicIndicators。
+// 多模态截图引擎约定：若实现 K 线图截图/绘图供 AI 视觉分析（如 chromedp 或服务端绘图），
+// 必须同步读取同一套 IndicatorParams/策略配置，在图上绘制用户自定义的 EMA200、RSI、MACD 等，
+// 保证发给 AI 的图片与文本 DynamicIndicators 一致。
+type IndicatorParams struct {
+	EMAPeriods   []int `json:"ema_periods,omitempty"`   // 默认 [20, 50]
+	SMAPeriods   []int `json:"sma_periods,omitempty"`   // 可选
+	RSIPeriods   []int `json:"rsi_periods,omitempty"`   // 默认 [7, 14]
+	ATRPeriods   []int `json:"atr_periods,omitempty"`   // 默认 [14]
+	ADXPeriods   []int `json:"adx_periods,omitempty"`   // 默认 [14]
+	BOLLPeriods  []int `json:"boll_periods,omitempty"`  // 默认 [20]
+	MACDFast     int   `json:"macd_fast,omitempty"`     // 默认 12
+	MACDSlow     int   `json:"macd_slow,omitempty"`     // 默认 26
+	MACDSignal   int   `json:"macd_signal,omitempty"`    // 默认 9
 }
 
 // KlineBar single kline bar with OHLCV data
@@ -34,17 +50,18 @@ type TimeframeSeriesData struct {
 	Timeframe   string     `json:"timeframe"`    // Timeframe identifier, e.g. "5m", "15m", "1h"
 	Klines      []KlineBar `json:"klines"`       // Full OHLCV kline data
 	MidPrices   []float64  `json:"mid_prices"`   // Price series (deprecated, kept for compatibility)
-	EMA20Values []float64  `json:"ema20_values"` // EMA20 series
-	EMA50Values []float64  `json:"ema50_values"` // EMA50 series
+	EMA20Values []float64  `json:"ema20_values"` // EMA20 series (deprecated, 见 DynamicIndicatorSeries)
+	EMA50Values []float64  `json:"ema50_values"` // EMA50 series (deprecated, 见 DynamicIndicatorSeries)
 	MACDValues  []float64  `json:"macd_values"`  // MACD series
 	RSI7Values  []float64  `json:"rsi7_values"`  // RSI7 series
 	RSI14Values []float64  `json:"rsi14_values"` // RSI14 series
 	Volume      []float64  `json:"volume"`       // Volume series (deprecated, use Klines)
 	ATR14       float64    `json:"atr14"`        // ATR14
-	// Bollinger Bands (period 20, std dev multiplier 2)
-	BOLLUpper  []float64 `json:"boll_upper"`  // Upper band
-	BOLLMiddle []float64 `json:"boll_middle"` // Middle band (SMA)
-	BOLLLower  []float64 `json:"boll_lower"`  // Lower band
+	BOLLUpper   []float64  `json:"boll_upper"`
+	BOLLMiddle  []float64  `json:"boll_middle"`
+	BOLLLower   []float64  `json:"boll_lower"`
+	// 动态指标序列：key 如 "ema_20", "ema_200", "rsi_14" 等，与 DynamicIndicators 对齐
+	DynamicIndicatorSeries map[string][]float64 `json:"dynamic_indicator_series,omitempty"`
 }
 
 // OIData Open Interest data

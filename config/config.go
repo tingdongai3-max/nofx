@@ -21,9 +21,10 @@ type Config struct {
 	MaxUsers            int // Maximum number of users allowed (0 = unlimited, default = 10)
 
 	// Database configuration
-	DBType     string // sqlite or postgres
-	DBPath     string // SQLite database file path
-	DBHost     string // PostgreSQL host
+	DBType      string // sqlite or postgres
+	DatabaseURL string // PostgreSQL connection string (Railway: DATABASE_URL)
+	DBPath      string // SQLite database file path
+	DBHost      string // PostgreSQL host
 	DBPort     int    // PostgreSQL port
 	DBUser     string // PostgreSQL user
 	DBPassword string // PostgreSQL password
@@ -105,6 +106,11 @@ func Init() {
 	cfg.TwelveDataKey = os.Getenv("TWELVEDATA_API_KEY")
 
 	// Database configuration
+	// Railway provides DATABASE_URL; when set, use PostgreSQL
+	if v := os.Getenv("DATABASE_URL"); v != "" {
+		cfg.DatabaseURL = strings.TrimSpace(v)
+		cfg.DBType = "postgres"
+	}
 	if v := os.Getenv("DB_TYPE"); v != "" {
 		cfg.DBType = strings.ToLower(v)
 	}

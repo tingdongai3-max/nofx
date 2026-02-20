@@ -65,14 +65,15 @@ func main() {
 		dbType = store.DBTypePostgres
 	}
 	st, err := store.NewWithConfig(store.DBConfig{
-		Type:     dbType,
-		Path:     cfg.DBPath,
-		Host:     cfg.DBHost,
-		Port:     cfg.DBPort,
-		User:     cfg.DBUser,
-		Password: cfg.DBPassword,
-		DBName:   cfg.DBName,
-		SSLMode:  cfg.DBSSLMode,
+		Type:        dbType,
+		DatabaseURL: cfg.DatabaseURL,
+		Path:        cfg.DBPath,
+		Host:        cfg.DBHost,
+		Port:        cfg.DBPort,
+		User:        cfg.DBUser,
+		Password:    cfg.DBPassword,
+		DBName:      cfg.DBName,
+		SSLMode:     cfg.DBSSLMode,
 	})
 	if err != nil {
 		logger.Fatalf("❌ Failed to initialize database: %v", err)

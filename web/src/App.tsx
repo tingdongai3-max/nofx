@@ -245,15 +245,18 @@ function App() {
     }
   )
 
+  // 账户/持仓轮询间隔至少 10 秒，避免 1～2 秒疯狂刷新触发限频
+  const POLL_ACCOUNT_POSITIONS_MS = 10000
+
   const { data: account } = useSWR<AccountInfo>(
     currentPage === 'trader' && selectedTraderId
       ? `account-${selectedTraderId}`
       : null,
     () => api.getAccount(selectedTraderId),
     {
-      refreshInterval: 15000, // 15秒刷新（配合后端15秒缓存）
-      revalidateOnFocus: false, // 禁用聚焦时重新验证，减少请求
-      dedupingInterval: 10000, // 10秒去重，防止短时间内重复请求
+      refreshInterval: POLL_ACCOUNT_POSITIONS_MS,
+      revalidateOnFocus: false,
+      dedupingInterval: POLL_ACCOUNT_POSITIONS_MS,
     }
   )
 
@@ -263,9 +266,9 @@ function App() {
       : null,
     () => api.getPositions(selectedTraderId),
     {
-      refreshInterval: 15000, // 15秒刷新（配合后端15秒缓存）
-      revalidateOnFocus: false, // 禁用聚焦时重新验证，减少请求
-      dedupingInterval: 10000, // 10秒去重，防止短时间内重复请求
+      refreshInterval: POLL_ACCOUNT_POSITIONS_MS,
+      revalidateOnFocus: false,
+      dedupingInterval: POLL_ACCOUNT_POSITIONS_MS,
     }
   )
 

@@ -31,10 +31,23 @@ import (
 	"nofx/trader/okx"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+)
+
+const accountPositionsCacheTTL = 5 * time.Second
+
+type ttlCacheEntry struct {
+	Body []byte
+	Until time.Time
+}
+
+var (
+	accountCache   sync.Map // key: traderID string, value: *ttlCacheEntry
+	positionsCache sync.Map
 )
 
 // Server HTTP API server
@@ -87,6 +100,7 @@ func NewServer(traderManager *manager.TraderManager, st *store.Store, cryptoServ
 }
 
 // corsMiddleware CORS middleware
+// "*" allows Railway auto-generated domains and any frontend origin for one-click deploy
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
@@ -402,6 +416,72 @@ func (s *Server) getTraderFromQuery(c *gin.Context) (*manager.TraderManager, str
 	return s.traderManager, traderID, nil
 }
 
+// createTempTraderFromExchangeConfig 根据交易所配置创建临时 Trader，IsTestnet 必须来自 exchangeCfg，禁止写死默认值（避免 50101 环境不匹配）
+func (s *Server) createTempTraderFromExchangeConfig(exchangeCfg *store.Exchange, userID string) (trader.Trader, error) {
+	if exchangeCfg == nil {
+		return nil, fmt.Errorf("exchange config is nil")
+	}
+	var t trader.Trader
+	var err error
+	switch exchangeCfg.ExchangeType {
+	case "binance":
+		t = binance.NewFuturesTrader(string(exchangeCfg.APIKey), string(exchangeCfg.SecretKey), userID, exchangeCfg.Testnet)
+	case "hyperliquid":
+		t, err = hyperliquidtrader.NewHyperliquidTrader(
+			string(exchangeCfg.APIKey),
+			exchangeCfg.HyperliquidWalletAddr,
+			exchangeCfg.Testnet,
+		)
+	case "aster":
+		t, err = aster.NewAsterTrader(
+			exchangeCfg.AsterUser,
+			exchangeCfg.AsterSigner,
+			string(exchangeCfg.AsterPrivateKey),
+		)
+	case "bybit":
+		t = bybit.NewBybitTrader(string(exchangeCfg.APIKey), string(exchangeCfg.SecretKey))
+	case "okx":
+		t = okx.NewOKXTrader(
+			string(exchangeCfg.APIKey),
+			string(exchangeCfg.SecretKey),
+			string(exchangeCfg.Passphrase),
+			true, // 临时实例默认全仓，实盘由 AutoTrader 传策略 IsCrossMargin
+			exchangeCfg.Testnet,
+		)
+	case "bitget":
+		t = bitget.NewBitgetTrader(
+			string(exchangeCfg.APIKey),
+			string(exchangeCfg.SecretKey),
+			string(exchangeCfg.Passphrase),
+		)
+	case "gate":
+		t = gate.NewGateTrader(string(exchangeCfg.APIKey), string(exchangeCfg.SecretKey))
+	case "kucoin":
+		t = kucoin.NewKuCoinTrader(
+			string(exchangeCfg.APIKey),
+			string(exchangeCfg.SecretKey),
+			string(exchangeCfg.Passphrase),
+		)
+	case "lighter":
+		if exchangeCfg.LighterWalletAddr != "" && string(exchangeCfg.LighterAPIKeyPrivateKey) != "" {
+			t, err = lighter.NewLighterTraderV2(
+				exchangeCfg.LighterWalletAddr,
+				string(exchangeCfg.LighterAPIKeyPrivateKey),
+				exchangeCfg.LighterAPIKeyIndex,
+				false,
+			)
+		} else {
+			err = fmt.Errorf("Lighter requires wallet address and API Key private key")
+		}
+	default:
+		return nil, fmt.Errorf("unsupported exchange type: %s", exchangeCfg.ExchangeType)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
 // AI trader management related structures
 type CreateTraderRequest struct {
 	Name                string  `json:"name" binding:"required"`
@@ -458,9 +538,9 @@ type SafeExchangeConfig struct {
 	ExchangeType          string `json:"exchange_type"` // "binance", "bybit", "okx", "hyperliquid", "aster", "lighter"
 	AccountName           string `json:"account_name"`  // User-defined account name
 	Name                  string `json:"name"`          // Display name
-	Type                  string `json:"type"`          // "cex" or "dex"
+	Type                  string `json:"type"`         // "cex" or "dex"
 	Enabled               bool   `json:"enabled"`
-	Testnet               bool   `json:"testnet,omitempty"`
+	Testnet               bool   `json:"testnet"`       // 必须返回，前端依赖此字段显示/回填模拟盘勾选
 	HyperliquidWalletAddr string `json:"hyperliquidWalletAddr"` // Hyperliquid wallet address (not sensitive)
 	AsterUser             string `json:"asterUser"`             // Aster username (not sensitive)
 	AsterSigner           string `json:"asterSigner"`           // Aster signer (not sensitive)
@@ -586,71 +666,8 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 	} else if !exchangeCfg.Enabled {
 		logger.Infof("⚠️ Exchange %s not enabled, using user input for initial balance", req.ExchangeID)
 	} else {
-		// Create temporary trader based on exchange type to query balance
-		var tempTrader trader.Trader
-		var createErr error
-
-		// Use ExchangeType (e.g., "binance") instead of ID (UUID)
-		// Convert EncryptedString fields to string
-		switch exchangeCfg.ExchangeType {
-		case "binance":
-			tempTrader = binance.NewFuturesTrader(string(exchangeCfg.APIKey), string(exchangeCfg.SecretKey), userID)
-		case "hyperliquid":
-			tempTrader, createErr = hyperliquidtrader.NewHyperliquidTrader(
-				string(exchangeCfg.APIKey), // private key
-				exchangeCfg.HyperliquidWalletAddr,
-				exchangeCfg.Testnet,
-			)
-		case "aster":
-			tempTrader, createErr = aster.NewAsterTrader(
-				exchangeCfg.AsterUser,
-				exchangeCfg.AsterSigner,
-				string(exchangeCfg.AsterPrivateKey),
-			)
-		case "bybit":
-			tempTrader = bybit.NewBybitTrader(
-				string(exchangeCfg.APIKey),
-				string(exchangeCfg.SecretKey),
-			)
-		case "okx":
-			tempTrader = okx.NewOKXTrader(
-				string(exchangeCfg.APIKey),
-				string(exchangeCfg.SecretKey),
-				string(exchangeCfg.Passphrase),
-			)
-		case "bitget":
-			tempTrader = bitget.NewBitgetTrader(
-				string(exchangeCfg.APIKey),
-				string(exchangeCfg.SecretKey),
-				string(exchangeCfg.Passphrase),
-			)
-		case "gate":
-			tempTrader = gate.NewGateTrader(
-				string(exchangeCfg.APIKey),
-				string(exchangeCfg.SecretKey),
-			)
-		case "kucoin":
-			tempTrader = kucoin.NewKuCoinTrader(
-				string(exchangeCfg.APIKey),
-				string(exchangeCfg.SecretKey),
-				string(exchangeCfg.Passphrase),
-			)
-		case "lighter":
-			if exchangeCfg.LighterWalletAddr != "" && string(exchangeCfg.LighterAPIKeyPrivateKey) != "" {
-				// Lighter only supports mainnet
-				tempTrader, createErr = lighter.NewLighterTraderV2(
-					exchangeCfg.LighterWalletAddr,
-					string(exchangeCfg.LighterAPIKeyPrivateKey),
-					exchangeCfg.LighterAPIKeyIndex,
-					false, // Always use mainnet for Lighter
-				)
-			} else {
-				createErr = fmt.Errorf("Lighter requires wallet address and API Key private key")
-			}
-		default:
-			logger.Infof("⚠️ Unsupported exchange type: %s, using user input for initial balance", exchangeCfg.ExchangeType)
-		}
-
+		// Create temporary trader from exchange config (Testnet 必须来自 exchangeCfg，禁止写死)
+		tempTrader, createErr := s.createTempTraderFromExchangeConfig(exchangeCfg, userID)
 		if createErr != nil {
 			logger.Infof("⚠️ Failed to create temporary trader, using user input for initial balance: %v", createErr)
 		} else if tempTrader != nil {
@@ -660,8 +677,6 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 				logger.Infof("⚠️ Failed to query exchange balance, using user input for initial balance: %v", balanceErr)
 			} else {
 				// Extract total equity (account total value = wallet balance + unrealized PnL)
-				// Priority: total_equity > totalWalletBalance > wallet_balance > totalEq > balance
-				// Note: Must use total_equity (not availableBalance) for accurate P&L calculation
 				balanceKeys := []string{"total_equity", "totalWalletBalance", "wallet_balance", "totalEq", "balance"}
 				for _, key := range balanceKeys {
 					if balance, ok := balanceInfo[key].(float64); ok && balance > 0 {
@@ -1155,75 +1170,14 @@ func (s *Server) handleSyncBalance(c *gin.Context) {
 		return
 	}
 
-	// Create temporary trader to query balance
-	var tempTrader trader.Trader
-	var createErr error
-
-	// Use ExchangeType (e.g., "binance") instead of ExchangeID (which is now UUID)
-	// Convert EncryptedString fields to string
-	switch exchangeCfg.ExchangeType {
-	case "binance":
-		tempTrader = binance.NewFuturesTrader(string(exchangeCfg.APIKey), string(exchangeCfg.SecretKey), userID)
-	case "hyperliquid":
-		tempTrader, createErr = hyperliquidtrader.NewHyperliquidTrader(
-			string(exchangeCfg.APIKey),
-			exchangeCfg.HyperliquidWalletAddr,
-			exchangeCfg.Testnet,
-		)
-	case "aster":
-		tempTrader, createErr = aster.NewAsterTrader(
-			exchangeCfg.AsterUser,
-			exchangeCfg.AsterSigner,
-			string(exchangeCfg.AsterPrivateKey),
-		)
-	case "bybit":
-		tempTrader = bybit.NewBybitTrader(
-			string(exchangeCfg.APIKey),
-			string(exchangeCfg.SecretKey),
-		)
-	case "okx":
-		tempTrader = okx.NewOKXTrader(
-			string(exchangeCfg.APIKey),
-			string(exchangeCfg.SecretKey),
-			string(exchangeCfg.Passphrase),
-		)
-	case "bitget":
-		tempTrader = bitget.NewBitgetTrader(
-			string(exchangeCfg.APIKey),
-			string(exchangeCfg.SecretKey),
-			string(exchangeCfg.Passphrase),
-		)
-	case "gate":
-		tempTrader = gate.NewGateTrader(
-			string(exchangeCfg.APIKey),
-			string(exchangeCfg.SecretKey),
-		)
-	case "kucoin":
-		tempTrader = kucoin.NewKuCoinTrader(
-			string(exchangeCfg.APIKey),
-			string(exchangeCfg.SecretKey),
-			string(exchangeCfg.Passphrase),
-		)
-	case "lighter":
-		if exchangeCfg.LighterWalletAddr != "" && string(exchangeCfg.LighterAPIKeyPrivateKey) != "" {
-			// Lighter only supports mainnet
-			tempTrader, createErr = lighter.NewLighterTraderV2(
-				exchangeCfg.LighterWalletAddr,
-				string(exchangeCfg.LighterAPIKeyPrivateKey),
-				exchangeCfg.LighterAPIKeyIndex,
-				false, // Always use mainnet for Lighter
-			)
-		} else {
-			createErr = fmt.Errorf("Lighter requires wallet address and API Key private key")
-		}
-	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported exchange type"})
-		return
-	}
-
+	tempTrader, createErr := s.createTempTraderFromExchangeConfig(exchangeCfg, userID)
 	if createErr != nil {
 		logger.Infof("⚠️ Failed to create temporary trader: %v", createErr)
 		SafeInternalError(c, "Failed to connect to exchange", createErr)
+		return
+	}
+	if tempTrader == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported exchange type"})
 		return
 	}
 
@@ -1318,75 +1272,14 @@ func (s *Server) handleClosePosition(c *gin.Context) {
 		return
 	}
 
-	// Create temporary trader to execute close position
-	var tempTrader trader.Trader
-	var createErr error
-
-	// Use ExchangeType (e.g., "binance") instead of ExchangeID (which is now UUID)
-	// Convert EncryptedString fields to string
-	switch exchangeCfg.ExchangeType {
-	case "binance":
-		tempTrader = binance.NewFuturesTrader(string(exchangeCfg.APIKey), string(exchangeCfg.SecretKey), userID)
-	case "hyperliquid":
-		tempTrader, createErr = hyperliquidtrader.NewHyperliquidTrader(
-			string(exchangeCfg.APIKey),
-			exchangeCfg.HyperliquidWalletAddr,
-			exchangeCfg.Testnet,
-		)
-	case "aster":
-		tempTrader, createErr = aster.NewAsterTrader(
-			exchangeCfg.AsterUser,
-			exchangeCfg.AsterSigner,
-			string(exchangeCfg.AsterPrivateKey),
-		)
-	case "bybit":
-		tempTrader = bybit.NewBybitTrader(
-			string(exchangeCfg.APIKey),
-			string(exchangeCfg.SecretKey),
-		)
-	case "okx":
-		tempTrader = okx.NewOKXTrader(
-			string(exchangeCfg.APIKey),
-			string(exchangeCfg.SecretKey),
-			string(exchangeCfg.Passphrase),
-		)
-	case "bitget":
-		tempTrader = bitget.NewBitgetTrader(
-			string(exchangeCfg.APIKey),
-			string(exchangeCfg.SecretKey),
-			string(exchangeCfg.Passphrase),
-		)
-	case "gate":
-		tempTrader = gate.NewGateTrader(
-			string(exchangeCfg.APIKey),
-			string(exchangeCfg.SecretKey),
-		)
-	case "kucoin":
-		tempTrader = kucoin.NewKuCoinTrader(
-			string(exchangeCfg.APIKey),
-			string(exchangeCfg.SecretKey),
-			string(exchangeCfg.Passphrase),
-		)
-	case "lighter":
-		if exchangeCfg.LighterWalletAddr != "" && string(exchangeCfg.LighterAPIKeyPrivateKey) != "" {
-			// Lighter only supports mainnet
-			tempTrader, createErr = lighter.NewLighterTraderV2(
-				exchangeCfg.LighterWalletAddr,
-				string(exchangeCfg.LighterAPIKeyPrivateKey),
-				exchangeCfg.LighterAPIKeyIndex,
-				false, // Always use mainnet for Lighter
-			)
-		} else {
-			createErr = fmt.Errorf("Lighter requires wallet address and API Key private key")
-		}
-	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported exchange type"})
-		return
-	}
-
+	tempTrader, createErr := s.createTempTraderFromExchangeConfig(exchangeCfg, userID)
 	if createErr != nil {
 		logger.Infof("⚠️ Failed to create temporary trader: %v", createErr)
 		SafeInternalError(c, "Failed to connect to exchange", createErr)
+		return
+	}
+	if tempTrader == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported exchange type"})
 		return
 	}
 
@@ -2185,57 +2078,211 @@ func (s *Server) handleStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, status)
 }
 
-// handleAccount Account information
+// handleAccount Account information（必须用 DB 中的 ExchangeConfig 创建临时 Trader，确保 Testnet 正确，避免 50101）
 func (s *Server) handleAccount(c *gin.Context) {
+	userID := c.GetString("user_id")
 	_, traderID, err := s.getTraderFromQuery(c)
 	if err != nil {
 		SafeBadRequest(c, "Invalid trader ID")
 		return
 	}
+	cacheKey := userID + ":" + traderID
+	if v, ok := accountCache.Load(cacheKey); ok {
+		entry := v.(*ttlCacheEntry)
+		if time.Now().Before(entry.Until) {
+			c.Data(http.StatusOK, "application/json", entry.Body)
+			return
+		}
+	}
 
-	trader, err := s.traderManager.GetTrader(traderID)
+	fullConfig, err := s.store.Trader().GetFullConfig(userID, traderID)
 	if err != nil {
 		SafeNotFound(c, "Trader")
 		return
 	}
+	exchangeCfg := fullConfig.Exchange
+	if exchangeCfg == nil || !exchangeCfg.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Exchange not configured or not enabled"})
+		return
+	}
 
-	logger.Infof("📊 Received account info request [%s]", trader.GetName())
-	account, err := trader.GetAccountInfo()
+	tempTrader, createErr := s.createTempTraderFromExchangeConfig(exchangeCfg, userID)
+	if createErr != nil || tempTrader == nil {
+		logger.Infof("⚠️ handleAccount create temp trader failed: %v", createErr)
+		SafeInternalError(c, "Failed to connect to exchange", createErr)
+		return
+	}
+
+	balance, err := tempTrader.GetBalance()
 	if err != nil {
 		SafeInternalError(c, "Get account info", err)
 		return
 	}
+	positions, err := tempTrader.GetPositions()
+	if err != nil {
+		SafeInternalError(c, "Get positions for account", err)
+		return
+	}
 
+	// 与 AutoTrader.GetAccountInfo 一致的字段构建
+	totalWalletBalance, _ := balance["totalWalletBalance"].(float64)
+	totalUnrealizedProfit, _ := balance["totalUnrealizedProfit"].(float64)
+	availableBalance, _ := balance["availableBalance"].(float64)
+	totalEquity, _ := balance["totalEquity"].(float64)
+	if totalEquity <= 0 {
+		totalEquity = totalWalletBalance + totalUnrealizedProfit
+	}
+	initialBalance := fullConfig.Trader.InitialBalance
+	totalPnL := totalEquity - initialBalance
+	totalPnLPct := 0.0
+	if initialBalance > 0 {
+		totalPnLPct = (totalPnL / initialBalance) * 100
+	}
+	totalMarginUsed := 0.0
+	for _, pos := range positions {
+		markPrice, _ := pos["markPrice"].(float64)
+		quantity, _ := pos["positionAmt"].(float64)
+		if quantity < 0 {
+			quantity = -quantity
+		}
+		leverage := 10.0
+		if lev, ok := pos["leverage"].(float64); ok && lev > 0 {
+			leverage = lev
+		}
+		totalMarginUsed += (quantity * markPrice) / leverage
+	}
+	marginUsedPct := 0.0
+	if totalEquity > 0 {
+		marginUsedPct = (totalMarginUsed / totalEquity) * 100
+	}
+
+	account := map[string]interface{}{
+		"total_equity":      totalEquity,
+		"wallet_balance":    totalWalletBalance,
+		"unrealized_profit": totalUnrealizedProfit,
+		"available_balance": availableBalance,
+		"total_pnl":         totalPnL,
+		"total_pnl_pct":     totalPnLPct,
+		"initial_balance":  initialBalance,
+		"daily_pnl":         0.0,
+		"position_count":    len(positions),
+		"margin_used":      totalMarginUsed,
+		"margin_used_pct":   marginUsedPct,
+	}
 	logger.Infof("✓ Returning account info [%s]: equity=%.2f, available=%.2f, pnl=%.2f (%.2f%%)",
-		trader.GetName(),
-		account["total_equity"],
-		account["available_balance"],
-		account["total_pnl"],
-		account["total_pnl_pct"])
-	c.JSON(http.StatusOK, account)
+		fullConfig.Trader.Name, totalEquity, availableBalance, totalPnL, totalPnLPct)
+	body, _ := json.Marshal(account)
+	accountCache.Store(cacheKey, &ttlCacheEntry{Body: body, Until: time.Now().Add(accountPositionsCacheTTL)})
+	c.Data(http.StatusOK, "application/json", body)
 }
 
-// handlePositions Position list
+// handlePositions Position list（必须用 DB 中的 ExchangeConfig 创建临时 Trader，确保 Testnet 正确，避免 50101）
 func (s *Server) handlePositions(c *gin.Context) {
+	userID := c.GetString("user_id")
 	_, traderID, err := s.getTraderFromQuery(c)
 	if err != nil {
 		SafeBadRequest(c, "Invalid trader ID")
 		return
 	}
+	cacheKey := userID + ":" + traderID
+	if v, ok := positionsCache.Load(cacheKey); ok {
+		entry := v.(*ttlCacheEntry)
+		if time.Now().Before(entry.Until) {
+			c.Data(http.StatusOK, "application/json", entry.Body)
+			return
+		}
+	}
 
-	trader, err := s.traderManager.GetTrader(traderID)
+	fullConfig, err := s.store.Trader().GetFullConfig(userID, traderID)
 	if err != nil {
 		SafeNotFound(c, "Trader")
 		return
 	}
+	exchangeCfg := fullConfig.Exchange
+	if exchangeCfg == nil || !exchangeCfg.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Exchange not configured or not enabled"})
+		return
+	}
 
-	positions, err := trader.GetPositions()
+	tempTrader, createErr := s.createTempTraderFromExchangeConfig(exchangeCfg, userID)
+	if createErr != nil || tempTrader == nil {
+		logger.Infof("⚠️ handlePositions create temp trader failed: %v", createErr)
+		SafeInternalError(c, "Failed to connect to exchange", createErr)
+		return
+	}
+
+	positions, err := tempTrader.GetPositions()
 	if err != nil {
 		SafeInternalError(c, "Get positions", err)
 		return
 	}
+	// 统一映射为前端期望的 snake_case 且数值类型，避免 OKX 等返回 string 或 camelCase 导致前端崩溃
+	out := normalizePositionsForFrontend(positions)
+	body, _ := json.Marshal(out)
+	positionsCache.Store(cacheKey, &ttlCacheEntry{Body: body, Until: time.Now().Add(accountPositionsCacheTTL)})
+	c.Data(http.StatusOK, "application/json", body)
+}
 
-	c.JSON(http.StatusOK, positions)
+// normalizePositionsForFrontend 将各交易所的持仓 map 转为前端 Position 结构（snake_case，数值保证为 number）
+func normalizePositionsForFrontend(positions []map[string]interface{}) []map[string]interface{} {
+	if len(positions) == 0 {
+		return positions
+	}
+	out := make([]map[string]interface{}, 0, len(positions))
+	for _, p := range positions {
+		entryPrice := toFloat64(p["entryPrice"], p["entry_price"])
+		markPrice := toFloat64(p["markPrice"], p["mark_price"])
+		quantity := toFloat64(p["positionAmt"], p["quantity"])
+		if quantity < 0 {
+			quantity = -quantity
+		}
+		unrealizedPnl := toFloat64(p["unRealizedProfit"], p["unrealized_pnl"])
+		leverage := toFloat64(p["leverage"], p["leverage"])
+		liqPrice := toFloat64(p["liquidationPrice"], p["liqPx"], p["liquidation_price"])
+		marginUsed := toFloat64(p["margin"], p["margin_used"])
+		side, _ := p["side"].(string)
+		if side == "" {
+			side = "long"
+		}
+		symbol, _ := p["symbol"].(string)
+		unrealizedPnlPct := 0.0
+		if entryPrice > 0 && quantity > 0 {
+			unrealizedPnlPct = (unrealizedPnl / (entryPrice * quantity)) * 100
+		}
+		out = append(out, map[string]interface{}{
+			"symbol":             symbol,
+			"side":               strings.ToLower(side),
+			"entry_price":        entryPrice,
+			"mark_price":         markPrice,
+			"quantity":           quantity,
+			"leverage":           leverage,
+			"unrealized_pnl":     unrealizedPnl,
+			"unrealized_pnl_pct": unrealizedPnlPct,
+			"liquidation_price":  liqPrice,
+			"margin_used":        marginUsed,
+		})
+	}
+	return out
+}
+
+func toFloat64(vals ...interface{}) float64 {
+	for _, v := range vals {
+		if v == nil {
+			continue
+		}
+		switch x := v.(type) {
+		case float64:
+			return x
+		case int:
+			return float64(x)
+		case int64:
+			return float64(x)
+		case string:
+			f, _ := strconv.ParseFloat(x, 64)
+			return f
+		}
+	}
+	return 0
 }
 
 // handlePositionHistory Historical closed positions with statistics

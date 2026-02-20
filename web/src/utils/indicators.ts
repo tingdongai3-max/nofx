@@ -174,6 +174,120 @@ export function calculateRSI(data: Kline[], period = 14): Array<{ time: number; 
   return result
 }
 
+// ADX (Average Directional Index), period 默认 14
+export function calculateADX(
+  data: Kline[],
+  period = 14
+): Array<{ time: number; value: number }> {
+  const result: Array<{ time: number; value: number }> = []
+  if (data.length < period + 2) return result
+
+  const high = data.map(d => d.high)
+  const low = data.map(d => d.low)
+  const close = data.map(d => d.close)
+
+  const tr: number[] = [0]
+  const plusDM: number[] = [0]
+  const minusDM: number[] = [0]
+  for (let i = 1; i < data.length; i++) {
+    tr.push(Math.max(high[i] - low[i], Math.abs(high[i] - close[i - 1]), Math.abs(low[i] - close[i - 1])))
+    const upMove = high[i] - high[i - 1]
+    const downMove = low[i - 1] - low[i]
+    plusDM.push(upMove > downMove && upMove > 0 ? upMove : 0)
+    minusDM.push(downMove > upMove && downMove > 0 ? downMove : 0)
+  }
+
+  const smooth = (arr: number[], period: number): number[] => {
+    const out: number[] = []
+    let sum = 0
+    for (let i = 0; i < period && i < arr.length; i++) sum += arr[i]
+    out.push(sum)
+    for (let i = period; i < arr.length; i++) {
+      sum = sum - sum / period + arr[i]
+      out.push(sum)
+    }
+    return out
+  }
+
+  const atr = smooth(tr.slice(1), period)
+  const plusDI: number[] = []
+  const minusDI: number[] = []
+  for (let i = period - 1; i < tr.length - 1; i++) {
+    const atrVal = atr[i - period + 1] || atr[atr.length - 1]
+    if (atrVal <= 0) {
+      plusDI.push(0)
+      minusDI.push(0)
+    } else {
+      let sumPlus = 0, sumMinus = 0
+      for (let j = i - period + 1; j <= i; j++) {
+        sumPlus += plusDM[j + 1]
+        sumMinus += minusDM[j + 1]
+      }
+      plusDI.push(100 * (sumPlus / period) / atrVal)
+      minusDI.push(100 * (sumMinus / period) / atrVal)
+    }
+  }
+
+  const dx: number[] = []
+  for (let i = 0; i < plusDI.length; i++) {
+    const sum = plusDI[i] + minusDI[i]
+    if (sum === 0) dx.push(0)
+    else dx.push(100 * Math.abs(plusDI[i] - minusDI[i]) / sum)
+  }
+
+  const adxSmooth: number[] = []
+  if (dx.length >= period) {
+    let sum = 0
+    for (let i = 0; i < period; i++) sum += dx[i]
+    adxSmooth.push(sum / period)
+    for (let i = period; i < dx.length; i++) {
+      adxSmooth.push((adxSmooth[adxSmooth.length - 1] * (period - 1) + dx[i]) / period)
+    }
+  }
+
+  for (let i = 0; i < adxSmooth.length; i++) {
+    const idx = period + i
+    if (data[idx]) result.push({ time: data[idx].time, value: adxSmooth[i] })
+  }
+  return result
+}
+
+// ATR (Average True Range), period 默认 14，Wilder 平滑
+export function calculateATR(
+  data: Kline[],
+  period = 14
+): Array<{ time: number; value: number }> {
+  const result: Array<{ time: number; value: number }> = []
+  if (data.length < period + 1) return result
+
+  const tr: number[] = [0]
+  for (let i = 1; i < data.length; i++) {
+    const high = data[i].high
+    const low = data[i].low
+    const prevClose = data[i - 1].close
+    const t = Math.max(
+      high - low,
+      Math.abs(high - prevClose),
+      Math.abs(low - prevClose)
+    )
+    tr.push(t)
+  }
+
+  // Wilder smoothing: first ATR = SMA of first `period` TRs
+  let atr = 0
+  for (let i = 1; i <= period; i++) {
+    atr += tr[i]
+  }
+  atr = atr / period
+  result.push({ time: data[period].time, value: atr })
+
+  for (let i = period + 1; i < data.length; i++) {
+    atr = (atr * (period - 1) + tr[i]) / period
+    result.push({ time: data[i].time, value: atr })
+  }
+  return result
+}
+
 // 布林带
 export interface BollingerBands {
   time: number

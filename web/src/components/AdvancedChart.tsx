@@ -16,6 +16,10 @@ import {
   calculateSMA,
   calculateEMA,
   calculateBollingerBands,
+  calculateMACD,
+  calculateRSI,
+  calculateATR,
+  calculateADX,
   type Kline,
 } from '../utils/indicators'
 import { Settings, BarChart2 } from 'lucide-react'
@@ -115,6 +119,14 @@ export function AdvancedChart({
   const currentMarkersDataRef = useRef<any[]>([]) // 存储当前的标记数据
   const klineDataRef = useRef<Map<number, { volume: number; quoteVolume: number }>>(new Map()) // 存储 kline 额外数据
   const priceLinesRef = useRef<any[]>([]) // 存储挂单价格线
+  const lastKlineDataRef = useRef<Kline[]>([]) // 用于指标/均线切换时重绘
+  const indicatorDataRef = useRef<{
+    macd: Array<{ time: number; macd: number; signal: number; histogram: number }>
+    rsi: Array<{ time: number; value: number }>
+    atr: Array<{ time: number; value: number }>
+    adx: Array<{ time: number; value: number }>
+    ma: Record<string, Array<{ time: number; value: number }>>
+  }>({ macd: [], rsi: [], atr: [], adx: [], ma: {} })
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -135,17 +147,23 @@ export function AdvancedChart({
     quoteVolume: number // 成交额（USDT/USD）
   } | null>(null)
 
-  // 指标配置
+  // 固定指标（Volume / BOLL / MACD / RSI / ATR）
   const [indicators, setIndicators] = useState<IndicatorConfig[]>([
     { id: 'volume', name: 'Volume', enabled: true, color: '#3B82F6' },
-    { id: 'ma5', name: 'MA5', enabled: false, color: '#FF6B6B', params: { period: 5 } },
-    { id: 'ma10', name: 'MA10', enabled: false, color: '#4ECDC4', params: { period: 10 } },
-    { id: 'ma20', name: 'MA20', enabled: false, color: '#FFD93D', params: { period: 20 } },
-    { id: 'ma60', name: 'MA60', enabled: false, color: '#95E1D3', params: { period: 60 } },
-    { id: 'ema12', name: 'EMA12', enabled: false, color: '#A8E6CF', params: { period: 12 } },
-    { id: 'ema26', name: 'EMA26', enabled: false, color: '#FFD3B6', params: { period: 26 } },
-    { id: 'bb', name: 'Bollinger Bands', enabled: false, color: '#9B59B6' },
+    { id: 'bb', name: 'BOLL', enabled: false, color: '#9B59B6' },
+    { id: 'macd', name: 'MACD', enabled: false, color: '#F97316' },
+    { id: 'rsi', name: 'RSI', enabled: false, color: '#22C55E' },
+    { id: 'atr', name: 'ATR', enabled: false, color: '#F6465D', params: { period: 14 } },
+    { id: 'adx', name: 'ADX', enabled: false, color: '#A855F7', params: { period: 14 } },
   ])
+  // 动态添加的均线（SMA/EMA + 自定义周期）
+  const [customMAs, setCustomMAs] = useState<Array<{ id: string; type: 'sma' | 'ema'; period: number; color: string; name: string }>>([])
+  const nextMAIdRef = useRef(0)
+  // 用 ref 保存当前指标/均线状态，避免 loadData 定时刷新时闭包拿到旧状态导致勾选丢失
+  const indicatorsRef = useRef(indicators)
+  const customMAsRef = useRef(customMAs)
+  indicatorsRef.current = indicators
+  customMAsRef.current = customMAs
 
   // 从服务获取K线数据
   const fetchKlineData = async (symbol: string, interval: string) => {
@@ -435,13 +453,12 @@ export function AdvancedChart({
     })
     candlestickSeriesRef.current = candlestickSeries as any
 
-    // 创建成交量系列
+    // 创建成交量系列（净化：无水平虚线、无纵轴色块、无尾价动画）
     const volumeSeries = chart.addSeries(HistogramSeries, {
       color: '#26a69a',
-      priceFormat: {
-        type: 'volume',
-      },
+      priceFormat: { type: 'volume' },
       priceScaleId: '',
+      lastPriceAnimation: 0,
       lastValueVisible: false,
       priceLineVisible: false,
     })
@@ -458,7 +475,20 @@ export function AdvancedChart({
       resizeObserver.observe(chartContainerRef.current)
     }
 
-    // 监听鼠标移动，显示 OHLC 信息
+    // 查找时间序列中 <= time 的最近一点的 value（用于十字光标图例）
+    const findValueAt = <T extends { time: number }>(
+      arr: T[],
+      time: number,
+      valueKey: keyof T = 'value' as keyof T
+    ): number | undefined => {
+      if (!arr.length) return undefined
+      let i = arr.length - 1
+      while (i >= 0 && arr[i].time > time) i--
+      if (i < 0) return undefined
+      const v = arr[i][valueKey]
+      return typeof v === 'number' ? v : undefined
+    }
+
     chart.subscribeCrosshairMove((param) => {
       if (!param.time || !param.point || !candlestickSeriesRef.current) {
         setTooltipData(null)
@@ -472,9 +502,24 @@ export function AdvancedChart({
       }
 
       const candleData = data as any
-
-      // 从存储的数据中获取 volume 和 quoteVolume
       const klineExtra = klineDataRef.current.get(param.time as number) || { volume: 0, quoteVolume: 0 }
+      const t = param.time as number
+      const ind = indicatorDataRef.current
+
+      const macdPoint = ind.macd.length ? (() => {
+        let i = ind.macd.length - 1
+        while (i >= 0 && ind.macd[i].time > t) i--
+        return i >= 0 ? ind.macd[i] : null
+      })() : null
+
+      const rsiVal = ind.rsi.length ? findValueAt(ind.rsi, t) : undefined
+      const atrVal = ind.atr.length ? findValueAt(ind.atr, t) : undefined
+      const adxVal = ind.adx.length ? findValueAt(ind.adx, t) : undefined
+      const maValues: Record<string, number> = {}
+      Object.keys(ind.ma).forEach(name => {
+        const v = findValueAt(ind.ma[name], t)
+        if (v !== undefined) maValues[name] = v
+      })
 
       setTooltipData({
         time: param.time,
@@ -486,6 +531,13 @@ export function AdvancedChart({
         quoteVolume: klineExtra.quoteVolume,
         x: param.point.x,
         y: param.point.y,
+        macd: macdPoint ? macdPoint.macd : undefined,
+        signal: macdPoint ? macdPoint.signal : undefined,
+        histogram: macdPoint ? macdPoint.histogram : undefined,
+        rsi: rsiVal,
+        atr: atrVal,
+        adx: adxVal,
+        ma: Object.keys(maValues).length ? maValues : undefined,
       })
     })
 
@@ -581,7 +633,8 @@ export function AdvancedChart({
           }
         }
 
-        // 3. 添加指标
+        // 3. 添加指标（并缓存 K 线供指标开关/均线变更时重绘）
+        lastKlineDataRef.current = klineData
         updateIndicators(klineData)
 
         // 4. 获取并显示订单标记
@@ -741,6 +794,13 @@ export function AdvancedChart({
     return () => clearInterval(refreshInterval)
   }, [symbol, interval, traderID, exchange])
 
+  // 指标或动态均线变更时重绘指标（使用已加载的 K 线）
+  useEffect(() => {
+    if (lastKlineDataRef.current.length > 0) {
+      updateIndicators(lastKlineDataRef.current)
+    }
+  }, [indicators, customMAs])
+
   // 单独刷新挂单价格线 (60秒刷新一次，避免频繁调用交易所API)
   useEffect(() => {
     if (!traderID || !candlestickSeriesRef.current) return
@@ -835,67 +895,161 @@ export function AdvancedChart({
     }
   }, [showOrderMarkers])
 
-  // 更新指标
+  // 所有指标系列共用的“净化”选项：去掉水平虚线、纵轴色块、尾价动画
+  const indicatorSeriesOptions = {
+    lastPriceAnimation: 0 as const,
+    priceLineVisible: false,
+    lastValueVisible: false,
+  }
+
+  // 更新指标（读取 ref 以兼容定时刷新时的最新勾选状态，避免勾选后消失）
   const updateIndicators = (klineData: Kline[]) => {
     if (!chartRef.current) return
+    const chart = chartRef.current
+    const currentIndicators = indicatorsRef.current
+    const currentCustomMAs = customMAsRef.current
 
-    // 清除旧指标
     indicatorSeriesRef.current.forEach(series => {
-      chartRef.current?.removeSeries(series as any)
+      chart.removeSeries(series as any)
     })
     indicatorSeriesRef.current.clear()
 
-    // 添加启用的指标
-    indicators.forEach(indicator => {
-      if (!indicator.enabled || !chartRef.current) return
+    // 重置十字光标图例数据源，下面按需填充
+    indicatorDataRef.current = { macd: [], rsi: [], atr: [], adx: [], ma: {} }
 
-      if (indicator.id.startsWith('ma')) {
-        const maData = calculateSMA(klineData, indicator.params.period)
-        const series = chartRef.current.addSeries(LineSeries, {
-          color: indicator.color,
-          lineWidth: 2,
-          title: indicator.name,
-        })
-        series.setData(maData as any)
-        indicatorSeriesRef.current.set(indicator.id, series)
-      } else if (indicator.id.startsWith('ema')) {
-        const emaData = calculateEMA(klineData, indicator.params.period)
-        const series = chartRef.current.addSeries(LineSeries, {
-          color: indicator.color,
-          lineWidth: 2,
-          title: indicator.name,
-          lineStyle: 2, // 虚线
-        })
-        series.setData(emaData as any)
-        indicatorSeriesRef.current.set(indicator.id, series)
-      } else if (indicator.id === 'bb') {
+    const paneMain = 0
+    const paneMACD = 1
+    const paneRSI = 2
+    const paneATR = 3
+    const paneADX = 4
+
+    // 1) 动态均线：主图
+    currentCustomMAs.forEach(ma => {
+      const data = ma.type === 'sma' ? calculateSMA(klineData, ma.period) : calculateEMA(klineData, ma.period)
+      indicatorDataRef.current.ma[ma.name] = data
+      const series = chart.addSeries(LineSeries, {
+        ...indicatorSeriesOptions,
+        color: ma.color,
+        lineWidth: 2,
+        title: ma.name,
+        lineStyle: ma.type === 'ema' ? 2 : 0,
+      }, paneMain as any)
+      series.setData(data as any)
+      indicatorSeriesRef.current.set(ma.id, series)
+    })
+
+    // 2) 固定指标
+    currentIndicators.forEach(indicator => {
+      if (!indicator.enabled) return
+      const baseOpts = { ...indicatorSeriesOptions }
+
+      if (indicator.id === 'bb') {
         const bbData = calculateBollingerBands(klineData)
-
-        const upperSeries = chartRef.current.addSeries(LineSeries, {
+        const upperSeries = chart.addSeries(LineSeries, {
+          ...baseOpts,
           color: indicator.color,
           lineWidth: 1,
           title: 'BB Upper',
-        })
+        }, paneMain as any)
         upperSeries.setData(bbData.map(d => ({ time: d.time as any, value: d.upper })))
-
-        const middleSeries = chartRef.current.addSeries(LineSeries, {
+        const middleSeries = chart.addSeries(LineSeries, {
+          ...baseOpts,
           color: indicator.color,
           lineWidth: 1,
           lineStyle: 2,
           title: 'BB Middle',
-        })
+        }, paneMain as any)
         middleSeries.setData(bbData.map(d => ({ time: d.time as any, value: d.middle })))
-
-        const lowerSeries = chartRef.current.addSeries(LineSeries, {
+        const lowerSeries = chart.addSeries(LineSeries, {
+          ...baseOpts,
           color: indicator.color,
           lineWidth: 1,
           title: 'BB Lower',
-        })
+        }, paneMain as any)
         lowerSeries.setData(bbData.map(d => ({ time: d.time as any, value: d.lower })))
-
         indicatorSeriesRef.current.set(indicator.id + '_upper', upperSeries)
         indicatorSeriesRef.current.set(indicator.id + '_middle', middleSeries)
         indicatorSeriesRef.current.set(indicator.id + '_lower', lowerSeries)
+      } else if (indicator.id === 'macd') {
+        const macdData = calculateMACD(klineData)
+        if (macdData.length === 0) return
+        indicatorDataRef.current.macd = macdData
+        const histData = macdData.map(d => ({
+          time: d.time as any,
+          value: d.histogram,
+          color: d.histogram >= 0 ? 'rgba(14, 203, 129, 0.5)' : 'rgba(246, 70, 93, 0.5)',
+        }))
+        const histSeries = chart.addSeries(HistogramSeries, {
+          ...indicatorSeriesOptions,
+          priceScaleId: 'macd',
+          title: 'MACD Hist',
+        }, paneMACD as any)
+        histSeries.setData(histData)
+        const macdSeries = chart.addSeries(LineSeries, {
+          ...baseOpts,
+          color: indicator.color,
+          lineWidth: 1,
+          title: 'MACD',
+          priceScaleId: 'macd',
+        }, paneMACD as any)
+        macdSeries.setData(macdData.map(d => ({ time: d.time as any, value: d.macd })))
+        const signalSeries = chart.addSeries(LineSeries, {
+          ...baseOpts,
+          color: '#60A5FA',
+          lineWidth: 1,
+          lineStyle: 2,
+          title: 'Signal',
+          priceScaleId: 'macd',
+        }, paneMACD as any)
+        signalSeries.setData(macdData.map(d => ({ time: d.time as any, value: d.signal })))
+        indicatorSeriesRef.current.set(indicator.id + '_hist', histSeries)
+        indicatorSeriesRef.current.set(indicator.id + '_macd', macdSeries)
+        indicatorSeriesRef.current.set(indicator.id + '_signal', signalSeries)
+      } else if (indicator.id === 'rsi') {
+        const rsiData = calculateRSI(klineData, 14)
+        if (rsiData.length === 0) return
+        indicatorDataRef.current.rsi = rsiData
+        const rsiSeries = chart.addSeries(LineSeries, {
+          ...baseOpts,
+          priceScaleId: 'rsi',
+          color: indicator.color,
+          lineWidth: 1,
+          title: 'RSI(14)',
+        }, paneRSI as any)
+        rsiSeries.setData(rsiData.map(d => ({ time: d.time as any, value: d.value })))
+        const scale = rsiSeries.priceScale()
+        if (scale && 'applyOptions' in scale) {
+          (scale as any).applyOptions({ scaleMargins: { top: 0.1, bottom: 0.1 }, minimumWidth: 40 })
+        }
+        indicatorSeriesRef.current.set(indicator.id, rsiSeries)
+      } else if (indicator.id === 'atr') {
+        const period = (indicator.params?.period as number) || 14
+        const atrData = calculateATR(klineData, period)
+        if (atrData.length === 0) return
+        indicatorDataRef.current.atr = atrData
+        const atrSeries = chart.addSeries(LineSeries, {
+          ...baseOpts,
+          priceScaleId: 'atr',
+          color: '#F6465D',
+          lineWidth: 1,
+          title: `ATR(${period})`,
+        }, paneATR as any)
+        atrSeries.setData(atrData.map(d => ({ time: d.time as any, value: d.value })))
+        indicatorSeriesRef.current.set(indicator.id, atrSeries)
+      } else if (indicator.id === 'adx') {
+        const period = (indicator.params?.period as number) || 14
+        const adxData = calculateADX(klineData, period)
+        if (adxData.length === 0) return
+        indicatorDataRef.current.adx = adxData
+        const adxSeries = chart.addSeries(LineSeries, {
+          ...baseOpts,
+          priceScaleId: 'adx',
+          color: indicator.color,
+          lineWidth: 1,
+          title: `ADX(${period})`,
+        }, paneADX as any)
+        adxSeries.setData(adxData.map(d => ({ time: d.time as any, value: d.value })))
+        indicatorSeriesRef.current.set(indicator.id, adxSeries)
       }
     })
   }
@@ -905,6 +1059,23 @@ export function AdvancedChart({
     setIndicators(prev =>
       prev.map(ind => (ind.id === id ? { ...ind, enabled: !ind.enabled } : ind))
     )
+  }
+
+  // 动态均线：添加
+  const MA_COLORS = ['#FF6B6B', '#4ECDC4', '#FFD93D', '#95E1D3', '#A8E6CF', '#FFD3B6', '#DDA0DD', '#87CEEB']
+  const [newMAType, setNewMAType] = useState<'sma' | 'ema'>('ema')
+  const [newMAPeriod, setNewMAPeriod] = useState<string>('20')
+  const addCustomMA = () => {
+    const period = parseInt(newMAPeriod, 10)
+    if (period < 2 || period > 500) return
+    const id = `ma_${nextMAIdRef.current++}`
+    const name = `${newMAType.toUpperCase()}${period}`
+    const color = MA_COLORS[customMAs.length % MA_COLORS.length]
+    setCustomMAs(prev => [...prev, { id, type: newMAType, period, color, name }])
+    setNewMAPeriod(String(period))
+  }
+  const removeCustomMA = (id: string) => {
+    setCustomMAs(prev => prev.filter(m => m.id !== id))
   }
 
   return (
@@ -1069,6 +1240,67 @@ export function AdvancedChart({
             ))}
           </div>
 
+          {/* 动态均线：添加 */}
+          <div
+            className="px-3 pb-3 pt-1 border-t"
+            style={{ borderColor: 'rgba(43, 49, 57, 0.5)' }}
+          >
+            <div className="text-xs font-medium text-gray-400 mb-2">
+              {language === 'zh' ? '+ 添加移动平均线' : '+ Add Moving Average'}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <select
+                value={newMAType}
+                onChange={e => setNewMAType(e.target.value as 'sma' | 'ema')}
+                className="rounded border border-gray-600 bg-[#1A1E23] text-gray-200 text-xs px-2 py-1.5 focus:ring-1 focus:ring-yellow-500/50"
+              >
+                <option value="sma">SMA</option>
+                <option value="ema">EMA</option>
+              </select>
+              <input
+                type="number"
+                min={2}
+                max={500}
+                value={newMAPeriod}
+                onChange={e => setNewMAPeriod(e.target.value)}
+                placeholder={language === 'zh' ? '周期' : 'Period'}
+                className="w-16 rounded border border-gray-600 bg-[#1A1E23] text-gray-200 text-xs px-2 py-1.5 focus:ring-1 focus:ring-yellow-500/50"
+              />
+              <button
+                type="button"
+                onClick={addCustomMA}
+                className="px-2 py-1.5 rounded text-xs font-medium bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30"
+              >
+                {language === 'zh' ? '添加' : 'Add'}
+              </button>
+            </div>
+            {customMAs.length > 0 && (
+              <ul className="mt-2 space-y-1">
+                {customMAs.map(ma => (
+                  <li
+                    key={ma.id}
+                    className="flex items-center justify-between text-xs text-gray-300 py-1 px-2 rounded bg-white/5"
+                  >
+                    <span>
+                      <span
+                        className="inline-block w-3 h-2 rounded-sm mr-1.5 border border-white/10"
+                        style={{ backgroundColor: ma.color }}
+                      />
+                      {ma.name}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => removeCustomMA(ma.id)}
+                      className="text-red-400 hover:text-red-300"
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
           {/* 底部提示 */}
           <div
             className="px-4 py-2 text-xs text-gray-500 border-t"
@@ -1147,6 +1379,42 @@ export function AdvancedChart({
                   </span>
                 </>
               )}
+              {tooltipData.macd != null && (
+                <>
+                  <span style={{ color: '#848E9C' }}>MACD:</span>
+                  <span style={{ color: '#F97316' }}>{(tooltipData.macd as number).toFixed(4)}</span>
+                  <span style={{ color: '#848E9C' }}>Signal:</span>
+                  <span style={{ color: '#60A5FA' }}>{(tooltipData.signal as number).toFixed(4)}</span>
+                  <span style={{ color: '#848E9C' }}>Hist:</span>
+                  <span style={{ color: (tooltipData.histogram as number) >= 0 ? '#0ECB81' : '#F6465D' }}>
+                    {(tooltipData.histogram as number).toFixed(4)}
+                  </span>
+                </>
+              )}
+              {tooltipData.rsi != null && (
+                <>
+                  <span style={{ color: '#848E9C' }}>RSI:</span>
+                  <span style={{ color: '#22C55E' }}>{(tooltipData.rsi as number).toFixed(2)}</span>
+                </>
+              )}
+              {tooltipData.atr != null && (
+                <>
+                  <span style={{ color: '#848E9C' }}>ATR:</span>
+                  <span style={{ color: '#F6465D' }}>{(tooltipData.atr as number).toFixed(4)}</span>
+                </>
+              )}
+              {tooltipData.adx != null && (
+                <>
+                  <span style={{ color: '#848E9C' }}>ADX:</span>
+                  <span style={{ color: '#A855F7' }}>{(tooltipData.adx as number).toFixed(2)}</span>
+                </>
+              )}
+              {tooltipData.ma && Object.entries(tooltipData.ma).map(([name, val]) => (
+                <span key={name} style={{ gridColumn: '1 / -1', display: 'contents' }}>
+                  <span style={{ color: '#848E9C' }}>{name}:</span>
+                  <span style={{ color: '#EAECEF' }}>{(val as number).toFixed(2)}</span>
+                </span>
+              ))}
             </div>
           </div>
         )}

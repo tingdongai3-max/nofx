@@ -1,3 +1,4 @@
+import { useState, useEffect } from 'react'
 import { Clock, Activity, TrendingUp, BarChart2, Info, Lock, ExternalLink, Zap, Check, AlertCircle, Key } from 'lucide-react'
 import type { IndicatorConfig } from '../../types'
 
@@ -35,6 +36,13 @@ export function IndicatorEditor({
   disabled,
   language,
 }: IndicatorEditorProps) {
+  const [trailingOffsetLocal, setTrailingOffsetLocal] = useState<string>(() =>
+    String(config.trailing_offset_percent ?? 0)
+  )
+  useEffect(() => {
+    setTrailingOffsetLocal(String(config.trailing_offset_percent ?? 0))
+  }, [config.trailing_offset_percent])
+
   const t = (key: string) => {
     const translations: Record<string, Record<string, string>> = {
       // Section titles
@@ -50,7 +58,8 @@ export function IndicatorEditor({
       // Timeframes
       timeframes: { zh: '时间周期', en: 'Timeframes' },
       timeframesDesc: { zh: '选择 K 线分析周期，★ 为主周期（双击设置）', en: 'Select K-line timeframes, ★ = primary (double-click)' },
-      klineCount: { zh: 'K 线数量', en: 'K-line Count' },
+      timeframeKlineCounts: { zh: '各周期 K 线数量', en: 'K-line count per timeframe' },
+      timeframeKlineCountsDesc: { zh: '为每个周期设置获取的 K 线根数，未填则用默认', en: 'Set count per timeframe; empty uses default' },
       scalp: { zh: '超短', en: 'Scalp' },
       intraday: { zh: '日内', en: 'Intraday' },
       swing: { zh: '波段', en: 'Swing' },
@@ -70,8 +79,12 @@ export function IndicatorEditor({
       rsiDesc: { zh: '相对强弱指标', en: 'Relative Strength Index' },
       atr: { zh: 'ATR', en: 'ATR' },
       atrDesc: { zh: '真实波幅均值', en: 'Average True Range' },
+      adx: { zh: 'ADX', en: 'ADX' },
+      adxDesc: { zh: '平均趋向指数', en: 'Average Directional Index' },
       boll: { zh: 'BOLL 布林带', en: 'Bollinger Bands' },
       bollDesc: { zh: '布林带指标（上中下轨）', en: 'Upper/Middle/Lower Bands' },
+      fibonacci: { zh: '斐波那契回撤', en: 'Fibonacci' },
+      fibonacciDesc: { zh: '阻力/支撑位写入 AI 文本', en: 'Resistance/support levels in AI prompt' },
       volume: { zh: '成交量', en: 'Volume' },
       volumeDesc: { zh: '交易量分析', en: 'Trading volume analysis' },
       oi: { zh: '持仓量', en: 'Open Interest' },
@@ -101,6 +114,21 @@ export function IndicatorEditor({
 
       // Tips
       aiCanCalculate: { zh: '💡 提示：AI 可自行计算这些指标，开启可减少 AI 计算量', en: '💡 Tip: AI can calculate these, enabling reduces AI workload' },
+
+      // Trailing stop (Risk Watchdog)
+      trailingPanel: { zh: '动态追踪止盈/止损 (硬风控)', en: 'Trailing Stop (Hard Risk)' },
+      trailingPanelDesc: { zh: '不经过 AI：价格跌破/突破所选指标线即市价平仓', en: 'Close by market when price breaks the selected indicator line (no AI)' },
+      enableTrailing: { zh: '开启指标移动止盈止损', en: 'Enable indicator trailing stop' },
+      trailingIndicator: { zh: '平仓线指标', en: 'Trailing line' },
+      trailingEma20: { zh: 'EMA20', en: 'EMA20' },
+      trailingEma50: { zh: 'EMA50', en: 'EMA50' },
+      trailingBollMiddle: { zh: '布林带中轨', en: 'BOLL Middle' },
+      trailingTimeframe: { zh: '风控计算周期', en: 'Watchdog timeframe' },
+      trailingOffsetPercent: { zh: '触发偏移量 (%)', en: 'Trigger offset (%)' },
+      trailingOffsetTooltip: {
+        zh: '例如设置 0.5，多单将在价格跌破均线 0.5% 后才触发平仓，防止假跌破插针。',
+        en: 'e.g. 0.5: long closes only when price is 0.5% below the line, avoiding fake breakdowns.',
+      },
 
       // NofxOS Data Provider
       nofxosTitle: { zh: 'NofxOS 量化数据源', en: 'NofxOS Data Provider' },
@@ -577,30 +605,9 @@ export function IndicatorEditor({
 
           {/* Timeframe Selection */}
           <div>
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center gap-2">
-                <Clock className="w-3.5 h-3.5" style={{ color: '#848E9C' }} />
-                <span className="text-xs font-medium" style={{ color: '#EAECEF' }}>{t('timeframes')}</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-[10px]" style={{ color: '#848E9C' }}>{t('klineCount')}:</span>
-                <input
-                  type="number"
-                  value={config.klines.primary_count}
-                  onChange={(e) =>
-                    !disabled &&
-                    onChange({
-                      ...config,
-                      klines: { ...config.klines, primary_count: parseInt(e.target.value) || 30 },
-                    })
-                  }
-                  disabled={disabled}
-                  min={10}
-                  max={200}
-                  className="w-16 px-2 py-1 rounded text-xs text-center"
-                  style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
-                />
-              </div>
+            <div className="flex items-center gap-2 mb-2">
+              <Clock className="w-3.5 h-3.5" style={{ color: '#848E9C' }} />
+              <span className="text-xs font-medium" style={{ color: '#EAECEF' }}>{t('timeframes')}</span>
             </div>
             <p className="text-[10px] mb-2" style={{ color: '#5E6673' }}>{t('timeframesDesc')}</p>
 
@@ -644,6 +651,44 @@ export function IndicatorEditor({
                 )
               })}
             </div>
+
+            {/* 各周期 K 线数量 (TimeframeCounts) */}
+            {selectedTimeframes.length > 0 && (
+              <div className="mt-3 pt-2" style={{ borderTop: '1px solid #2B3139' }}>
+                <p className="text-[10px] font-medium mb-1.5" style={{ color: '#EAECEF' }}>{t('timeframeKlineCounts')}</p>
+                <p className="text-[10px] mb-2" style={{ color: '#5E6673' }}>{t('timeframeKlineCountsDesc')}</p>
+                <div className="flex flex-wrap gap-2">
+                  {selectedTimeframes.map((tf) => {
+                    const label = allTimeframes.find((t) => t.value === tf)?.label ?? tf
+                    const value = config.klines.timeframe_counts?.[tf] ?? config.klines.primary_count ?? 30
+                    return (
+                      <div key={tf} className="flex items-center gap-1">
+                        <span className="text-[10px] w-8" style={{ color: '#848E9C' }}>{label}:</span>
+                        <input
+                          type="number"
+                          value={value}
+                          onChange={(e) => {
+                            if (disabled) return
+                            const v = parseInt(e.target.value, 10)
+                            const next = { ...(config.klines.timeframe_counts || {}), [tf]: Number.isNaN(v) || v <= 0 ? undefined : v }
+                            if (next[tf] === undefined) delete next[tf]
+                            onChange({
+                              ...config,
+                              klines: { ...config.klines, timeframe_counts: Object.keys(next).length ? next : undefined },
+                            })
+                          }}
+                          disabled={disabled}
+                          min={10}
+                          max={500}
+                          className="w-14 px-1.5 py-0.5 rounded text-xs text-center"
+                          style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
+                        />
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -672,7 +717,9 @@ export function IndicatorEditor({
               { key: 'enable_macd', label: 'macd', desc: 'macdDesc', color: '#a855f7' },
               { key: 'enable_rsi', label: 'rsi', desc: 'rsiDesc', color: '#F6465D', periodKey: 'rsi_periods', defaultPeriods: '7,14' },
               { key: 'enable_atr', label: 'atr', desc: 'atrDesc', color: '#60a5fa', periodKey: 'atr_periods', defaultPeriods: '14' },
+              { key: 'enable_adx', label: 'adx', desc: 'adxDesc', color: '#A855F7', periodKey: 'adx_periods', defaultPeriods: '14' },
               { key: 'enable_boll', label: 'boll', desc: 'bollDesc', color: '#ec4899', periodKey: 'boll_periods', defaultPeriods: '20' },
+              { key: 'enable_fibonacci', label: 'fibonacci', desc: 'fibonacciDesc', color: '#f59e0b' },
             ].map(({ key, label, desc, color, periodKey, defaultPeriods }) => (
               <div
                 key={key}
@@ -762,6 +809,91 @@ export function IndicatorEditor({
               </div>
             ))}
           </div>
+        </div>
+      </div>
+
+      {/* ============================================ */}
+      {/* Section: 动态追踪止盈/止损 (硬风控)           */}
+      {/* ============================================ */}
+      <div className="rounded-lg overflow-hidden" style={{ background: '#0B0E11', border: '1px solid #2B3139' }}>
+        <div className="px-3 py-2 flex items-center gap-2" style={{ background: '#1E2329', borderBottom: '1px solid #2B3139' }}>
+          <AlertCircle className="w-4 h-4" style={{ color: '#f59e0b' }} />
+          <span className="text-sm font-medium" style={{ color: '#EAECEF' }}>{t('trailingPanel')}</span>
+          <span className="text-xs" style={{ color: '#848E9C' }}>- {t('trailingPanelDesc')}</span>
+        </div>
+        <div className="p-3 space-y-3">
+          <div className="flex items-center justify-between p-2.5 rounded-lg" style={{ background: config.enable_indicator_trailing ? 'rgba(245, 158, 11, 0.08)' : 'transparent', border: config.enable_indicator_trailing ? '1px solid rgba(245, 158, 11, 0.3)' : '1px solid #2B3139' }}>
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 rounded-full" style={{ background: '#f59e0b' }} />
+              <span className="text-xs font-medium" style={{ color: '#EAECEF' }}>{t('enableTrailing')}</span>
+            </div>
+            <input
+              type="checkbox"
+              checked={config.enable_indicator_trailing || false}
+              onChange={(e) => !disabled && onChange({ ...config, enable_indicator_trailing: e.target.checked, ...(e.target.checked && !config.trailing_indicator ? { trailing_indicator: 'ema_20' } : {}), ...(e.target.checked && !config.trailing_timeframe ? { trailing_timeframe: '5m' } : {}) })}
+              disabled={disabled}
+              className="w-4 h-4 rounded accent-amber-500"
+            />
+          </div>
+          {config.enable_indicator_trailing && (
+            <>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] flex-shrink-0" style={{ color: '#848E9C' }}>{t('trailingIndicator')}:</span>
+                <select
+                  value={config.trailing_indicator || 'ema_20'}
+                  onChange={(e) => !disabled && onChange({ ...config, trailing_indicator: e.target.value })}
+                  disabled={disabled}
+                  className="flex-1 px-2 py-1.5 rounded text-xs"
+                  style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
+                >
+                  <option value="ema_20">{t('trailingEma20')}</option>
+                  <option value="ema_50">{t('trailingEma50')}</option>
+                  <option value="boll_middle_20">{t('trailingBollMiddle')}</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] flex-shrink-0" style={{ color: '#848E9C' }}>{t('trailingTimeframe')}:</span>
+                <select
+                  value={config.trailing_timeframe || '5m'}
+                  onChange={(e) => !disabled && onChange({ ...config, trailing_timeframe: e.target.value })}
+                  disabled={disabled}
+                  className="flex-1 px-2 py-1.5 rounded text-xs"
+                  style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
+                >
+                  <option value="1m">1m</option>
+                  <option value="5m">5m</option>
+                  <option value="15m">15m</option>
+                  <option value="1h">1h</option>
+                  <option value="4h">4h</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] flex-shrink-0" style={{ color: '#848E9C' }} title={t('trailingOffsetTooltip')}>{t('trailingOffsetPercent')}:</span>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  placeholder="-0.5"
+                  value={trailingOffsetLocal}
+                  onChange={(e) => {
+                    if (disabled) return
+                    setTrailingOffsetLocal(e.target.value)
+                  }}
+                  onBlur={() => {
+                    if (disabled) return
+                    const v = parseFloat(trailingOffsetLocal)
+                    const clamped = Number.isFinite(v) ? Math.max(-5, Math.min(5, v)) : 0
+                    setTrailingOffsetLocal(String(clamped))
+                    onChange({ ...config, trailing_offset_percent: clamped })
+                  }}
+                  disabled={disabled}
+                  title={t('trailingOffsetTooltip')}
+                  className="flex-1 px-2 py-1.5 rounded text-xs w-20"
+                  style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
+                />
+                <span className="text-[10px]" style={{ color: '#848E9C' }} title={t('trailingOffsetTooltip')}>%</span>
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>

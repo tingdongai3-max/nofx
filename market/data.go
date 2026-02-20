@@ -2,30 +2,18 @@ package market
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"nofx/logger"
 	"nofx/provider/coinank/coinank_api"
 	"nofx/provider/coinank/coinank_enum"
 	"nofx/provider/hyperliquid"
+	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
-)
 
-// FundingRateCache is the funding rate cache structure
-// Binance Funding Rate only updates every 8 hours, using 1-hour cache can significantly reduce API calls
-type FundingRateCache struct {
-	Rate      float64
-	UpdatedAt time.Time
-}
-
-var (
-	fundingRateMap sync.Map // map[string]*FundingRateCache
-	frCacheTTL     = 1 * time.Hour
+	talib "github.com/markcheno/go-talib"
 )
 
 // Note: Kline data now uses free/open API (coinank_api.Kline) which doesn't require authentication
@@ -89,10 +77,16 @@ func getKlinesFromCoinAnk(symbol, interval, exchange string, limit int) ([]Kline
 		coinankExchange = coinank_enum.Binance
 	}
 
-	// Call CoinAnk free/open API (no authentication required)
+	// Prefer live WebSocket buffer first to achieve real-time, zero-HTTP quotes.
+	ensureKlineStream(symbol, interval, exchange)
+	if live, ok := getRealtimeKlines(symbol, interval, exchange, limit); ok && len(live) > 0 {
+		return live, nil
+	}
+
+	// Fallback: call CoinAnk free/open HTTP API (no authentication required).
+	// This path is mainly for historical backfill or when WS hasn't produced data yet.
 	ctx := context.Background()
 	ts := time.Now().UnixMilli()
-	// Use "To" side to search backward from current time (get historical klines)
 	coinankKlines, err := coinank_api.Kline(ctx, symbol, coinankExchange, ts, coinank_enum.To, limit, coinankInterval)
 	if err != nil {
 		// If exchange-specific data fails, fallback to Binance
@@ -165,13 +159,15 @@ func getKlinesFromHyperliquid(symbol, interval string, limit int) ([]Kline, erro
 	return klines, nil
 }
 
-// Get retrieves market data for the specified token (uses Binance data by default)
-func Get(symbol string) (*Data, error) {
-	return GetWithExchange(symbol, "binance")
+// Get retrieves market data for the specified token (uses Binance data by default).
+// opts 为 nil 时使用默认指标参数并填充 DynamicIndicators。
+func Get(symbol string, opts *IndicatorParams) (*Data, error) {
+	return GetWithExchange(symbol, "binance", opts)
 }
 
-// GetWithExchange retrieves market data for the specified token using exchange-specific data
-func GetWithExchange(symbol, exchange string) (*Data, error) {
+// GetWithExchange retrieves market data for the specified token using exchange-specific data.
+// opts 为 nil 时使用默认指标参数。
+func GetWithExchange(symbol, exchange string, opts *IndicatorParams) (*Data, error) {
 	var klines3m, klines4h []Kline
 	var err error
 	// Normalize symbol
@@ -225,11 +221,8 @@ func GetWithExchange(symbol, exchange string) (*Data, error) {
 		return nil, fmt.Errorf("4-hour K-line data is empty")
 	}
 
-	// Calculate current indicators (based on 3-minute latest data)
 	currentPrice := klines3m[len(klines3m)-1].Close
-	currentEMA20 := calculateEMA(klines3m, 20)
-	currentMACD := calculateMACD(klines3m)
-	currentRSI7 := calculateRSI(klines3m, 7)
+	dynamicIndicators := fillDynamicIndicators(klines3m, opts)
 
 	// Calculate price change percentage
 	// 1-hour price change = price from 20 3-minute K-lines ago
@@ -257,23 +250,18 @@ func GetWithExchange(symbol, exchange string) (*Data, error) {
 		oiData = &OIData{Latest: 0, Average: 0}
 	}
 
-	// Get Funding Rate
 	fundingRate, _ := getFundingRate(symbol)
-
-	// Calculate intraday series data
 	intradayData := calculateIntradaySeries(klines3m)
-
-	// Calculate longer-term data
 	longerTermData := calculateLongerTermData(klines4h)
+	fibonacci := fillFibonacci(klines3m)
 
 	return &Data{
 		Symbol:            symbol,
 		CurrentPrice:      currentPrice,
 		PriceChange1h:     priceChange1h,
 		PriceChange4h:     priceChange4h,
-		CurrentEMA20:      currentEMA20,
-		CurrentMACD:       currentMACD,
-		CurrentRSI7:       currentRSI7,
+		DynamicIndicators: dynamicIndicators,
+		Fibonacci:         fibonacci,
 		OpenInterest:      oiData,
 		FundingRate:       fundingRate,
 		IntradaySeries:    intradayData,
@@ -281,23 +269,64 @@ func GetWithExchange(symbol, exchange string) (*Data, error) {
 	}, nil
 }
 
-// GetWithTimeframes retrieves market data for specified multiple timeframes
-// timeframes: list of timeframes, e.g. ["5m", "15m", "1h", "4h"]
-// primaryTimeframe: primary timeframe (used for calculating current indicators), defaults to timeframes[0]
-// count: number of K-lines for each timeframe
-func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe string, count int) (*Data, error) {
+// DefaultCountForTimeframe 返回未配置时各周期默认 K 线数量（小周期多、大周期少，控制 Token），供调用方构建 counts 使用
+func DefaultCountForTimeframe(tf string) int {
+	switch tf {
+	case "1m":
+		return 200
+	case "3m":
+		return 150
+	case "5m":
+		return 100
+	case "15m":
+		return 50
+	case "30m":
+		return 40
+	case "1h":
+		return 30
+	case "2h":
+		return 24
+	case "4h":
+		return 20
+	case "6h":
+		return 16
+	case "8h":
+		return 14
+	case "12h":
+		return 12
+	case "1d":
+		return 10
+	case "3d":
+		return 8
+	case "1w":
+		return 6
+	default:
+		return 50
+	}
+}
+
+// GetWithTimeframes retrieves market data for specified multiple timeframes (uses Binance by default).
+// For exchange-specific data, use GetWithTimeframesWithExchange.
+func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe string, counts map[string]int, opts *IndicatorParams) (*Data, error) {
+	return GetWithTimeframesWithExchange(symbol, timeframes, primaryTimeframe, counts, opts, "binance")
+}
+
+// GetWithTimeframesWithExchange retrieves market data for specified multiple timeframes from the given exchange.
+// exchange must match the trader's connected exchange (e.g. okx, binance) to avoid cross-exchange data pollution.
+func GetWithTimeframesWithExchange(symbol string, timeframes []string, primaryTimeframe string, counts map[string]int, opts *IndicatorParams, exchange string) (*Data, error) {
 	symbol = Normalize(symbol)
+	if exchange == "" {
+		exchange = "binance"
+	}
 
 	if len(timeframes) == 0 {
 		return nil, fmt.Errorf("at least one timeframe is required")
 	}
 
-	// If primary timeframe is not specified, use the first one
 	if primaryTimeframe == "" {
 		primaryTimeframe = timeframes[0]
 	}
 
-	// Ensure primary timeframe is in the list
 	hasPrimary := false
 	for _, tf := range timeframes {
 		if tf == primaryTimeframe {
@@ -309,46 +338,37 @@ func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe stri
 		timeframes = append([]string{primaryTimeframe}, timeframes...)
 	}
 
-	// Store data for all timeframes
 	timeframeData := make(map[string]*TimeframeSeriesData)
 	var primaryKlines []Kline
-
-	// Check if this is an xyz dex asset (use Hyperliquid API)
 	isXyzAsset := IsXyzDexAsset(symbol)
 
-	// Get K-line data for each timeframe
 	for _, tf := range timeframes {
-		var klines []Kline
-		var err error
-
-		if isXyzAsset {
-			// Use Hyperliquid API for xyz dex assets
-			klines, err = getKlinesFromHyperliquid(symbol, tf, 200)
-			if err != nil {
-				logger.Infof("⚠️ Failed to get %s %s K-line from Hyperliquid: %v", symbol, tf, err)
-				continue
-			}
-		} else {
-			// Use CoinAnk for regular crypto assets (default to Binance)
-			klines, err = getKlinesFromCoinAnk(symbol, tf, "binance", 200)
-			if err != nil {
-				logger.Infof("⚠️ Failed to get %s %s K-line from CoinAnk: %v", symbol, tf, err)
-				continue
-			}
+		limit := counts[tf]
+		if limit <= 0 {
+			limit = DefaultCountForTimeframe(tf)
 		}
 
+		var klines []Kline
+		var err error
+		if isXyzAsset {
+			klines, err = getKlinesFromHyperliquid(symbol, tf, limit)
+		} else {
+			klines, err = getKlinesFromCoinAnk(symbol, tf, exchange, limit)
+		}
+		if err != nil {
+			logger.Infof("⚠️ Failed to get %s %s K-line: %v", symbol, tf, err)
+			continue
+		}
 		if len(klines) == 0 {
 			logger.Infof("⚠️ %s %s K-line data is empty", symbol, tf)
 			continue
 		}
 
-		// Save primary timeframe K-lines for calculating base indicators
 		if tf == primaryTimeframe {
 			primaryKlines = klines
 		}
 
-		// Calculate series data for this timeframe (use count from config)
-		seriesData := calculateTimeframeSeries(klines, tf, count)
+		seriesData := calculateTimeframeSeries(klines, tf, limit)
 		timeframeData[tf] = seriesData
 	}
 
@@ -363,36 +383,29 @@ func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe stri
 		return nil, fmt.Errorf("%s data is stale, possible cache failure", symbol)
 	}
 
-	// Calculate current indicators (based on primary timeframe latest data)
 	currentPrice := primaryKlines[len(primaryKlines)-1].Close
-	currentEMA20 := calculateEMA(primaryKlines, 20)
-	currentMACD := calculateMACD(primaryKlines)
-	currentRSI7 := calculateRSI(primaryKlines, 7)
+	dynamicIndicators := fillDynamicIndicators(primaryKlines, opts)
+	fibonacci := fillFibonacci(primaryKlines)
 
-	// Calculate price changes
-	priceChange1h := calculatePriceChangeByBars(primaryKlines, primaryTimeframe, 60) // 1 hour
-	priceChange4h := calculatePriceChangeByBars(primaryKlines, primaryTimeframe, 240) // 4 hours
+	priceChange1h := calculatePriceChangeByBars(primaryKlines, primaryTimeframe, 60)
+	priceChange4h := calculatePriceChangeByBars(primaryKlines, primaryTimeframe, 240)
 
-	// Get OI data
 	oiData, err := getOpenInterestData(symbol)
 	if err != nil {
 		oiData = &OIData{Latest: 0, Average: 0}
 	}
-
-	// Get Funding Rate
 	fundingRate, _ := getFundingRate(symbol)
 
 	return &Data{
-		Symbol:        symbol,
-		CurrentPrice:  currentPrice,
-		PriceChange1h: priceChange1h,
-		PriceChange4h: priceChange4h,
-		CurrentEMA20:  currentEMA20,
-		CurrentMACD:   currentMACD,
-		CurrentRSI7:   currentRSI7,
-		OpenInterest:  oiData,
-		FundingRate:   fundingRate,
-		TimeframeData: timeframeData,
+		Symbol:            symbol,
+		CurrentPrice:      currentPrice,
+		PriceChange1h:     priceChange1h,
+		PriceChange4h:     priceChange4h,
+		DynamicIndicators: dynamicIndicators,
+		Fibonacci:         fibonacci,
+		OpenInterest:      oiData,
+		FundingRate:       fundingRate,
+		TimeframeData:     timeframeData,
 	}, nil
 }
 
@@ -553,21 +566,15 @@ func calculateEMA(klines []Kline, period int) float64 {
 	if len(klines) < period {
 		return 0
 	}
-
-	// Calculate SMA as initial EMA
-	sum := 0.0
-	for i := 0; i < period; i++ {
-		sum += klines[i].Close
+	closes := make([]float64, len(klines))
+	for i, k := range klines {
+		closes[i] = k.Close
 	}
-	ema := sum / float64(period)
-
-	// Calculate EMA
-	multiplier := 2.0 / float64(period+1)
-	for i := period; i < len(klines); i++ {
-		ema = (klines[i].Close-ema)*multiplier + ema
+	out := talib.Ema(closes, period)
+	if len(out) == 0 {
+		return 0
 	}
-
-	return ema
+	return out[len(out)-1]
 }
 
 // calculateMACD calculates MACD
@@ -575,13 +582,15 @@ func calculateMACD(klines []Kline) float64 {
 	if len(klines) < 26 {
 		return 0
 	}
-
-	// Calculate 12-period and 26-period EMA
-	ema12 := calculateEMA(klines, 12)
-	ema26 := calculateEMA(klines, 26)
-
-	// MACD = EMA12 - EMA26
-	return ema12 - ema26
+	closes := make([]float64, len(klines))
+	for i, k := range klines {
+		closes[i] = k.Close
+	}
+	macd, _, _ := talib.Macd(closes, 12, 26, 9)
+	if len(macd) == 0 {
+		return 0
+	}
+	return macd[len(macd)-1]
 }
 
 // calculateRSI calculates RSI
@@ -589,43 +598,15 @@ func calculateRSI(klines []Kline, period int) float64 {
 	if len(klines) <= period {
 		return 0
 	}
-
-	gains := 0.0
-	losses := 0.0
-
-	// Calculate initial average gain/loss
-	for i := 1; i <= period; i++ {
-		change := klines[i].Close - klines[i-1].Close
-		if change > 0 {
-			gains += change
-		} else {
-			losses += -change
-		}
+	closes := make([]float64, len(klines))
+	for i, k := range klines {
+		closes[i] = k.Close
 	}
-
-	avgGain := gains / float64(period)
-	avgLoss := losses / float64(period)
-
-	// Use Wilder smoothing method to calculate subsequent RSI
-	for i := period + 1; i < len(klines); i++ {
-		change := klines[i].Close - klines[i-1].Close
-		if change > 0 {
-			avgGain = (avgGain*float64(period-1) + change) / float64(period)
-			avgLoss = (avgLoss * float64(period-1)) / float64(period)
-		} else {
-			avgGain = (avgGain * float64(period-1)) / float64(period)
-			avgLoss = (avgLoss*float64(period-1) + (-change)) / float64(period)
-		}
+	out := talib.Rsi(closes, period)
+	if len(out) == 0 {
+		return 0
 	}
-
-	if avgLoss == 0 {
-		return 100
-	}
-
-	rs := avgGain / avgLoss
-	rsi := 100 - (100 / (1 + rs))
-
-	return rsi
+	return out[len(out)-1]
 }
 
 // calculateATR calculates ATR
@@ -668,28 +649,122 @@ func calculateBOLL(klines []Kline, period int, multiplier float64) (upper, middl
 	if len(klines) < period {
 		return 0, 0, 0
 	}
-
-	// Calculate SMA (middle band)
-	sum := 0.0
-	for i := len(klines) - period; i < len(klines); i++ {
-		sum += klines[i].Close
+	closes := make([]float64, len(klines))
+	for i, k := range klines {
+		closes[i] = k.Close
 	}
-	sma := sum / float64(period)
-
-	// Calculate standard deviation
-	variance := 0.0
-	for i := len(klines) - period; i < len(klines); i++ {
-		diff := klines[i].Close - sma
-		variance += diff * diff
+	up, mid, low := talib.BBands(closes, period, multiplier, multiplier, 0)
+	if len(up) == 0 || len(mid) == 0 || len(low) == 0 {
+		return 0, 0, 0
 	}
-	stdDev := math.Sqrt(variance / float64(period))
+	last := len(up) - 1
+	return up[last], mid[last], low[last]
+}
 
-	// Calculate bands
-	middle = sma
-	upper = sma + multiplier*stdDev
-	lower = sma - multiplier*stdDev
+// defaultIndicatorParams 返回默认指标参数（当调用方未传时使用）
+func defaultIndicatorParams() *IndicatorParams {
+	return &IndicatorParams{
+		EMAPeriods:  []int{20, 50},
+		RSIPeriods:  []int{7, 14},
+		ATRPeriods:  []int{14},
+		ADXPeriods:  []int{14},
+		BOLLPeriods: []int{20},
+		MACDFast:    12,
+		MACDSlow:    26,
+		MACDSignal:  9,
+	}
+}
 
-	return upper, middle, lower
+// fillDynamicIndicators 根据 klines 和策略参数填充 DynamicIndicators 字典
+func fillDynamicIndicators(klines []Kline, opts *IndicatorParams) map[string]float64 {
+	if opts == nil {
+		opts = defaultIndicatorParams()
+	}
+	out := make(map[string]float64)
+	closes := make([]float64, len(klines))
+	for i, k := range klines {
+		closes[i] = k.Close
+	}
+
+	// EMA
+	for _, p := range opts.EMAPeriods {
+		if len(klines) >= p {
+			out[fmt.Sprintf("ema_%d", p)] = calculateEMA(klines, p)
+		}
+	}
+	// SMA (simple moving average: sum of last p closes / p)
+	for _, p := range opts.SMAPeriods {
+		if len(klines) >= p {
+			sum := 0.0
+			for i := len(closes) - p; i < len(closes); i++ {
+				sum += closes[i]
+			}
+			out[fmt.Sprintf("sma_%d", p)] = sum / float64(p)
+		}
+	}
+	// RSI
+	for _, p := range opts.RSIPeriods {
+		if len(klines) > p {
+			rsi := talib.Rsi(closes, p)
+			if len(rsi) > 0 {
+				out[fmt.Sprintf("rsi_%d", p)] = rsi[len(rsi)-1]
+			}
+		}
+	}
+	// MACD (fast, slow, signal)
+	fast, slow, sig := opts.MACDFast, opts.MACDSlow, opts.MACDSignal
+	if fast <= 0 {
+		fast = 12
+	}
+	if slow <= 0 {
+		slow = 26
+	}
+	if sig <= 0 {
+		sig = 9
+	}
+	if len(klines) >= slow {
+		macd, signal, hist := talib.Macd(closes, fast, slow, sig)
+		if len(macd) > 0 {
+			out["macd"] = macd[len(macd)-1]
+		}
+		if len(signal) > 0 {
+			out["macd_signal"] = signal[len(signal)-1]
+		}
+		if len(hist) > 0 {
+			out["macd_histogram"] = hist[len(hist)-1]
+		}
+	}
+	// ATR
+	for _, p := range opts.ATRPeriods {
+		if len(klines) > p {
+			out[fmt.Sprintf("atr_%d", p)] = calculateATR(klines, p)
+		}
+	}
+	// ADX (Average Directional Index)
+	highs := make([]float64, len(klines))
+	lows := make([]float64, len(klines))
+	for i, k := range klines {
+		highs[i] = k.High
+		lows[i] = k.Low
+	}
+	for _, p := range opts.ADXPeriods {
+		if len(klines) > p+1 {
+			adx := talib.Adx(highs, lows, closes, p)
+			if len(adx) > 0 {
+				out[fmt.Sprintf("adx_%d", p)] = adx[len(adx)-1]
+			}
+		}
+	}
+	// BOLL (last value only for scalar; series in TimeframeSeriesData)
+	for _, p := range opts.BOLLPeriods {
+		if len(klines) >= p {
+			u, m, l := calculateBOLL(klines, p, 2)
+			out[fmt.Sprintf("boll_upper_%d", p)] = u
+			out[fmt.Sprintf("boll_middle_%d", p)] = m
+			out[fmt.Sprintf("boll_lower_%d", p)] = l
+		}
+	}
+	return out
 }
 
 // calculateIntradaySeries calculates intraday series data
@@ -788,100 +863,114 @@ func calculateLongerTermData(klines []Kline) *LongerTermData {
 	return data
 }
 
+// fillFibonacci 根据主周期 K 线区间计算最高、最低及五个斐波那契回撤/扩展位，供 AI 阻力/支撑参考
+func fillFibonacci(klines []Kline) map[string]float64 {
+	out := make(map[string]float64)
+	if len(klines) == 0 {
+		return out
+	}
+	high, low := klines[0].High, klines[0].Low
+	for _, k := range klines[1:] {
+		if k.High > high {
+			high = k.High
+		}
+		if k.Low < low {
+			low = k.Low
+		}
+	}
+	out["high"] = high
+	out["low"] = low
+	diff := high - low
+	if diff <= 0 {
+		return out
+	}
+	// 回撤位：从 high 向下算
+	out["0.236"] = high - 0.236*diff
+	out["0.382"] = high - 0.382*diff
+	out["0.5"] = high - 0.5*diff
+	out["0.618"] = high - 0.618*diff
+	out["0.786"] = high - 0.786*diff
+	return out
+}
+
 // getOpenInterestData retrieves OI data
 func getOpenInterestData(symbol string) (*OIData, error) {
-	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/openInterest?symbol=%s", symbol)
-
-	apiClient := NewAPIClient()
-	resp, err := apiClient.client.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	// Normalize to Binance-style symbol (e.g., BTCUSDT) for ticker snapshot lookup.
+	norm := Normalize(symbol)
+	// xyz: assets (stocks/forex/commodities) don't have Binance futures OI; return zeroed data.
+	if IsXyzDexAsset(norm) {
+		return &OIData{Latest: 0, Average: 0}, nil
 	}
 
-	var result struct {
-		OpenInterest string `json:"openInterest"`
-		Symbol       string `json:"symbol"`
-		Time         int64  `json:"time"`
+	// Remove any xyz: prefix that might remain after normalization.
+	norm = strings.TrimPrefix(strings.ToUpper(norm), "XYZ:")
+
+	snap, ok := getTickerSnapshot(norm)
+	if !ok || snap == nil {
+		// Graceful fallback: no snapshot yet, return zero data.
+		return &OIData{Latest: 0, Average: 0}, nil
 	}
 
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
+	oi := snap.OIUSD
+	if oi <= 0 {
+		return &OIData{Latest: 0, Average: 0}, nil
 	}
-
-	oi, _ := strconv.ParseFloat(result.OpenInterest, 64)
 
 	return &OIData{
 		Latest:  oi,
-		Average: oi * 0.999, // Approximate average
+		Average: oi * 0.999, // Lightweight approximation of average
 	}, nil
 }
 
-// getFundingRate retrieves funding rate (optimized: uses 1-hour cache)
+// getFundingRate retrieves funding rate using the global WebSocket ticker stream.
 func getFundingRate(symbol string) (float64, error) {
-	// Check cache (1-hour validity)
-	// Funding Rate only updates every 8 hours, 1-hour cache is very reasonable
-	if cached, ok := fundingRateMap.Load(symbol); ok {
-		cache := cached.(*FundingRateCache)
-		if time.Since(cache.UpdatedAt) < frCacheTTL {
-			// Cache hit, return directly
-			return cache.Rate, nil
-		}
+	norm := Normalize(symbol)
+	if IsXyzDexAsset(norm) {
+		return 0, nil
 	}
+	norm = strings.TrimPrefix(strings.ToUpper(norm), "XYZ:")
 
-	// Cache expired or doesn't exist, call API
-	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=%s", symbol)
-
-	apiClient := NewAPIClient()
-	resp, err := apiClient.client.Get(url)
-	if err != nil {
-		return 0, err
+	snap, ok := getTickerSnapshot(norm)
+	if !ok || snap == nil {
+		return 0, nil
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
-	}
-
-	var result struct {
-		Symbol          string `json:"symbol"`
-		MarkPrice       string `json:"markPrice"`
-		IndexPrice      string `json:"indexPrice"`
-		LastFundingRate string `json:"lastFundingRate"`
-		NextFundingTime int64  `json:"nextFundingTime"`
-		InterestRate    string `json:"interestRate"`
-		Time            int64  `json:"time"`
-	}
-
-	if err := json.Unmarshal(body, &result); err != nil {
-		return 0, err
-	}
-
-	rate, _ := strconv.ParseFloat(result.LastFundingRate, 64)
-
-	// Update cache
-	fundingRateMap.Store(symbol, &FundingRateCache{
-		Rate:      rate,
-		UpdatedAt: time.Now(),
-	})
-
-	return rate, nil
+	return snap.FundingRate, nil
 }
 
-// Format formats and outputs market data
+// Format formats and outputs market data (uses DynamicIndicators for AI prompt)
 func Format(data *Data) string {
 	var sb strings.Builder
 
-	// Format price with dynamic precision
 	priceStr := formatPriceWithDynamicPrecision(data.CurrentPrice)
-	sb.WriteString(fmt.Sprintf("current_price = %s, current_ema20 = %.3f, current_macd = %.3f, current_rsi (7 period) = %.3f\n\n",
-		priceStr, data.CurrentEMA20, data.CurrentMACD, data.CurrentRSI7))
+	sb.WriteString(fmt.Sprintf("current_price = %s", priceStr))
+	if len(data.DynamicIndicators) > 0 {
+		// 按 key 排序输出，便于阅读
+		keys := make([]string, 0, len(data.DynamicIndicators))
+		for k := range data.DynamicIndicators {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := data.DynamicIndicators[k]
+			// 将 key 转为可读名，如 ema_200 -> current_ema200
+			readable := strings.ReplaceAll(k, "_", "")
+			sb.WriteString(fmt.Sprintf(", current_%s = %.3f", readable, v))
+		}
+	}
+	sb.WriteString("\n\n")
+
+	if len(data.Fibonacci) > 0 {
+		sb.WriteString("Fibonacci levels (resistance/support from recent range): ")
+		sb.WriteString(fmt.Sprintf("high = %s, low = %s",
+			formatPriceWithDynamicPrecision(data.Fibonacci["high"]),
+			formatPriceWithDynamicPrecision(data.Fibonacci["low"])))
+		for _, k := range []string{"0.236", "0.382", "0.5", "0.618", "0.786"} {
+			if v, ok := data.Fibonacci[k]; ok {
+				sb.WriteString(fmt.Sprintf(", %s = %s", k, formatPriceWithDynamicPrecision(v)))
+			}
+		}
+		sb.WriteString("\n\n")
+	}
 
 	sb.WriteString(fmt.Sprintf("In addition, here is the latest %s open interest and funding rate for perps:\n\n",
 		data.Symbol))
@@ -1148,9 +1237,8 @@ func BuildDataFromKlines(symbol string, primary []Kline, longer []Kline) (*Data,
 	data := &Data{
 		Symbol:            symbol,
 		CurrentPrice:      currentPrice,
-		CurrentEMA20:      calculateEMA(primary, 20),
-		CurrentMACD:       calculateMACD(primary),
-		CurrentRSI7:       calculateRSI(primary, 7),
+		DynamicIndicators: fillDynamicIndicators(primary, nil),
+		Fibonacci:         fillFibonacci(primary),
 		PriceChange1h:     priceChangeFromSeries(primary, time.Hour),
 		PriceChange4h:     priceChangeFromSeries(primary, 4*time.Hour),
 		OpenInterest:      &OIData{Latest: 0, Average: 0},

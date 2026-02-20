@@ -1,11 +1,13 @@
 #!/bin/sh
 set -e
 
-# Railway 会设置 PORT 环境变量
+# Railway 会设置 PORT、DATABASE_URL 等环境变量
 export PORT=${PORT:-8080}
 echo "🚀 Starting NOFX on port $PORT..."
 
-# 生成加密密钥（如果没有设置）
+# DATABASE_URL: Railway PostgreSQL 自动提供，应用会自动连接
+# 加密密钥：生产环境务必在 Railway 控制台设置 RSA_PRIVATE_KEY 和 DATA_ENCRYPTION_KEY，
+# 否则每次部署会生成新密钥，无法解密数据库中已有的交易所 API 配置
 if [ -z "$RSA_PRIVATE_KEY" ]; then
     export RSA_PRIVATE_KEY=$(openssl genrsa 2048 2>/dev/null)
 fi

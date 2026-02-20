@@ -345,7 +345,7 @@ func TestNewFuturesTrader(t *testing.T) {
 	defer mockServer.Close()
 
 	// Test successful creation
-	t1 := NewFuturesTrader("test_api_key", "test_secret_key", "test_user")
+	t1 := NewFuturesTrader("test_api_key", "test_secret_key", "test_user", false)
 
 	// Modify client to use mock server
 	t1.client.BaseURL = mockServer.URL

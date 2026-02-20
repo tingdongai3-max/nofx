@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -52,18 +53,35 @@ type CryptoService struct {
 	dataKey    []byte
 }
 
-// NewCryptoService creates crypto service (loads keys from environment variables)
+// NewCryptoService creates crypto service (loads keys from environment variables).
+// If RSA_PRIVATE_KEY and DATA_ENCRYPTION_KEY are both unset, generates ephemeral keys for local/dev use (not for production).
 func NewCryptoService() (*CryptoService, error) {
-	// 1. Load RSA private key
+	// 1. Load or generate RSA private key
 	privateKey, err := loadRSAPrivateKeyFromEnv()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load RSA private key: %w", err)
+		if os.Getenv(EnvRSAPrivateKey) == "" && os.Getenv(EnvDataEncryptionKey) == "" {
+			// Dev mode: generate ephemeral key
+			privateKey, err = generateEphemeralRSAKey()
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate ephemeral RSA key: %w", err)
+			}
+			log.Printf("[crypto] ⚠️ RSA_PRIVATE_KEY and DATA_ENCRYPTION_KEY not set: using ephemeral keys (dev only, not for production)")
+		} else {
+			return nil, fmt.Errorf("failed to load RSA private key: %w", err)
+		}
 	}
 
-	// 2. Load AES data encryption key
+	// 2. Load or generate AES data encryption key
 	dataKey, err := loadDataKeyFromEnv()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load data encryption key: %w", err)
+		if os.Getenv(EnvDataEncryptionKey) == "" {
+			dataKey, err = generateEphemeralDataKey()
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate ephemeral data key: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to load data encryption key: %w", err)
+		}
 	}
 
 	return &CryptoService{
@@ -71,6 +89,18 @@ func NewCryptoService() (*CryptoService, error) {
 		publicKey:  &privateKey.PublicKey,
 		dataKey:    dataKey,
 	}, nil
+}
+
+func generateEphemeralRSAKey() (*rsa.PrivateKey, error) {
+	return rsa.GenerateKey(rand.Reader, 2048)
+}
+
+func generateEphemeralDataKey() ([]byte, error) {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, err
+	}
+	return key, nil
 }
 
 // loadRSAPrivateKeyFromEnv loads RSA private key from environment variable

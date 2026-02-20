@@ -458,11 +458,7 @@ func (s *Server) handleStrategyTestRun(c *gin.Context) {
 	// Get timeframe configuration
 	timeframes := req.Config.Indicators.Klines.SelectedTimeframes
 	primaryTimeframe := req.Config.Indicators.Klines.PrimaryTimeframe
-	klineCount := req.Config.Indicators.Klines.PrimaryCount
-
-	// If no timeframes selected, use default values
 	if len(timeframes) == 0 {
-		// Backward compatibility: use primary and longer timeframes
 		if primaryTimeframe != "" {
 			timeframes = append(timeframes, primaryTimeframe)
 		} else {
@@ -475,16 +471,21 @@ func (s *Server) handleStrategyTestRun(c *gin.Context) {
 	if primaryTimeframe == "" {
 		primaryTimeframe = timeframes[0]
 	}
-	if klineCount <= 0 {
-		klineCount = 30
+
+	counts := make(map[string]int)
+	for _, tf := range timeframes {
+		if n, ok := req.Config.Indicators.Klines.TimeframeCounts[tf]; ok && n > 0 {
+			counts[tf] = n
+		} else {
+			counts[tf] = market.DefaultCountForTimeframe(tf)
+		}
 	}
+	fmt.Printf("📊 Using timeframes: %v, primary: %s, counts: %v\n", timeframes, primaryTimeframe, counts)
 
-	fmt.Printf("📊 Using timeframes: %v, primary: %s, kline count: %d\n", timeframes, primaryTimeframe, klineCount)
-
-	// Get real market data (using multiple timeframes)
+	opts := kernel.IndicatorParamsFromConfig(req.Config.Indicators)
 	marketDataMap := make(map[string]*market.Data)
 	for _, coin := range candidates {
-		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, klineCount)
+		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, counts, opts)
 		if err != nil {
 			// If getting data for a coin fails, log but continue
 			fmt.Printf("⚠️  Failed to get market data for %s: %v\n", coin.Symbol, err)
