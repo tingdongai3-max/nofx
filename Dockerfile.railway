@@ -43,6 +43,9 @@ COPY --from=backend-builder /usr/lib/libta_lib.so* /usr/lib/
 RUN ldconfig
 COPY --from=backend-builder /app/nofx /app/nofx
 
+# 复制 nginx 配置文件
+COPY nginx /app/nginx
+
 COPY railway/start.sh /app/start.sh
 RUN sed -i 's/\r$//' /app/start.sh
 RUN chmod +x /app/start.sh
