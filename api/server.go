@@ -1640,7 +1640,11 @@ func (s *Server) handleUpdateModelConfigs(c *gin.Context) {
 			return
 		}
 
-		// Decrypt data
+		// Decrypt data（加密服务未启用时拒绝加密请求，前端应使用明文模式）
+		if s.cryptoHandler.cryptoService == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Encryption service unavailable, please use plaintext mode"})
+			return
+		}
 		decrypted, err := s.cryptoHandler.cryptoService.DecryptSensitiveData(&encryptedPayload)
 		if err != nil {
 			logger.Infof("❌ Failed to decrypt model config (UserID: %s): %v", userID, err)
@@ -1773,7 +1777,11 @@ func (s *Server) handleUpdateExchangeConfigs(c *gin.Context) {
 			return
 		}
 
-		// Decrypt data
+		// Decrypt data（加密服务未启用时拒绝加密请求，前端应使用明文模式）
+		if s.cryptoHandler.cryptoService == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Encryption service unavailable, please use plaintext mode"})
+			return
+		}
 		decrypted, err := s.cryptoHandler.cryptoService.DecryptSensitiveData(&encryptedPayload)
 		if err != nil {
 			logger.Infof("❌ Failed to decrypt exchange config (UserID: %s): %v", userID, err)
@@ -1881,6 +1889,10 @@ func (s *Server) handleCreateExchange(c *gin.Context) {
 			return
 		}
 
+		if s.cryptoHandler.cryptoService == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Encryption service unavailable, please use plaintext mode"})
+			return
+		}
 		decrypted, err := s.cryptoHandler.cryptoService.DecryptSensitiveData(&encryptedPayload)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to decrypt data"})

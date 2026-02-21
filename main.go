@@ -37,13 +37,16 @@ func main() {
 	logger.Info("✅ Configuration loaded")
 
 	// Initialize encryption service BEFORE database (so EncryptedString can decrypt on read)
+	// 降级逻辑：RSA_PRIVATE_KEY 无效或缺失时跳过加密初始化，EncryptedString 自动使用明文/Base64 模式
 	logger.Info("🔐 Initializing encryption service...")
 	cryptoService, err := crypto.NewCryptoService()
 	if err != nil {
-		logger.Fatalf("❌ Failed to initialize encryption service: %v", err)
+		logger.Warnf("⚠️ Encryption service init failed (using plaintext mode): %v", err)
+		cryptoService = nil
+	} else {
+		crypto.SetGlobalCryptoService(cryptoService)
+		logger.Info("✅ Encryption service initialized successfully")
 	}
-	crypto.SetGlobalCryptoService(cryptoService)
-	logger.Info("✅ Encryption service initialized successfully")
 
 	// Initialize database from configuration
 	// For backward compatibility: command line arg overrides config (SQLite only)

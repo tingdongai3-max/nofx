@@ -24,10 +24,12 @@ func NewCryptoHandler(cryptoService *crypto.CryptoService) *CryptoHandler {
 // ==================== Crypto Config Endpoint ====================
 
 // HandleGetCryptoConfig Get crypto configuration
+// 加密服务未启用时强制返回 transport_encryption: false，前端使用明文传输
 func (h *CryptoHandler) HandleGetCryptoConfig(c *gin.Context) {
 	cfg := config.Get()
+	transportEncryption := cfg.TransportEncryption && h.cryptoService != nil
 	c.JSON(http.StatusOK, gin.H{
-		"transport_encryption": cfg.TransportEncryption,
+		"transport_encryption": transportEncryption,
 	})
 }
 
@@ -36,7 +38,7 @@ func (h *CryptoHandler) HandleGetCryptoConfig(c *gin.Context) {
 // HandleGetPublicKey Get server public key
 func (h *CryptoHandler) HandleGetPublicKey(c *gin.Context) {
 	cfg := config.Get()
-	if !cfg.TransportEncryption {
+	if !cfg.TransportEncryption || h.cryptoService == nil {
 		c.JSON(http.StatusOK, gin.H{
 			"public_key":           "",
 			"algorithm":            "",
@@ -57,6 +59,13 @@ func (h *CryptoHandler) HandleGetPublicKey(c *gin.Context) {
 
 // HandleDecryptSensitiveData Decrypt encrypted data sent from client
 func (h *CryptoHandler) HandleDecryptSensitiveData(c *gin.Context) {
+	if h.cryptoService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":   "Encryption service unavailable",
+			"message": "Configure RSA_PRIVATE_KEY or DATA_ENCRYPTION_KEY to enable encryption, or use plaintext mode",
+		})
+		return
+	}
 	var payload crypto.EncryptedPayload
 	if err := c.ShouldBindJSON(&payload); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
