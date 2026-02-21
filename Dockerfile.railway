@@ -1,6 +1,4 @@
-# ==========================================
-# Stage 1: 构建前端 (Node.js)
-# ==========================================
+# Stage 1: 真正编译你的定制前端
 FROM node:20-alpine AS frontend-builder
 WORKDIR /app/web
 COPY web/package*.json ./
@@ -8,52 +6,35 @@ RUN npm install
 COPY web/ ./
 RUN npm run build
 
-# ==========================================
-# Stage 2: 构建后端 (Go + TA-Lib)
-# ==========================================
+# Stage 2: 真正编译你的定制后端 (带 TA-Lib)
 FROM golang:bookworm AS backend-builder
 WORKDIR /app
-
-# 安装编译 CGO 和 TA-Lib 所需的环境
 RUN apt-get update && apt-get install -y gcc make wget \
-  && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz \
-  && tar -xzf ta-lib-0.4.0-src.tar.gz \
-  && cd ta-lib && ./configure --prefix=/usr && make && make install
-
-# 编译 Go 代码
+    && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz \
+    && tar -xzf ta-lib-0.4.0-src.tar.gz \
+    && cd ta-lib && ./configure --prefix=/usr && make && make install
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=1 GOOS=linux go build -o nofx main.go
 
-# ==========================================
-# Stage 3: 最终运行环境
-# ==========================================
+# Stage 3: 最终运行环境 (改用 Debian 确保兼容性)
 FROM debian:bookworm-slim
-
 RUN apt-get update && apt-get install -y ca-certificates tzdata sqlite3 nginx curl \
-  && rm -rf /var/lib/apt/lists/*
-
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-RUN mkdir -p /app/data
-
-# 整合我们自己编译的前后端产物
+RUN mkdir -p /app/data /etc/nginx/conf.d
+# 复制你亲手改的代码产物
 COPY --from=frontend-builder /app/web/dist /usr/share/nginx/html
 COPY --from=backend-builder /usr/lib/libta_lib.so* /usr/lib/
 RUN ldconfig
 COPY --from=backend-builder /app/nofx /app/nofx
-
-# 复制 nginx 配置文件
-COPY nginx /app/nginx
-
 COPY railway/start.sh /app/start.sh
-RUN sed -i 's/\r$//' /app/start.sh
-RUN chmod +x /app/start.sh
-
+# 彻底解决 Windows 换行符导致脚本打不开的问题
+RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
 ENV DB_PATH=/app/data/data.db
 EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
-  CMD curl -sf http://127.0.0.1:${PORT:-8080}/api/health || exit 1
-
+# 修正健康检查路径
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD curl -f http://localhost:8080/api/health || exit 1
 CMD ["/app/start.sh"]
