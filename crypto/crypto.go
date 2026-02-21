@@ -54,34 +54,26 @@ type CryptoService struct {
 }
 
 // NewCryptoService creates crypto service (loads keys from environment variables).
-// If RSA_PRIVATE_KEY and DATA_ENCRYPTION_KEY are both unset, generates ephemeral keys for local/dev use (not for production).
+// 降级逻辑：RSA/DATA_KEY 无效或缺失时自动使用临时密钥，绝不返回 error 导致进程退出
 func NewCryptoService() (*CryptoService, error) {
 	// 1. Load or generate RSA private key
 	privateKey, err := loadRSAPrivateKeyFromEnv()
 	if err != nil {
-		if os.Getenv(EnvRSAPrivateKey) == "" && os.Getenv(EnvDataEncryptionKey) == "" {
-			// Dev mode: generate ephemeral key
-			privateKey, err = generateEphemeralRSAKey()
-			if err != nil {
-				return nil, fmt.Errorf("failed to generate ephemeral RSA key: %w", err)
-			}
-			log.Printf("[crypto] ⚠️ RSA_PRIVATE_KEY and DATA_ENCRYPTION_KEY not set: using ephemeral keys (dev only, not for production)")
-		} else {
-			return nil, fmt.Errorf("failed to load RSA private key: %w", err)
+		privateKey, err = generateEphemeralRSAKey()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate ephemeral RSA key: %w", err)
 		}
+		log.Printf("[crypto] ⚠️ RSA_PRIVATE_KEY invalid or missing, using ephemeral key: %v", err)
 	}
 
 	// 2. Load or generate AES data encryption key
 	dataKey, err := loadDataKeyFromEnv()
 	if err != nil {
-		if os.Getenv(EnvDataEncryptionKey) == "" {
-			dataKey, err = generateEphemeralDataKey()
-			if err != nil {
-				return nil, fmt.Errorf("failed to generate ephemeral data key: %w", err)
-			}
-		} else {
-			return nil, fmt.Errorf("failed to load data encryption key: %w", err)
+		dataKey, err = generateEphemeralDataKey()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate ephemeral data key: %w", err)
 		}
+		log.Printf("[crypto] ⚠️ DATA_ENCRYPTION_KEY invalid or missing, using ephemeral key: %v", err)
 	}
 
 	return &CryptoService{
