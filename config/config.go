@@ -82,7 +82,13 @@ func Init() {
 		}
 	}
 
+	// PORT: Railway 自动设置；API_SERVER_PORT: start.sh 用于内部后端端口（如 8081）
+	// 优先级：API_SERVER_PORT（容器内 nginx 代理场景）> PORT（Railway 单进程）> 8080
 	if v := os.Getenv("API_SERVER_PORT"); v != "" {
+		if port, err := strconv.Atoi(v); err == nil && port > 0 {
+			cfg.APIServerPort = port
+		}
+	} else if v := os.Getenv("PORT"); v != "" {
 		if port, err := strconv.Atoi(v); err == nil && port > 0 {
 			cfg.APIServerPort = port
 		}

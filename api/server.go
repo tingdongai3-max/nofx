@@ -3451,8 +3451,8 @@ func (s *Server) handleGetSupportedExchanges(c *gin.Context) {
 
 // Start Start server
 func (s *Server) Start() error {
-	addr := fmt.Sprintf(":%d", s.port)
-	logger.Infof("🌐 API server starting at http://localhost%s", addr)
+	addr := fmt.Sprintf("0.0.0.0:%d", s.port)
+	logger.Infof("🌐 API server starting at http://%s", addr)
 	logger.Infof("📊 API Documentation:")
 	logger.Infof("  • GET  /api/health           - Health check")
 	logger.Infof("  • GET  /api/traders          - Public AI trader leaderboard top 50 (no auth required)")

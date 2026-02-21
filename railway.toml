@@ -1,7 +1,17 @@
+# Railway 一键部署配置
+# 部署前：在 Railway 控制台添加 PostgreSQL 插件并关联到本服务，DATABASE_URL 将自动注入
+
+# 以下变量请在 Railway 控制台 Variables 中配置（部署时会提醒）：
+#   DEEPSEEK_API_KEY      - DeepSeek AI API Key（AI 交易必需）
+#   JWT_SECRET            - JWT 签名密钥（生产环境必改）
+#   DATA_ENCRYPTION_KEY   - 数据加密密钥 base64（交易所 API 配置加密，生产必设）
+#   RSA_PRIVATE_KEY       - RSA 私钥 PEM（可选，与 DATA_ENCRYPTION_KEY 二选一）
+
 [build]
 dockerfilePath = "Dockerfile.railway"
 
 [deploy]
+startCommand = "/app/start.sh"
 healthcheckPath = "/health"
 healthcheckTimeout = 60
 restartPolicyType = "ON_FAILURE"
