@@ -52,12 +52,23 @@ NGINX_EOF
 
 # 启动后端
 /app/nofx &
-sleep 2
 
-# 启动 nginx（后台）
-nginx
+# 等待后端 /api/health 就绪（最多 90 秒，每 2 秒重试）
+echo "⏳ Waiting for backend /api/health..."
+max_wait=90
+elapsed=0
+while [ $elapsed -lt $max_wait ]; do
+  if curl -sf "http://127.0.0.1:${BACKEND_PORT}/api/health" >/dev/null 2>&1; then
+    echo "✅ Backend ready after ${elapsed}s"
+    break
+  fi
+  sleep 2
+  elapsed=$((elapsed + 2))
+done
+if [ $elapsed -ge $max_wait ]; then
+  echo "⚠️ Backend did not become ready in ${max_wait}s, starting nginx anyway"
+fi
 
-echo "✅ NOFX started successfully"
-
-# 保持容器运行
-tail -f /dev/null
+# 启动 nginx（前台运行，作为主进程）
+echo "✅ Starting nginx on port $PORT..."
+exec nginx -g 'daemon off;'
