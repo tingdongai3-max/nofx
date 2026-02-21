@@ -458,10 +458,9 @@ export function AdvancedChart({
       color: '#26a69a',
       priceFormat: { type: 'volume' },
       priceScaleId: '',
-      lastPriceAnimation: 0,
       lastValueVisible: false,
       priceLineVisible: false,
-    })
+    } as any)
     volumeSeriesRef.current = volumeSeries as any
 
     // 响应式调整 (ResizeObserver)

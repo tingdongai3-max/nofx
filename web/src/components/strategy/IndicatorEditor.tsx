@@ -670,8 +670,12 @@ export function IndicatorEditor({
                           onChange={(e) => {
                             if (disabled) return
                             const v = parseInt(e.target.value, 10)
-                            const next = { ...(config.klines.timeframe_counts || {}), [tf]: Number.isNaN(v) || v <= 0 ? undefined : v }
-                            if (next[tf] === undefined) delete next[tf]
+                            const raw = { ...(config.klines.timeframe_counts || {}), [tf]: Number.isNaN(v) || v <= 0 ? undefined : v }
+                            if (raw[tf] === undefined) delete raw[tf]
+                            const next: Record<string, number> = {}
+                            for (const [k, val] of Object.entries(raw)) {
+                              if (typeof val === 'number') next[k] = val
+                            }
                             onChange({
                               ...config,
                               klines: { ...config.klines, timeframe_counts: Object.keys(next).length ? next : undefined },
