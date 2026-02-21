@@ -11,7 +11,7 @@ RUN npm run build
 # ==========================================
 # Stage 2: 构建后端 (Go + TA-Lib)
 # ==========================================
-FROM golang:1.22-bookworm AS backend-builder
+FROM golang:bookworm AS backend-builder
 WORKDIR /app
 
 # 安装编译 CGO 和 TA-Lib 所需的环境
