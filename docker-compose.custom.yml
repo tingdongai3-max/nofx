@@ -1,0 +1,34 @@
+# NOFX 自托管部署 - 从你的分支构建并运行
+# 用于 install-custom.sh 一键部署（拉取你自己的仓库分支）
+#
+# 使用方式（在安装目录下）:
+#   docker compose -f docker-compose.custom.yml up -d
+# 更新:
+#   git pull && docker compose -f docker-compose.custom.yml build --no-cache && docker compose -f docker-compose.custom.yml up -d
+
+services:
+  nofx:
+    build:
+      context: .
+      dockerfile: Dockerfile.railway
+    image: nofx-custom:latest
+    container_name: nofx-trading
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "${NOFX_BACKEND_PORT:-8080}:8080"
+    volumes:
+      - ./data:/data
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - PORT=8080
+      - DB_PATH=/data/db/data.db
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
