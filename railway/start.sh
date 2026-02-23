@@ -1,6 +1,27 @@
 #!/bin/sh
 set -e
 export PORT=${PORT:-8080}
+
+# 持久化目录：/data/config 与 /data/db，用于 Docker 重启后保留配置与数据库
+mkdir -p /data/config /data/db
+# 软链接：/app/data -> /data/db，使数据库写入持久卷
+ln -sfn /data/db /app/data 2>/dev/null || true
+# 使用持久化 DB 路径（挂载 /data 卷时生效）
+export DB_PATH=${DB_PATH:-/data/db/data.db}
+
+# 加密密钥必须由环境变量提供，禁止随机生成，避免重启后 "Decryption Failed"
+if [ -z "$DATA_ENCRYPTION_KEY" ]; then
+  echo "ERROR: DATA_ENCRYPTION_KEY must be set in Railway Variables."
+  echo "Set a persistent base64 key (e.g. openssl rand -base64 32) to avoid decryption errors on restart."
+  exit 1
+fi
+# 自检：确保 DB 目录可写（Railway 需将卷挂载到 /data）
+if ! touch /data/db/.writable 2>/dev/null; then
+  echo "WARN: /data/db not writable - add volume mount to /data in Railway for persistence"
+elif rm -f /data/db/.writable 2>/dev/null; then
+  : # OK
+fi
+
 # 关键修复：确保配置目录存在
 mkdir -p /etc/nginx/conf.d
 

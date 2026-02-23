@@ -1,11 +1,10 @@
 # Railway 一键部署配置
-# 部署前：在 Railway 控制台添加 PostgreSQL 插件并关联到本服务，DATABASE_URL 将自动注入
-
-# 以下变量请在 Railway 控制台 Variables 中配置（部署时会提醒）：
+# 部署前：1) 添加 PostgreSQL 插件并关联；2) 将卷挂载到 /data 以持久化数据库与配置
+#
+# Variables 必配：
 #   DEEPSEEK_API_KEY      - DeepSeek AI API Key（AI 交易必需）
 #   JWT_SECRET            - JWT 签名密钥（生产环境必改）
-#   DATA_ENCRYPTION_KEY   - 数据加密密钥 base64（交易所 API 配置加密，生产必设）
-#   RSA_PRIVATE_KEY       - RSA 私钥 PEM（可选，与 DATA_ENCRYPTION_KEY 二选一）
+#   DATA_ENCRYPTION_KEY   - 固定 base64 密钥（openssl rand -base64 32），禁止每次启动随机生成
 
 [build]
 dockerfilePath = "Dockerfile.railway"

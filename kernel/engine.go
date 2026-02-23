@@ -130,7 +130,7 @@ type Context struct {
 // Decision AI trading decision
 type Decision struct {
 	Symbol string `json:"symbol"`
-	Action string `json:"action"` // Standard: "open_long", "open_short", "close_long", "close_short", "hold", "wait"
+	Action string `json:"action"` // Allowed: "open_long", "open_short", "hold", "wait" (close_long/close_short removed; use TP/SL only)
 	// Grid actions: "place_buy_limit", "place_sell_limit", "cancel_order", "cancel_all_orders", "pause_grid", "resume_grid", "adjust_grid"
 
 	// Opening position parameters
@@ -988,7 +988,7 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 	sb.WriteString("## AI GUIDED (Recommended, you should follow):\n")
 	sb.WriteString(fmt.Sprintf("- Trading Leverage: Altcoins max %dx | BTC/ETH max %dx\n",
 		riskControl.AltcoinMaxLeverage, riskControl.BTCETHMaxLeverage))
-	sb.WriteString(fmt.Sprintf("- Risk-Reward Ratio: ≥1:%.1f (take_profit / stop_loss)\n", riskControl.MinRiskRewardRatio))
+	sb.WriteString(fmt.Sprintf("- Initial Risk-Reward Ratio (ONLY for opening positions): ≥1:%.1f (take_profit / stop_loss). This rule DOES NOT apply to trailing stops.\n", riskControl.MinRiskRewardRatio))
 	sb.WriteString(fmt.Sprintf("- Min Confidence: ≥%d to open position\n\n", riskControl.MinConfidence))
 
 	// Position sizing guidance
@@ -1038,6 +1038,10 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 	}
 
 	// 7. Output format
+	sb.WriteString("# SYSTEM OVERRIDE (Action Configuration)\n\n")
+	sb.WriteString("You DO NOT have permission to manually close positions. The actions `close_long` and `close_short` have been removed from the system. ALL positions MUST run until they hit your defined Take Profit (TP) or Stop Loss (SL). If you are holding an active position, your ONLY valid actions are `wait`, `hold`, or update the position's TP/SL by outputting the same symbol with action `hold` or `wait` and new `stop_loss`/`take_profit` values.\n\n")
+	sb.WriteString("## TRAILING_STOP_PROTOCOL (Take Profit Iron Rule)\n\n")
+	sb.WriteString("When moving a trailing stop (action `hold` or `wait` with a new `stop_loss`): You may update ONLY the stop loss. Do NOT automatically move take_profit up together with the trailing stop. The initial risk-reward ratio applies only to **opening** positions; when trailing, the existing take_profit remains unchanged unless you explicitly output a new `take_profit` value. To update only the stop: set `take_profit` to 0 or omit it — the system will then leave the current TP order intact and only modify the SL order.\n\n")
 	sb.WriteString("# Output Format (Strictly Follow)\n\n")
 	sb.WriteString("**Must use XML tags <reasoning> and <decision> to separate chain of thought and decision JSON, avoiding parsing errors**\n\n")
 	sb.WriteString("## Format Requirements\n\n")
@@ -1052,13 +1056,14 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 	examplePositionSize := accountEquity * btcEthPosValueRatio
 	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300},\n",
 		riskControl.BTCETHMaxLeverage, examplePositionSize))
-	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"close_long\"}\n")
+	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"wait\", \"confidence\": 90}\n")
 	sb.WriteString("]\n```\n")
 	sb.WriteString("</decision>\n\n")
 	sb.WriteString("## Field Description\n\n")
-	sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
+	sb.WriteString("- `action`: open_long | open_short | hold | wait (close_long and close_short are NOT allowed; use TP/SL to exit)\n")
 	sb.WriteString(fmt.Sprintf("- `confidence`: 0-100 (opening recommended ≥ %d)\n", riskControl.MinConfidence))
 	sb.WriteString("- Required when opening: leverage, position_size_usd, stop_loss, take_profit, confidence, risk_usd\n")
+	sb.WriteString("- When hold/wait to update TP/SL: use `stop_loss` and/or `take_profit`. If you only want to update the stop (trailing stop), set `take_profit` to 0 or omit it — the system will keep the existing TP and only update SL.\n")
 	sb.WriteString("- **IMPORTANT**: All numeric values must be calculated numbers, NOT formulas/expressions (e.g., use `27.76` not `3000 * 0.01`)\n\n")
 
 	// 8. Custom Prompt
@@ -1259,6 +1264,7 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 	// Position information
 	if len(ctx.Positions) > 0 {
 		sb.WriteString("## Current Positions\n")
+		sb.WriteString("For these symbols, only actions allowed: wait, hold (optionally include stop_loss/take_profit to update TP/SL). Do NOT use close_long/close_short.\n\n")
 		for i, pos := range ctx.Positions {
 			sb.WriteString(e.formatPositionInfo(i+1, pos, ctx))
 		}
@@ -1892,12 +1898,13 @@ func validateDecisions(decisions []Decision, accountEquity float64, btcEthLevera
 
 func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64) error {
 	validActions := map[string]bool{
-		"open_long":   true,
-		"open_short":  true,
+		"open_long":  true,
+		"open_short": true,
+		"hold":       true,
+		"wait":       true,
+		// close_long and close_short removed: AI must use TP/SL only; execution layer still accepts and blocks them
 		"close_long":  true,
 		"close_short": true,
-		"hold":        true,
-		"wait":        true,
 	}
 
 	if !validActions[d.Action] {

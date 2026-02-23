@@ -14,8 +14,11 @@ import (
 
 // syncState stores the last sync time (Unix ms) for incremental sync
 var (
-	binanceSyncState      = make(map[string]int64) // exchangeID -> lastSyncTimeMs (Unix ms)
-	binanceSyncStateMutex sync.RWMutex
+	binanceSyncState         = make(map[string]int64) // exchangeID -> lastSyncTimeMs (Unix ms)
+	binanceSyncStateMutex    sync.RWMutex
+	lastCommissionPnLRun     time.Time // commission/PnL 仅每 4 小时拉一次，降低权重
+	lastCommissionPnLRunMu   sync.Mutex
+	commissionPnLMinInterval = 4 * time.Hour
 )
 
 // SyncOrdersFromBinance syncs Binance Futures trade history to local database
@@ -24,6 +27,10 @@ var (
 func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string, exchangeType string, st *store.Store) error {
 	if st == nil {
 		return fmt.Errorf("store is nil")
+	}
+
+	if err := CheckCircuitBreaker(); err != nil {
+		return fmt.Errorf("circuit breaker open: %w", err)
 	}
 
 	orderStore := st.Order()
@@ -68,17 +75,40 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 	}
 
 	// Step 2: Detect symbols to sync using multiple methods
-	// COMMISSION detection may miss trades (VIP users, BNB discount, 0-fee trades)
+	// COMMISSION/REALIZED_PNL 权重高且非交易强依赖，改为每 4 小时拉一次；实时 PnL 靠 WebSocket
 	symbolMap := make(map[string]bool)
 	lastSyncTime := time.UnixMilli(lastSyncTimeMs) // Convert to time.Time for API calls
 
-	// Method 1: COMMISSION income detection
-	commissionSymbols, err := t.GetCommissionSymbols(lastSyncTime)
-	if err != nil {
-		logger.Infof("  ⚠️ Failed to get commission symbols: %v", err)
-	} else {
+	runCommissionPnL := false
+	lastCommissionPnLRunMu.Lock()
+	if time.Since(lastCommissionPnLRun) >= commissionPnLMinInterval {
+		runCommissionPnL = true
+		lastCommissionPnLRun = time.Now()
+	}
+	lastCommissionPnLRunMu.Unlock()
+
+	if runCommissionPnL {
+		// Method 1: COMMISSION income detection（每 4 小时）
+		commissionSymbols, err := t.GetCommissionSymbols(lastSyncTime)
+		if err != nil {
+			logger.Infof("  ⚠️ Failed to get commission symbols: %v", err)
+			time.Sleep(30 * time.Second) // 失败后至少 30 秒再允许重试
+			return fmt.Errorf("get commission symbols: %w", err)
+		}
 		logger.Infof("  📋 COMMISSION symbols found: %d - %v", len(commissionSymbols), commissionSymbols)
 		for _, s := range commissionSymbols {
+			symbolMap[s] = true
+		}
+
+		// Method 4: REALIZED_PNL（每 4 小时）
+		pnlSymbols, err := t.GetPnLSymbols(lastSyncTime)
+		if err != nil {
+			logger.Infof("  ⚠️ Failed to get PnL symbols: %v", err)
+			time.Sleep(30 * time.Second)
+			return fmt.Errorf("get PnL symbols: %w", err)
+		}
+		logger.Infof("  📋 REALIZED_PNL symbols found: %d - %v", len(pnlSymbols), pnlSymbols)
+		for _, s := range pnlSymbols {
 			symbolMap[s] = true
 		}
 	}
@@ -97,19 +127,7 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 		symbolMap[s] = true
 	}
 
-	// Method 4: ALWAYS query REALIZED_PNL income to find symbols with closed trades
-	// This catches trades that COMMISSION missed (VIP users, BNB fee discount)
-	// IMPORTANT: Must run always, not just when symbolMap is empty,
-	// because a position might be fully closed (no active position) but have PnL
-	pnlSymbols, err := t.GetPnLSymbols(lastSyncTime)
-	if err != nil {
-		logger.Infof("  ⚠️ Failed to get PnL symbols: %v", err)
-	} else {
-		logger.Infof("  📋 REALIZED_PNL symbols found: %d - %v", len(pnlSymbols), pnlSymbols)
-		for _, s := range pnlSymbols {
-			symbolMap[s] = true
-		}
-	}
+	// Method 4 已并入 runCommissionPnL 每 4 小时块，此处不再重复拉 PnL
 
 	var changedSymbols []string
 	for s := range symbolMap {
@@ -146,9 +164,16 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 		if queryErr != nil {
 			logger.Infof("  ⚠️ Failed to get trades for %s: %v", symbol, queryErr)
 			failedSymbols = append(failedSymbols, symbol)
-			continue
+			SetCircuitBreakerFromError(queryErr)
+			time.Sleep(30 * time.Second) // 禁止 0 延迟重试，至少 30 秒
+			break
 		}
 		allTrades = append(allTrades, trades...)
+	}
+
+	if len(failedSymbols) > 0 && len(allTrades) == 0 {
+		logger.Infof("  ⚠️ %d symbols failed, will retry after 30s: %v", len(failedSymbols), failedSymbols)
+		return fmt.Errorf("sync failed for %d symbols", len(failedSymbols))
 	}
 
 	logger.Infof("📥 Received %d trades from Binance (%d API calls)", len(allTrades), apiCalls)
@@ -363,7 +388,8 @@ func (t *FuturesTrader) StartOrderSync(traderID string, exchangeID string, excha
 	go func() {
 		for range ticker.C {
 			if err := t.SyncOrdersFromBinance(traderID, exchangeID, exchangeType, st); err != nil {
-				logger.Infof("⚠️  Binance order sync failed: %v", err)
+				logger.Infof("⚠️  Binance order sync failed: %v (sleep 30s before retry)", err)
+				time.Sleep(30 * time.Second) // 失败后至少 30 秒再重试，避免死亡循环
 			}
 		}
 	}()

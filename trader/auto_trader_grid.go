@@ -757,6 +757,14 @@ func (at *AutoTrader) adjustGridDirection(newDirection market.GridDirection) err
 
 // RunGridCycle executes one grid trading cycle
 func (at *AutoTrader) RunGridCycle() error {
+	// 引擎互斥锁：若上一周期仍在执行，跳过本次
+	if at.isExecuting.Load() {
+		logger.Infof("[Grid] Skip cycle: previous decision still executing")
+		return nil
+	}
+	at.isExecuting.Store(true)
+	defer at.isExecuting.Store(false)
+
 	// Check if trader is stopped (early exit to prevent trades after Stop() is called)
 	at.isRunningMutex.RLock()
 	running := at.isRunning

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"nofx/hook"
 	"nofx/logger"
 	"nofx/trader/types"
@@ -46,29 +47,47 @@ func getBrOrderID() string {
 
 // FuturesTrader Binance futures trader
 type FuturesTrader struct {
-	client *futures.Client
-
-	// isTestnet: true 时强制使用 testnet.binancefuture.com，防止 hook 等覆盖 BaseURL
+	client  *futures.Client
+	apiKey  string // 用于 ws-api userDataStream.start / userDataStream.ping，替代废弃的 REST listenKey 接口
 	isTestnet bool
 
-	// Balance cache
+	// Balance cache (updated by WebSocket User Data Stream or HTTP fallback)
 	cachedBalance     map[string]interface{}
 	balanceCacheTime  time.Time
 	balanceCacheMutex sync.RWMutex
 
-	// Position cache
+	// Position cache (updated by WebSocket User Data Stream or HTTP fallback)
 	cachedPositions     []map[string]interface{}
 	positionsCacheTime  time.Time
 	positionsCacheMutex sync.RWMutex
 
-	// Cache validity period (15 seconds)
+	// Cache validity period (15 seconds) - used only when User Data Stream is not active
 	cacheDuration time.Duration
+
+	// User Data Stream control
+	userDataStop chan struct{}
 }
 
 const binanceFuturesTestnetURL = "https://testnet.binancefuture.com"
 
-// NewFuturesTrader creates futures trader. isTestnet: true 使用 testnet.binancefuture.com 模拟盘，BaseURL 在 hook 后再次强制覆盖
+// NewFuturesTrader creates futures trader with User Data Stream for real-time cache.
+// isTestnet: true 使用 testnet.binancefuture.com 模拟盘
 func NewFuturesTrader(apiKey, secretKey string, userId string, isTestnet bool) *FuturesTrader {
+	return newFuturesTrader(apiKey, secretKey, userId, isTestnet, true)
+}
+
+// NewFuturesTraderNoUserStream creates futures trader without starting User Data Stream.
+// Use for short-lived temp traders (e.g. API account fetch) to avoid WebSocket overhead.
+func NewFuturesTraderNoUserStream(apiKey, secretKey string, userId string, isTestnet bool) *FuturesTrader {
+	return newFuturesTrader(apiKey, secretKey, userId, isTestnet, false)
+}
+
+const (
+	recvWindowMs      = 20000 // 20s for -1021 (go-binance may not expose RecvWindow on all services)
+	timeSyncThreshold = 5000  // 5s, force sync if offset exceeds
+)
+
+func newFuturesTrader(apiKey, secretKey string, userId string, isTestnet bool, startUserStream bool) *FuturesTrader {
 	client := futures.NewClient(apiKey, secretKey)
 	if isTestnet {
 		client.BaseURL = binanceFuturesTestnetURL
@@ -88,14 +107,19 @@ func NewFuturesTrader(apiKey, secretKey string, userId string, isTestnet bool) *
 	syncBinanceServerTime(client)
 	trader := &FuturesTrader{
 		client:        client,
+		apiKey:        apiKey,
 		isTestnet:     isTestnet,
-		cacheDuration: 15 * time.Second, // 15-second cache
+		cacheDuration: 15 * time.Second, // 15-second cache (fallback when WebSocket inactive)
 	}
 
 	// Set dual-side position mode (Hedge Mode)
 	// This is required because the code uses PositionSide (LONG/SHORT)
 	if err := trader.setDualSidePosition(); err != nil {
 		logger.Infof("⚠️ Failed to set dual-side position mode: %v (ignore this warning if already in dual-side mode)", err)
+	}
+
+	if startUserStream {
+		trader.StartUserDataStream()
 	}
 
 	return trader
@@ -137,23 +161,42 @@ func syncBinanceServerTime(client *futures.Client) {
 	logger.Infof("⏱ Binance server time synced, offset %dms", offset)
 }
 
-// GetBalance gets account balance (with cache)
+// ensureTimeSync forces sync if offset exceeds threshold (mitigate -1021)
+func (t *FuturesTrader) ensureTimeSync() {
+	serverTime, err := t.client.NewServerTimeService().Do(context.Background())
+	if err != nil {
+		return
+	}
+	offset := time.Now().UnixMilli() - serverTime
+	if offset > timeSyncThreshold || offset < -timeSyncThreshold {
+		t.client.TimeOffset = offset
+		logger.Infof("⏱ Time sync forced (offset %dms > %dms)", offset, timeSyncThreshold)
+	}
+}
+
+// GetBalance gets account balance. Returns from local cache (updated by User Data Stream)
+// without HTTP. Falls back to HTTP only when cache is empty.
+// Returns a copy to avoid race: reader holds copy while WS may replace cache.
 func (t *FuturesTrader) GetBalance() (map[string]interface{}, error) {
-	// First check if cache is valid
 	t.balanceCacheMutex.RLock()
-	if t.cachedBalance != nil && time.Since(t.balanceCacheTime) < t.cacheDuration {
-		cacheAge := time.Since(t.balanceCacheTime)
+	if t.cachedBalance != nil {
+		snapshot := make(map[string]interface{}, len(t.cachedBalance))
+		for k, v := range t.cachedBalance {
+			snapshot[k] = v
+		}
 		t.balanceCacheMutex.RUnlock()
-		logger.Infof("✓ Using cached account balance (cache age: %.1f seconds ago)", cacheAge.Seconds())
-		return t.cachedBalance, nil
+		return snapshot, nil
 	}
 	t.balanceCacheMutex.RUnlock()
 
-	// Cache expired or doesn't exist, call API
-	logger.Infof("🔄 Cache expired, calling Binance API to get account balance...")
+	// Cache empty: force HTTP fetch and update cache
+	return t.fetchAndCacheBalance()
+}
+
+// fetchAndCacheBalance fetches balance via REST API and updates cache
+func (t *FuturesTrader) fetchAndCacheBalance() (map[string]interface{}, error) {
 	account, err := t.client.NewGetAccountService().Do(context.Background())
 	if err != nil {
-		logger.Infof("❌ Binance API call failed: %v", err)
 		return nil, fmt.Errorf("failed to get account info: %w", err)
 	}
 
@@ -162,12 +205,6 @@ func (t *FuturesTrader) GetBalance() (map[string]interface{}, error) {
 	result["availableBalance"], _ = strconv.ParseFloat(account.AvailableBalance, 64)
 	result["totalUnrealizedProfit"], _ = strconv.ParseFloat(account.TotalUnrealizedProfit, 64)
 
-	logger.Infof("✓ Binance API returned: total balance=%s, available=%s, unrealized PnL=%s",
-		account.TotalWalletBalance,
-		account.AvailableBalance,
-		account.TotalUnrealizedProfit)
-
-	// Update cache
 	t.balanceCacheMutex.Lock()
 	t.cachedBalance = result
 	t.balanceCacheTime = time.Now()
@@ -176,22 +213,37 @@ func (t *FuturesTrader) GetBalance() (map[string]interface{}, error) {
 	return result, nil
 }
 
-// GetPositions gets all positions (with cache)
+// GetPositions gets all positions. Returns from local cache (updated by User Data Stream)
+// without HTTP. Falls back to HTTP only when cache is empty.
+// Returns a copy to avoid race: reader holds copy while WS may replace cache.
 func (t *FuturesTrader) GetPositions() ([]map[string]interface{}, error) {
-	// First check if cache is valid
 	t.positionsCacheMutex.RLock()
-	if t.cachedPositions != nil && time.Since(t.positionsCacheTime) < t.cacheDuration {
-		cacheAge := time.Since(t.positionsCacheTime)
+	if t.cachedPositions != nil {
+		snapshot := make([]map[string]interface{}, len(t.cachedPositions))
+		for i, p := range t.cachedPositions {
+			pm := make(map[string]interface{}, len(p))
+			for k, v := range p {
+				pm[k] = v
+			}
+			snapshot[i] = pm
+		}
 		t.positionsCacheMutex.RUnlock()
-		logger.Infof("✓ Using cached position information (cache age: %.1f seconds ago)", cacheAge.Seconds())
-		return t.cachedPositions, nil
+		return snapshot, nil
 	}
 	t.positionsCacheMutex.RUnlock()
 
-	// Cache expired or doesn't exist, call API
-	logger.Infof("🔄 Cache expired, calling Binance API to get position information...")
+	// Cache empty: force HTTP fetch and update cache
+	return t.fetchAndCachePositions()
+}
+
+// fetchAndCachePositions fetches positions via REST API and updates cache
+func (t *FuturesTrader) fetchAndCachePositions() ([]map[string]interface{}, error) {
+	if err := CheckCircuitBreaker(); err != nil {
+		return nil, err
+	}
 	positions, err := t.client.NewGetPositionRiskService().Do(context.Background())
 	if err != nil {
+		SetCircuitBreakerFromError(err)
 		return nil, fmt.Errorf("failed to get positions: %w", err)
 	}
 
@@ -199,7 +251,7 @@ func (t *FuturesTrader) GetPositions() ([]map[string]interface{}, error) {
 	for _, pos := range positions {
 		posAmt, _ := strconv.ParseFloat(pos.PositionAmt, 64)
 		if posAmt == 0 {
-			continue // Skip positions with zero amount
+			continue
 		}
 
 		posMap := make(map[string]interface{})
@@ -210,25 +262,25 @@ func (t *FuturesTrader) GetPositions() ([]map[string]interface{}, error) {
 		posMap["unRealizedProfit"], _ = strconv.ParseFloat(pos.UnRealizedProfit, 64)
 		posMap["leverage"], _ = strconv.ParseFloat(pos.Leverage, 64)
 		posMap["liquidationPrice"], _ = strconv.ParseFloat(pos.LiquidationPrice, 64)
-		// Note: Binance SDK doesn't expose updateTime field, will fallback to local tracking
-
-		// Determine direction
 		if posAmt > 0 {
 			posMap["side"] = "long"
 		} else {
 			posMap["side"] = "short"
 		}
-
 		result = append(result, posMap)
 	}
 
-	// Update cache
 	t.positionsCacheMutex.Lock()
 	t.cachedPositions = result
 	t.positionsCacheTime = time.Now()
 	t.positionsCacheMutex.Unlock()
 
 	return result, nil
+}
+
+// ReconcileFromREST 强制对账：用 REST 全量数据覆盖本地缓存（缓存自我纠错，应对 WS 漏接或手机端手动操作）
+func (t *FuturesTrader) ReconcileFromREST() {
+	t.refreshAccountFromAPI()
 }
 
 // SetMarginMode sets margin mode
@@ -438,34 +490,131 @@ func (t *FuturesTrader) OpenShort(symbol string, quantity float64, leverage int)
 	return result, nil
 }
 
-// CloseLong closes a long position
+// ForceZeroPositionInCache 平仓成功后或 alreadyClosed 时清理幽灵缓存，将该 symbol 的对应仓位从内存移除（对外暴露供 AutoTrader 调用）
+func (t *FuturesTrader) ForceZeroPositionInCache(symbol, positionSide string) {
+	key := symbol + "_" + positionSide
+	t.positionsCacheMutex.Lock()
+	defer t.positionsCacheMutex.Unlock()
+	newList := make([]map[string]interface{}, 0, len(t.cachedPositions))
+	for _, p := range t.cachedPositions {
+		psym, _ := p["symbol"].(string)
+		pside := "LONG"
+		if s, _ := p["side"].(string); s == "short" {
+			pside = "SHORT"
+		}
+		if psym+"_"+pside == key {
+			continue // 移除该仓位
+		}
+		newList = append(newList, p)
+	}
+	t.cachedPositions = newList
+	t.positionsCacheTime = time.Now()
+}
+
+// getPositionSizeForClose returns absolute position size from WS cache, floored. 0 if not found.
+// 注意：平仓操作应使用 getPositionSizeFromREST 忽略缓存，此方法仅用于非平仓场景
+func (t *FuturesTrader) getPositionSizeForClose(symbol, side string) float64 {
+	positions, err := t.GetPositions()
+	if err != nil {
+		return 0
+	}
+	for _, pos := range positions {
+		psym, _ := pos["symbol"].(string)
+		pside, _ := pos["side"].(string)
+		if psym != symbol || strings.ToLower(pside) != side {
+			continue
+		}
+		pa, _ := pos["positionAmt"].(float64)
+		var abs float64
+		if strings.ToLower(pside) == "short" && pa < 0 {
+			abs = -pa
+		} else {
+			abs = pa
+		}
+		return math.Floor(abs*1e8) / 1e8
+	}
+	return 0
+}
+
+// getPositionSizeFromREST fetches position from fapi/v2/positionRisk for final reconciliation when cache=0
+func (t *FuturesTrader) getPositionSizeFromREST(symbol, side string) float64 {
+	if err := CheckCircuitBreaker(); err != nil {
+		return 0
+	}
+	positions, err := t.client.NewGetPositionRiskService().Do(context.Background())
+	if err != nil {
+		SetCircuitBreakerFromError(err)
+		return 0
+	}
+	for _, pos := range positions {
+		posAmt, _ := strconv.ParseFloat(pos.PositionAmt, 64)
+		if posAmt == 0 {
+			continue
+		}
+		pside := "long"
+		if posAmt < 0 {
+			pside = "short"
+		}
+		if pos.Symbol != symbol || pside != side {
+			continue
+		}
+		abs := posAmt
+		if abs < 0 {
+			abs = -abs
+		}
+		return math.Floor(abs*1e8) / 1e8
+	}
+	return 0
+}
+
+// formatQuantityFloor formats quantity with Floor to never exceed position (avoids -2022)
+func (t *FuturesTrader) formatQuantityFloor(symbol string, quantity float64) (string, error) {
+	precision, err := t.GetSymbolPrecision(symbol)
+	if err != nil {
+		return fmt.Sprintf("%.3f", quantity), nil
+	}
+	mult := math.Pow(10, float64(precision))
+	floored := math.Floor(quantity*mult) / mult
+	format := fmt.Sprintf("%%.%df", precision)
+	return fmt.Sprintf(format, floored), nil
+}
+
+// CloseLong closes a long position. side=SELL, positionSide=LONG. Hedge mode: do NOT send reduceOnly.
 func (t *FuturesTrader) CloseLong(symbol string, quantity float64) (map[string]interface{}, error) {
-	// If quantity is 0, get current position quantity
-	if quantity == 0 {
-		positions, err := t.GetPositions()
-		if err != nil {
-			return nil, err
-		}
-
-		for _, pos := range positions {
-			if pos["symbol"] == symbol && pos["side"] == "long" {
-				quantity = pos["positionAmt"].(float64)
-				break
-			}
-		}
-
-		if quantity == 0 {
-			return nil, fmt.Errorf("no long position found for %s", symbol)
-		}
+	if err := CheckCircuitBreaker(); err != nil {
+		return nil, err
+	}
+	t.ensureTimeSync()
+	if err := t.CancelAllOrders(symbol); err != nil {
+		logger.Infof("  ⚠ Failed to cancel pending orders before close: %v", err)
 	}
 
-	// Format quantity
-	quantityStr, err := t.FormatQuantity(symbol, quantity)
+	// 平仓前终极 REST 校验：忽略缓存，强制调用 fapi/v2/positionRisk 获取真实仓位
+	currentSize := t.getPositionSizeFromREST(symbol, "long")
+	if currentSize <= 0 {
+		logger.Infof("[INFO] Position already closed, skipping. symbol=%s side=LONG", symbol)
+		return map[string]interface{}{"orderId": int64(0), "status": "ALREADY_CLOSED", "alreadyClosed": true}, nil
+	}
+
+	if quantity == 0 {
+		quantity = currentSize
+	}
+	if quantity > currentSize {
+		quantity = currentSize
+	}
+
+	quantityStr, err := t.formatQuantityFloor(symbol, quantity)
 	if err != nil {
 		return nil, err
 	}
+	quantityFloat, _ := strconv.ParseFloat(quantityStr, 64)
+	if quantityFloat <= 0 {
+		return nil, fmt.Errorf("formatted quantity too small: %s", quantityStr)
+	}
+	if quantityFloat > currentSize {
+		quantityStr, _ = t.formatQuantityFloor(symbol, currentSize)
+	}
 
-	// Create market sell order (close long, using br ID)
 	order, err := t.client.NewCreateOrderService().
 		Symbol(symbol).
 		Side(futures.SideTypeSell).
@@ -476,15 +625,18 @@ func (t *FuturesTrader) CloseLong(symbol string, quantity float64) (map[string]i
 		Do(context.Background())
 
 	if err != nil {
+		SetCircuitBreakerFromError(err)
+		if strings.Contains(err.Error(), "-2022") || strings.Contains(err.Error(), "2022") {
+			logger.Errorf("[Binance -2022] symbol=%s side=SELL positionSide=LONG quantity=%s actualPositionSize=%.8f err=%v",
+				symbol, quantityStr, currentSize, err)
+		}
 		return nil, fmt.Errorf("failed to close long position: %w", err)
 	}
 
 	logger.Infof("✓ Closed long position successfully: %s quantity: %s", symbol, quantityStr)
 
-	// After closing position, cancel all pending orders for this symbol (stop-loss and take-profit orders)
-	if err := t.CancelAllOrders(symbol); err != nil {
-		logger.Infof("  ⚠ Failed to cancel pending orders: %v", err)
-	}
+	// 脏写缓存：不等 WebSocket，立即将该 symbol LONG 仓位标记为 0
+	t.ForceZeroPositionInCache(symbol, "LONG")
 
 	result := make(map[string]interface{})
 	result["orderId"] = order.OrderID
@@ -493,34 +645,42 @@ func (t *FuturesTrader) CloseLong(symbol string, quantity float64) (map[string]i
 	return result, nil
 }
 
-// CloseShort closes a short position
+// CloseShort closes a short position. side=BUY, positionSide=SHORT. Hedge mode: do NOT send reduceOnly.
 func (t *FuturesTrader) CloseShort(symbol string, quantity float64) (map[string]interface{}, error) {
-	// If quantity is 0, get current position quantity
-	if quantity == 0 {
-		positions, err := t.GetPositions()
-		if err != nil {
-			return nil, err
-		}
-
-		for _, pos := range positions {
-			if pos["symbol"] == symbol && pos["side"] == "short" {
-				quantity = -pos["positionAmt"].(float64) // Short position quantity is negative, take absolute value
-				break
-			}
-		}
-
-		if quantity == 0 {
-			return nil, fmt.Errorf("no short position found for %s", symbol)
-		}
+	if err := CheckCircuitBreaker(); err != nil {
+		return nil, err
+	}
+	t.ensureTimeSync()
+	if err := t.CancelAllOrders(symbol); err != nil {
+		logger.Infof("  ⚠ Failed to cancel pending orders before close: %v", err)
 	}
 
-	// Format quantity
-	quantityStr, err := t.FormatQuantity(symbol, quantity)
+	// 平仓前终极 REST 校验：忽略缓存，强制调用 fapi/v2/positionRisk 获取真实仓位
+	currentSize := t.getPositionSizeFromREST(symbol, "short")
+	if currentSize <= 0 {
+		logger.Infof("[INFO] Position already closed, skipping. symbol=%s side=SHORT", symbol)
+		return map[string]interface{}{"orderId": int64(0), "status": "ALREADY_CLOSED", "alreadyClosed": true}, nil
+	}
+
+	if quantity == 0 {
+		quantity = currentSize
+	}
+	if quantity > currentSize {
+		quantity = currentSize
+	}
+
+	quantityStr, err := t.formatQuantityFloor(symbol, quantity)
 	if err != nil {
 		return nil, err
 	}
+	quantityFloat, _ := strconv.ParseFloat(quantityStr, 64)
+	if quantityFloat <= 0 {
+		return nil, fmt.Errorf("formatted quantity too small: %s", quantityStr)
+	}
+	if quantityFloat > currentSize {
+		quantityStr, _ = t.formatQuantityFloor(symbol, currentSize)
+	}
 
-	// Create market buy order (close short, using br ID)
 	order, err := t.client.NewCreateOrderService().
 		Symbol(symbol).
 		Side(futures.SideTypeBuy).
@@ -531,15 +691,18 @@ func (t *FuturesTrader) CloseShort(symbol string, quantity float64) (map[string]
 		Do(context.Background())
 
 	if err != nil {
+		SetCircuitBreakerFromError(err)
+		if strings.Contains(err.Error(), "-2022") || strings.Contains(err.Error(), "2022") {
+			logger.Errorf("[Binance -2022] symbol=%s side=BUY positionSide=SHORT quantity=%s actualPositionSize=%.8f err=%v",
+				symbol, quantityStr, currentSize, err)
+		}
 		return nil, fmt.Errorf("failed to close short position: %w", err)
 	}
 
 	logger.Infof("✓ Closed short position successfully: %s quantity: %s", symbol, quantityStr)
 
-	// After closing position, cancel all pending orders for this symbol (stop-loss and take-profit orders)
-	if err := t.CancelAllOrders(symbol); err != nil {
-		logger.Infof("  ⚠ Failed to cancel pending orders: %v", err)
-	}
+	// 脏写缓存：不等 WebSocket，立即将该 symbol SHORT 仓位标记为 0
+	t.ForceZeroPositionInCache(symbol, "SHORT")
 
 	result := make(map[string]interface{})
 	result["orderId"] = order.OrderID
@@ -1363,6 +1526,9 @@ func (t *FuturesTrader) GetTrades(startTime time.Time, limit int) ([]types.Trade
 // GetTradesForSymbol retrieves trade history for a specific symbol
 // This is more reliable than using Income API which may have delays
 func (t *FuturesTrader) GetTradesForSymbol(symbol string, startTime time.Time, limit int) ([]types.TradeRecord, error) {
+	if err := CheckCircuitBreaker(); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		limit = 100
 	}
@@ -1376,6 +1542,7 @@ func (t *FuturesTrader) GetTradesForSymbol(symbol string, startTime time.Time, l
 		Limit(limit).
 		Do(context.Background())
 	if err != nil {
+		SetCircuitBreakerFromError(err)
 		return nil, fmt.Errorf("failed to get trade history for %s: %w", symbol, err)
 	}
 
@@ -1406,6 +1573,9 @@ func (t *FuturesTrader) GetTradesForSymbol(symbol string, startTime time.Time, l
 // GetTradesForSymbolFromID retrieves trade history for a specific symbol starting from a given trade ID
 // This is used for incremental sync - only fetch new trades since last sync
 func (t *FuturesTrader) GetTradesForSymbolFromID(symbol string, fromID int64, limit int) ([]types.TradeRecord, error) {
+	if err := CheckCircuitBreaker(); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		limit = 100
 	}
@@ -1419,6 +1589,7 @@ func (t *FuturesTrader) GetTradesForSymbolFromID(symbol string, fromID int64, li
 		Limit(limit).
 		Do(context.Background())
 	if err != nil {
+		SetCircuitBreakerFromError(err)
 		return nil, fmt.Errorf("failed to get trade history for %s from ID %d: %w", symbol, fromID, err)
 	}
 
@@ -1449,12 +1620,16 @@ func (t *FuturesTrader) GetTradesForSymbolFromID(symbol string, fromID int64, li
 // GetCommissionSymbols returns symbols that have new commission records since lastSyncTime
 // COMMISSION income is generated for every trade, so this is more reliable than REALIZED_PNL
 func (t *FuturesTrader) GetCommissionSymbols(lastSyncTime time.Time) ([]string, error) {
+	if err := CheckCircuitBreaker(); err != nil {
+		return nil, err
+	}
 	incomes, err := t.client.NewGetIncomeHistoryService().
 		IncomeType("COMMISSION").
 		StartTime(lastSyncTime.UnixMilli()).
 		Limit(1000).
 		Do(context.Background())
 	if err != nil {
+		SetCircuitBreakerFromError(err)
 		return nil, fmt.Errorf("failed to get commission history: %w", err)
 	}
 
@@ -1476,12 +1651,16 @@ func (t *FuturesTrader) GetCommissionSymbols(lastSyncTime time.Time) ([]string, 
 // GetPnLSymbols returns symbols that have REALIZED_PNL records since lastSyncTime
 // This is a fallback when COMMISSION detection fails (VIP users, BNB fee discount)
 func (t *FuturesTrader) GetPnLSymbols(lastSyncTime time.Time) ([]string, error) {
+	if err := CheckCircuitBreaker(); err != nil {
+		return nil, err
+	}
 	incomes, err := t.client.NewGetIncomeHistoryService().
 		IncomeType("REALIZED_PNL").
 		StartTime(lastSyncTime.UnixMilli()).
 		Limit(1000).
 		Do(context.Background())
 	if err != nil {
+		SetCircuitBreakerFromError(err)
 		return nil, fmt.Errorf("failed to get PnL history: %w", err)
 	}
 

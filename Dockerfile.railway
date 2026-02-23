@@ -23,7 +23,8 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates tzdata sqlite3 nginx curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-RUN mkdir -p /app/data /etc/nginx/conf.d
+RUN mkdir -p /app/data /data/config /data/db /etc/nginx/conf.d
+VOLUME /data
 # 复制你亲手改的代码产物
 COPY --from=frontend-builder /app/web/dist /usr/share/nginx/html
 COPY --from=backend-builder /usr/lib/libta_lib.so* /usr/lib/
@@ -32,7 +33,7 @@ COPY --from=backend-builder /app/nofx /app/nofx
 COPY railway/start.sh /app/start.sh
 # 彻底解决 Windows 换行符导致脚本打不开的问题
 RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
-ENV DB_PATH=/app/data/data.db
+ENV DB_PATH=/data/db/data.db
 EXPOSE 8080
 # 修正健康检查路径
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

@@ -36,16 +36,15 @@ func main() {
 	cfg := config.Get()
 	logger.Info("✅ Configuration loaded")
 
-	// Initialize encryption service BEFORE database (so EncryptedString can decrypt on read)
-	// 降级逻辑：RSA_PRIVATE_KEY 无效或缺失时跳过加密初始化，EncryptedString 自动使用明文/Base64 模式
+	// Initialize encryption service BEFORE database (plaintext/base64 mode, no keys required)
 	logger.Info("🔐 Initializing encryption service...")
 	cryptoService, err := crypto.NewCryptoService()
 	if err != nil {
-		logger.Warnf("⚠️ Encryption service init failed (using plaintext mode): %v", err)
+		logger.Warnf("⚠️ Encryption service init failed: %v", err)
 		cryptoService = nil
 	} else {
 		crypto.SetGlobalCryptoService(cryptoService)
-		logger.Info("✅ Encryption service initialized successfully")
+		logger.Info("🔓 Encryption service disabled, using plaintext mode for local environment")
 	}
 
 	// Initialize database from configuration

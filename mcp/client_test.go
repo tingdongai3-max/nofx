@@ -331,9 +331,9 @@ func TestClient_IsRetryableError(t *testing.T) {
 		expected bool
 	}{
 		{
-			name:     "EOF error",
+			name:     "EOF error (not retryable to avoid duplicate token consumption)",
 			err:      errors.New("unexpected EOF"),
-			expected: true,
+			expected: false,
 		},
 		{
 			name:     "timeout error",

@@ -22,6 +22,7 @@ import (
 	"nofx/trader/okx"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -147,6 +148,7 @@ type AutoTrader struct {
 	gridState             *GridState         // Grid trading state (only used when StrategyType == "grid_trading")
 	watchdogCtx           context.Context    // Context for risk watchdog (cancelled on Stop)
 	watchdogCancel        context.CancelFunc // Cancel risk watchdog on Stop
+	isExecuting           atomic.Bool       // 引擎互斥锁：防止多个 AI 决策线程重叠
 }
 
 // NewAutoTrader creates an automatic trader
@@ -442,11 +444,30 @@ func (at *AutoTrader) Run() error {
 		}
 	}
 
-	// Start Binance order sync if using Binance exchange
+	// Start Binance order sync and cache self-healing if using Binance exchange
 	if at.exchange == "binance" {
-		if binanceTrader, ok := at.trader.(*binance.FuturesTrader); ok && at.store != nil {
-			binanceTrader.StartOrderSync(at.id, at.exchangeID, at.exchange, at.store, 30*time.Second)
-			logger.Infof("🔄 [%s] Binance order+position sync enabled (every 30s)", at.name)
+		if binanceTrader, ok := at.trader.(*binance.FuturesTrader); ok {
+			if at.store != nil {
+				binanceTrader.StartOrderSync(at.id, at.exchangeID, at.exchange, at.store, 30*time.Second)
+				logger.Infof("🔄 [%s] Binance order+position sync enabled (every 30s)", at.name)
+			}
+			// 定时全局对账：每 5 分钟 REST 全量覆盖缓存，应对 WS 漏接或手机端手动操作
+			at.monitorWg.Add(1)
+			go func() {
+				defer at.monitorWg.Done()
+				ticker := time.NewTicker(5 * time.Minute)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-at.stopMonitorCh:
+						return
+					case <-ticker.C:
+						binanceTrader.ReconcileFromREST()
+						logger.Infof("🔄 [%s] Cache self-healing: 5-min REST reconciliation done", at.name)
+					}
+				}
+			}()
+			logger.Infof("🔄 [%s] Cache self-healing enabled (every 5 min REST reconciliation)", at.name)
 		}
 	}
 
@@ -552,6 +573,14 @@ func (at *AutoTrader) Stop() {
 
 // runCycle runs one trading cycle (using AI full decision-making)
 func (at *AutoTrader) runCycle() error {
+	// 引擎互斥锁：若上一周期仍在执行，跳过本次
+	if at.isExecuting.Load() {
+		logger.Infof("⏭ Skip cycle: previous AI decision still executing")
+		return nil
+	}
+	at.isExecuting.Store(true)
+	defer at.isExecuting.Store(false)
+
 	at.callCount++
 
 	logger.Info("\n" + strings.Repeat("=", 70) + "\n")
@@ -1069,10 +1098,9 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *kernel.Decision, actio
 		return at.executeOpenLongWithRecord(decision, actionRecord)
 	case "open_short":
 		return at.executeOpenShortWithRecord(decision, actionRecord)
-	case "close_long":
-		return at.executeCloseLongWithRecord(decision, actionRecord)
-	case "close_short":
-		return at.executeCloseShortWithRecord(decision, actionRecord)
+	case "close_long", "close_short":
+		logger.Warnf("[System Guard] AI attempted to manually close position (action=%s). Blocked; converting to wait.", decision.Action)
+		return nil
 	case "hold", "wait":
 		// 动态止盈止损：若已有持仓且 AI 给出新 TP/SL，先撤旧单再挂新单
 		if (decision.TakeProfit > 0 || decision.StopLoss > 0) && at.updateTpSlForExistingPosition(decision) {
@@ -1111,26 +1139,32 @@ func (at *AutoTrader) updateTpSlForExistingPosition(decision *kernel.Decision) b
 		return false
 	}
 	sideUpper := strings.ToUpper(posSide)
-	logger.Infof("  📍 [updateTpSl] %s 已有 %s 持仓 qty=%.4f，撤旧 TP/SL 并挂新单 TP=%.4f SL=%.4f",
-		decision.Symbol, posSide, quantity, decision.TakeProfit, decision.StopLoss)
-	if err := at.trader.CancelTakeProfitOrders(decision.Symbol); err != nil {
-		logger.Infof("  ⚠️ [updateTpSl] cancel take profit orders: %v", err)
-	}
-	if err := at.trader.CancelStopLossOrders(decision.Symbol); err != nil {
-		logger.Infof("  ⚠️ [updateTpSl] cancel stop loss orders: %v", err)
-	}
-	if decision.StopLoss > 0 {
-		if err := at.trader.SetStopLoss(decision.Symbol, sideUpper, quantity, decision.StopLoss); err != nil {
-			logger.Infof("  ⚠️ [updateTpSl] set stop loss: %v", err)
-		} else {
-			logger.Infof("  ✓ [updateTpSl] stop loss set: %.4f", decision.StopLoss)
+	updateTP := decision.TakeProfit > 0
+	updateSL := decision.StopLoss > 0
+	logger.Infof("  📍 [updateTpSl] %s 已有 %s 持仓 qty=%.4f，updateTP=%v updateSL=%v (TP=%.4f SL=%.4f)",
+		decision.Symbol, posSide, quantity, updateTP, updateSL, decision.TakeProfit, decision.StopLoss)
+	// Only cancel and set TP when AI provided a new take_profit; otherwise keep existing TP (trailing stop = SL only).
+	if updateTP {
+		if err := at.trader.CancelTakeProfitOrders(decision.Symbol); err != nil {
+			logger.Infof("  ⚠️ [updateTpSl] cancel take profit orders: %v", err)
 		}
-	}
-	if decision.TakeProfit > 0 {
 		if err := at.trader.SetTakeProfit(decision.Symbol, sideUpper, quantity, decision.TakeProfit); err != nil {
 			logger.Infof("  ⚠️ [updateTpSl] set take profit: %v", err)
 		} else {
 			logger.Infof("  ✓ [updateTpSl] take profit set: %.4f", decision.TakeProfit)
+		}
+	} else {
+		logger.Infof("  ✓ [updateTpSl] take_profit not set (≤0 or omitted), keeping existing TP order")
+	}
+	// Only cancel and set SL when AI provided a new stop_loss.
+	if updateSL {
+		if err := at.trader.CancelStopLossOrders(decision.Symbol); err != nil {
+			logger.Infof("  ⚠️ [updateTpSl] cancel stop loss orders: %v", err)
+		}
+		if err := at.trader.SetStopLoss(decision.Symbol, sideUpper, quantity, decision.StopLoss); err != nil {
+			logger.Infof("  ⚠️ [updateTpSl] set stop loss: %v", err)
+		} else {
+			logger.Infof("  ✓ [updateTpSl] stop loss set: %.4f", decision.StopLoss)
 		}
 	}
 	return true
@@ -1449,6 +1483,15 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 		return err
 	}
 
+	if alreadyClosed, _ := order["alreadyClosed"].(bool); alreadyClosed {
+		// 拦截后清理幽灵缓存：手动平仓导致 REST 返回已无仓位，必须立即从内存移除
+		if bt, ok := at.trader.(*binance.FuturesTrader); ok {
+			bt.ForceZeroPositionInCache(decision.Symbol, "LONG")
+		}
+		logger.Infof("  ✓ Position already closed, skipped (ghost cache cleared)")
+		return nil
+	}
+
 	// Record order ID
 	if orderID, ok := order["orderId"].(int64); ok {
 		actionRecord.OrderID = orderID
@@ -1511,6 +1554,15 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 	order, err := at.trader.CloseShort(decision.Symbol, 0) // 0 = close all
 	if err != nil {
 		return err
+	}
+
+	if alreadyClosed, _ := order["alreadyClosed"].(bool); alreadyClosed {
+		// 拦截后清理幽灵缓存：手动平仓导致 REST 返回已无仓位，必须立即从内存移除
+		if bt, ok := at.trader.(*binance.FuturesTrader); ok {
+			bt.ForceZeroPositionInCache(decision.Symbol, "SHORT")
+		}
+		logger.Infof("  ✓ Position already closed, skipped (ghost cache cleared)")
+		return nil
 	}
 
 	// Record order ID

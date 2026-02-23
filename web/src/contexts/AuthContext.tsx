@@ -123,6 +123,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const data = await response.json()
 
       if (response.ok) {
+        // 本地免登录：后端直接返回 token（如 127.0.0.1 bypass）
+        if (data.token) {
+          reset401Flag()
+          const userInfo = { id: data.user_id, email: data.email }
+          setToken(data.token)
+          setUser(userInfo)
+          localStorage.setItem('auth_token', data.token)
+          localStorage.setItem('auth_user', JSON.stringify(userInfo))
+          const returnUrl = sessionStorage.getItem('returnUrl')
+          if (returnUrl) {
+            sessionStorage.removeItem('returnUrl')
+            window.history.pushState({}, '', returnUrl)
+          } else {
+            window.history.pushState({}, '', '/traders')
+          }
+          window.dispatchEvent(new PopStateEvent('popstate'))
+          return { success: true, message: data.message }
+        }
         // Check for OTP setup required (incomplete registration)
         if (data.requires_otp_setup) {
           return {

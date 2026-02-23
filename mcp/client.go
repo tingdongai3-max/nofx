@@ -21,8 +21,8 @@ var (
 
 	MaxRetryTimes = 3
 
+	// EOF excluded: long-thinking models often get "unexpected EOF" when proxy/client closes first; retrying would send duplicate requests and burn tokens again
 	retryableErrors = []string{
-		"EOF",
 		"timeout",
 		"connection reset",
 		"connection refused",
@@ -170,6 +170,10 @@ func (client *Client) CallWithMessages(systemPrompt, userPrompt string) (string,
 		}
 
 		lastErr = err
+		// Hint for long-thinking models: unexpected EOF often means connection closed before response (proxy or client timeout)
+		if strings.Contains(err.Error(), "unexpected EOF") {
+			client.logger.Warnf("⚠️  AI request ended with unexpected EOF (connection closed). For long-thinking models, set AI_TIMEOUT_SECONDS=600 or higher and ensure your API proxy (e.g. poloapi.top) allows long-lived responses. No retry to avoid duplicate token consumption.")
+		}
 		// Check if error is retryable via hooks (supports custom retry strategy in subclass)
 		if !client.hooks.isRetryableError(err) {
 			return "", err
