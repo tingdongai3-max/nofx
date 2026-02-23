@@ -1,10 +1,11 @@
 #!/bin/bash
 # 在服务器上开启自托管放行并重启（拉最新代码、写入 ALLOW_BYPASS_LOGIN=1、重建/重启）
-# 用法（在服务器上执行）:
-#   curl -fsSL https://raw.githubusercontent.com/tingdongai3-max/nofx/my-custom-version/scripts/server-allow-bypass-login.sh | bash
-# 或: cd /root/nofx && bash scripts/server-allow-bypass-login.sh
+# 用法（在服务器上执行，分两行避免粘贴问题）:
+#   cd /root/nofx
+#   curl -fsSL https://raw.githubusercontent.com/tingdongai3-max/nofx/my-custom-version/scripts/server-allow-bypass-login.sh -o /tmp/allow-bypass.sh && bash /tmp/allow-bypass.sh
 set -e
-cd "${1:-/root/nofx}"
+INSTALL_DIR="${1:-/root/nofx}"
+cd "$INSTALL_DIR"
 [ -d .git ] && git pull origin my-custom-version || true
 if [ ! -f .env ]; then
   echo "No .env in $(pwd), creating with ALLOW_BYPASS_LOGIN=1"
