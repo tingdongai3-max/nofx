@@ -7,6 +7,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/tingdongai3-max/nofx/my-custom-version/install-custom.sh | bash
 # 或指定安装目录:
 #   curl -fsSL .../install-custom.sh | bash -s -- /opt/nofx
+# 迁移本地配置与数据到服务器（先上传迁移包到服务器 /tmp/）:
+#   curl -fsSL .../install-custom.sh | bash -s -- \$HOME/nofx /tmp/nofx-migration-YYYYMMDD-HHMM.tar.gz
 #
 # 可选环境变量（在运行前 export）:
 #   NOFX_GIT_REPO    仓库 URL，默认 https://github.com/tingdongai3-max/nofx.git
@@ -23,8 +25,9 @@ set -e
 GIT_REPO="${NOFX_GIT_REPO:-https://github.com/tingdongai3-max/nofx.git}"
 GIT_BRANCH="${NOFX_GIT_BRANCH:-my-custom-version}"
 COMPOSE_FILE="docker-compose.custom.yml"
-# 安装目录：第一个参数或环境变量或默认
+# 安装目录：第一个参数或环境变量或默认；第二个参数可选：迁移包路径（恢复本地配置与数据）
 INSTALL_DIR="${1:-${NOFX_INSTALL_DIR:-$HOME/nofx}}"
+MIGRATION_TARBALL="${2:-}"
 
 # ---------- 颜色 ----------
 RED='\033[0;31m'
@@ -66,10 +69,31 @@ check_and_install_deps() {
     elif command -v docker-compose &>/dev/null; then
         COMPOSE_CMD="docker-compose"
     else
-        die "Docker Compose not found. Install: https://docs.docker.com/compose/install/"
+        log_info "Docker Compose not found, installing standalone docker-compose (v1)..."
+        install_docker_compose_standalone || die "Failed to install Docker Compose"
+        COMPOSE_CMD="docker-compose"
     fi
     export COMPOSE_CMD
     log_ok "Dependencies OK (curl, git, docker, $COMPOSE_CMD)"
+}
+
+# 在无 docker-compose-plugin 的 Ubuntu 上安装独立版 docker-compose
+install_docker_compose_standalone() {
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64) arch="x86_64" ;;
+        aarch64|arm64) arch="aarch64" ;;
+        *) log_err "Unsupported arch $(uname -m)"; return 1 ;;
+    esac
+    local os="linux"
+    local ver="v2.24.0"
+    local url="https://github.com/docker/compose/releases/download/${ver}/docker-compose-${os}-${arch}"
+    local dest="/usr/local/bin/docker-compose"
+    curl -fsSL "$url" -o /tmp/docker-compose-bin || return 1
+    sudo mv /tmp/docker-compose-bin "$dest" || mv /tmp/docker-compose-bin "$dest" || return 1
+    sudo chmod +x "$dest" 2>/dev/null || chmod +x "$dest" || return 1
+    log_ok "Installed docker-compose to $dest"
+    return 0
 }
 
 # ---------- 安装目录：存在则 pull，否则 clone（幂等） ----------
@@ -97,6 +121,22 @@ setup_repo() {
         log_ok "Cloned $GIT_REPO ($GIT_BRANCH) into $INSTALL_DIR"
     fi
     cd "$INSTALL_DIR" || die "Cannot cd to $INSTALL_DIR"
+}
+
+# ---------- 恢复迁移包（可选：覆盖 .env 和 data/） ----------
+restore_migration() {
+    if [ -z "$MIGRATION_TARBALL" ] || [ ! -f "$MIGRATION_TARBALL" ]; then
+        return 0
+    fi
+    log_info "Restoring migration from: $MIGRATION_TARBALL"
+    tar -xzf "$MIGRATION_TARBALL" -C "$INSTALL_DIR" || die "Failed to extract migration tarball"
+    # 兼容本地为 data/data.db 的布局：Docker 需要 data/db/data.db
+    if [ -f "$INSTALL_DIR/data/data.db" ] && [ ! -f "$INSTALL_DIR/data/db/data.db" ]; then
+        mkdir -p "$INSTALL_DIR/data/db"
+        cp "$INSTALL_DIR/data/data.db" "$INSTALL_DIR/data/db/data.db"
+        log_info "Copied data/data.db -> data/db/data.db for Docker layout"
+    fi
+    log_ok "Migration restored (.env and data/ applied)"
 }
 
 # ---------- .env：不存在则生成，不硬编码敏感信息 ----------
@@ -195,6 +235,7 @@ main() {
     echo -e "${NC}"
     check_and_install_deps
     setup_repo
+    restore_migration
     setup_env
     build_and_start
     wait_healthy

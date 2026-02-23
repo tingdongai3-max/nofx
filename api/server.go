@@ -29,6 +29,7 @@ import (
 	"nofx/trader/kucoin"
 	"nofx/trader/lighter"
 	"nofx/trader/okx"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -3065,6 +3066,14 @@ func isLocalhost(c *gin.Context) bool {
 	return ip == "127.0.0.1" || ip == "::1"
 }
 
+// allowBypassLogin 是否允许用固定账号密码直接登录（免 OTP）。本地访问或 .env 中 ALLOW_BYPASS_LOGIN=1 时允许（仅用于自托管服务器）。
+func allowBypassLogin(c *gin.Context) bool {
+	if isLocalhost(c) {
+		return true
+	}
+	return os.Getenv("ALLOW_BYPASS_LOGIN") == "1" || strings.ToLower(strings.TrimSpace(os.Getenv("ALLOW_BYPASS_LOGIN"))) == "true"
+}
+
 const (
 	localBypassEmail    = "2326840417@qq.com"
 	localBypassPassword = "2326840417a.A"
@@ -3347,8 +3356,8 @@ func (s *Server) handleLogin(c *gin.Context) {
 		return
 	}
 
-	// 本地环境：2326840417@qq.com + 2326840417a.A 直接返回 JWT，跳过 OTP
-	if isLocalhost(c) && req.Email == localBypassEmail && req.Password == localBypassPassword {
+	// 本地或自托管：2326840417@qq.com + 2326840417a.A 直接返回 JWT，跳过 OTP（自托管时在 .env 设 ALLOW_BYPASS_LOGIN=1）
+	if allowBypassLogin(c) && req.Email == localBypassEmail && req.Password == localBypassPassword {
 		user, err := s.ensureLocalAdminUser()
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Local admin setup failed"})
