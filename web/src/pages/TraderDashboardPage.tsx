@@ -205,10 +205,8 @@ export function TraderDashboardPage({
                     : `Exported ${data.count} decisions`
             )
         } catch (e) {
-            notify.error(
-                language === 'zh' ? '导出失败' : 'Export failed',
-                (e as Error)?.message
-            )
+            const msg = (e as Error)?.message
+            notify.error(language === 'zh' ? '导出失败' : 'Export failed', msg ? { description: msg } : undefined)
         } finally {
             setExporting(false)
         }
