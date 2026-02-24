@@ -25,6 +25,19 @@ cp config.json.example config.json
 ./scripts/start.sh start --build
 ```
 
+### 自托管分支部署与更新
+
+使用 **install-custom.sh** 部署到自己的服务器（拉取自定义分支、Docker 构建）：
+
+- **更新说明（一条命令）：** [self-hosted-update.zh-CN.md](self-hosted-update.zh-CN.md)
+
+---
+
+
+## 📖 功能说明（维护者）
+
+- **ATR 移动止盈止损（分批止盈）**：规则与实现要点见 [atr-trailing.zh-CN.md](atr-trailing.zh-CN.md)。
+
 ---
 
 

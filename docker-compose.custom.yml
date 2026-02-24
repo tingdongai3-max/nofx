@@ -3,8 +3,9 @@
 #
 # 使用方式（在安装目录下）:
 #   docker compose -f docker-compose.custom.yml up -d
-# 更新:
-#   git pull && docker compose -f docker-compose.custom.yml build --no-cache && docker compose -f docker-compose.custom.yml up -d
+#
+# 更新（在安装目录 ~/nofx 下执行，一条命令）:
+#   git pull origin my-custom-version && docker compose -f docker-compose.custom.yml build --no-cache && docker compose -f docker-compose.custom.yml up -d --force-recreate
 
 services:
   nofx:

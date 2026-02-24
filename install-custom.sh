@@ -15,8 +15,11 @@
 #   NOFX_GIT_BRANCH  分支名，默认 my-custom-version
 #   NOFX_INSTALL_DIR 安装目录，默认 $HOME/nofx
 #
-# 更新（再次执行即可，幂等：先 pull 再重建并重启）:
-#   curl -fsSL https://raw.githubusercontent.com/tingdongai3-max/nofx/my-custom-version/install-custom.sh | bash
+# 更新（任选其一）:
+#   方式一（推荐，一条命令完成 pull + 重建 + 重启）:
+#     curl -fsSL https://raw.githubusercontent.com/tingdongai3-max/nofx/my-custom-version/install-custom.sh | bash
+#   方式二（已手动 git pull 过，在安装目录下只重建并重启）:
+#     cd ~/nofx && docker compose -f docker-compose.custom.yml build --no-cache && docker compose -f docker-compose.custom.yml up -d --force-recreate
 #
 
 set -e
