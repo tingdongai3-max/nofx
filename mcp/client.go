@@ -190,6 +190,12 @@ func (client *Client) CallWithMessages(systemPrompt, userPrompt string) (string,
 	return "", fmt.Errorf("still failed after %d retries: %w", maxRetries, lastErr)
 }
 
+// CallWithCacheableSystem sends systemStatic (cacheable) + systemDynamic (fresh) + userPrompt.
+// Default: concatenate system and call CallWithMessages. Claude overrides to use prompt caching.
+func (client *Client) CallWithCacheableSystem(systemStatic, systemDynamic, userPrompt string) (string, error) {
+	return client.CallWithMessages(systemStatic+systemDynamic, userPrompt)
+}
+
 func (client *Client) setAuthHeader(reqHeader http.Header) {
 	reqHeader.Set("Authorization", fmt.Sprintf("Bearer %s", client.APIKey))
 }
@@ -346,6 +352,32 @@ func (client *Client) call(systemPrompt, userPrompt string) (string, error) {
 	}
 
 	return result, nil
+}
+
+// executeRequestBody sends one request with a pre-built body (used by Claude for prompt caching).
+func (client *Client) executeRequestBody(requestBody map[string]any) (string, error) {
+	jsonData, err := client.hooks.marshalRequestBody(requestBody)
+	if err != nil {
+		return "", err
+	}
+	url := client.hooks.buildUrl()
+	req, err := client.hooks.buildRequest(url, jsonData)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	resp, err := client.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API returned error (status %d): %s", resp.StatusCode, string(body))
+	}
+	return client.hooks.parseMCPResponse(body)
 }
 
 func (client *Client) String() string {

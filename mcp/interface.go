@@ -11,6 +11,9 @@ type AIClient interface {
 	SetTimeout(timeout time.Duration)
 	CallWithMessages(systemPrompt, userPrompt string) (string, error)
 	CallWithRequest(req *Request) (string, error) // Builder pattern API (supports advanced features)
+	// CallWithCacheableSystem sends systemStatic (cacheable) + systemDynamic (fresh each time) + userPrompt.
+	// Providers that support prompt caching (e.g. Claude) may cache systemStatic; others concatenate and send as usual.
+	CallWithCacheableSystem(systemStatic, systemDynamic, userPrompt string) (string, error)
 }
 
 // clientHooks internal hook interface (for subclass to override specific steps)

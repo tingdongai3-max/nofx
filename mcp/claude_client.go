@@ -92,6 +92,47 @@ func (c *ClaudeClient) buildMCPRequestBody(systemPrompt, userPrompt string) map[
 	return requestBody
 }
 
+// buildBodyWithCache builds request body with prompt caching: system = [cacheable static block, dynamic block].
+// Only the static block is marked cache_control so dynamic (equity) and user prompt are never cached.
+func (c *ClaudeClient) buildBodyWithCache(systemStatic, systemDynamic, userPrompt string) map[string]any {
+	systemBlocks := []map[string]any{}
+	if systemStatic != "" {
+		systemBlocks = append(systemBlocks, map[string]any{
+			"type":          "text",
+			"text":          systemStatic,
+			"cache_control": map[string]string{"type": "ephemeral"},
+		})
+	}
+	if systemDynamic != "" {
+		systemBlocks = append(systemBlocks, map[string]any{
+			"type": "text",
+			"text": systemDynamic,
+		})
+	}
+	var systemVal any = systemStatic + systemDynamic
+	if len(systemBlocks) > 0 {
+		systemVal = systemBlocks
+	}
+	return map[string]any{
+		"model":      c.Model,
+		"max_tokens": c.MaxTokens,
+		"system":     systemVal,
+		"messages": []map[string]string{
+			{"role": "user", "content": userPrompt},
+		},
+	}
+}
+
+// CallWithCacheableSystem uses prompt caching: systemStatic is cached, systemDynamic and userPrompt are sent fresh.
+func (c *ClaudeClient) CallWithCacheableSystem(systemStatic, systemDynamic, userPrompt string) (string, error) {
+	if c.APIKey == "" {
+		return "", fmt.Errorf("AI API key not set, please call SetAPIKey first")
+	}
+	c.logger.Infof("📡 [Claude] Request with prompt caching (static block cached, dynamic + user fresh)")
+	body := c.buildBodyWithCache(systemStatic, systemDynamic, userPrompt)
+	return c.Client.executeRequestBody(body)
+}
+
 // parseMCPResponse Claude has different response format
 func (c *ClaudeClient) parseMCPResponse(body []byte) (string, error) {
 	var response struct {
@@ -100,8 +141,10 @@ func (c *ClaudeClient) parseMCPResponse(body []byte) (string, error) {
 			Text string `json:"text"`
 		} `json:"content"`
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens               int `json:"input_tokens"`
+			OutputTokens              int `json:"output_tokens"`
+			CacheReadInputTokens      int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens  int `json:"cache_creation_input_tokens"`
 		} `json:"usage"`
 		Error *struct {
 			Type    string `json:"type"`
@@ -121,13 +164,20 @@ func (c *ClaudeClient) parseMCPResponse(body []byte) (string, error) {
 		return "", fmt.Errorf("Claude returned empty content, body: %s", string(body))
 	}
 
-	// Report token usage if callback is set
-	totalTokens := response.Usage.InputTokens + response.Usage.OutputTokens
+	// Log prompt cache usage when present
+	if response.Usage.CacheReadInputTokens > 0 || response.Usage.CacheCreationInputTokens > 0 {
+		c.logger.Infof("📦 [Claude] Prompt cache: read=%d created=%d input_after_breakpoint=%d",
+			response.Usage.CacheReadInputTokens, response.Usage.CacheCreationInputTokens, response.Usage.InputTokens)
+	}
+
+	// Report token usage if callback is set (input_tokens here = tokens after cache breakpoint; total input = cache_read + cache_creation + input_tokens)
+	totalInput := response.Usage.InputTokens + response.Usage.CacheReadInputTokens + response.Usage.CacheCreationInputTokens
+	totalTokens := totalInput + response.Usage.OutputTokens
 	if TokenUsageCallback != nil && totalTokens > 0 {
 		TokenUsageCallback(TokenUsage{
 			Provider:         c.Provider,
 			Model:            c.Model,
-			PromptTokens:     response.Usage.InputTokens,
+			PromptTokens:     totalInput,
 			CompletionTokens: response.Usage.OutputTokens,
 			TotalTokens:      totalTokens,
 		})

@@ -33,6 +33,7 @@ type IndicatorParams struct {
 	MACDFast     int   `json:"macd_fast,omitempty"`     // 默认 12
 	MACDSlow     int   `json:"macd_slow,omitempty"`     // 默认 26
 	MACDSignal   int   `json:"macd_signal,omitempty"`    // 默认 9
+	BIASPeriods  []int `json:"bias_periods,omitempty"`  // 乖离率周期，默认 [6, 12, 24]
 }
 
 // KlineBar single kline bar with OHLCV data

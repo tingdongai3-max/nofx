@@ -230,6 +230,7 @@ func (s *Server) setupRoutes() {
 			protected.GET("/open-orders", s.handleOpenOrders)      // Open orders from exchange (pending SL/TP)
 			protected.GET("/decisions", s.handleDecisions)
 			protected.GET("/decisions/latest", s.handleLatestDecisions)
+			protected.GET("/decisions/export", s.handleDecisionsExport)
 			protected.GET("/statistics", s.handleStatistics)
 
 			// Backtest routes
@@ -2955,6 +2956,102 @@ func (s *Server) handleLatestDecisions(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, records)
+}
+
+// handleDecisionsExport exports AI decision records in machine-readable JSON (for bots/analysis).
+// Query: trader_id (required), from, to (ISO8601 or YYYY-MM-DD), or period=last_24h|last_7d|last_30d.
+// Optional: include_prompts=1 to include system_prompt and input_prompt in each record.
+func (s *Server) handleDecisionsExport(c *gin.Context) {
+	_, traderID, err := s.getTraderFromQuery(c)
+	if err != nil {
+		SafeBadRequest(c, "Invalid trader ID")
+		return
+	}
+
+	trader, err := s.traderManager.GetTrader(traderID)
+	if err != nil {
+		SafeNotFound(c, "Trader")
+		return
+	}
+
+	var fromTime, toTime time.Time
+	toTime = time.Now().UTC()
+	if period := c.Query("period"); period != "" {
+		switch period {
+		case "last_24h":
+			fromTime = toTime.Add(-24 * time.Hour)
+		case "last_7d":
+			fromTime = toTime.AddDate(0, 0, -7)
+		case "last_30d":
+			fromTime = toTime.AddDate(0, 0, -30)
+		default:
+			SafeBadRequest(c, "period must be last_24h, last_7d, or last_30d")
+			return
+		}
+	} else {
+		fromStr := c.Query("from")
+		toStr := c.Query("to")
+		if fromStr == "" || toStr == "" {
+			SafeBadRequest(c, "Either period or both from and to (ISO8601/YYYY-MM-DD) are required")
+			return
+		}
+		for _, pair := range []struct{ s *string; t *time.Time }{
+			{&fromStr, &fromTime},
+			{&toStr, &toTime},
+		} {
+			*pair.t, err = parseExportTime(*pair.s)
+			if err != nil {
+				SafeBadRequest(c, "Invalid time format: use ISO8601 or YYYY-MM-DD")
+				return
+			}
+		}
+		if fromTime.After(toTime) {
+			fromTime, toTime = toTime, fromTime
+		}
+	}
+
+	records, err := trader.GetStore().Decision().GetRecordsInRange(trader.GetID(), fromTime, toTime)
+	if err != nil {
+		SafeInternalError(c, "Export decisions", err)
+		return
+	}
+
+	includePrompts := c.Query("include_prompts") == "1" || c.Query("include_prompts") == "true"
+	exported := make([]map[string]interface{}, len(records))
+	for i, r := range records {
+		row := map[string]interface{}{
+			"cycle_number": r.CycleNumber,
+			"timestamp":    r.Timestamp.Format(time.RFC3339),
+			"success":      r.Success,
+			"decisions":    r.Decisions,
+		}
+		if includePrompts {
+			row["system_prompt"] = r.SystemPrompt
+			row["input_prompt"] = r.InputPrompt
+		}
+		exported[i] = row
+	}
+
+	out := map[string]interface{}{
+		"exporter_version": 1,
+		"trader_id":        traderID,
+		"from":             fromTime.Format(time.RFC3339),
+		"to":               toTime.Format(time.RFC3339),
+		"exported_at":      time.Now().UTC().Format(time.RFC3339),
+		"count":            len(exported),
+		"records":          exported,
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+func parseExportTime(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC(), nil
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC), nil
+	}
+	return time.Time{}, fmt.Errorf("invalid time: %s", s)
 }
 
 // handleStatistics Statistics information

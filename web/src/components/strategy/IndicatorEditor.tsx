@@ -83,6 +83,8 @@ export function IndicatorEditor({
       adxDesc: { zh: '平均趋向指数', en: 'Average Directional Index' },
       boll: { zh: 'BOLL 布林带', en: 'Bollinger Bands' },
       bollDesc: { zh: '布林带指标（上中下轨）', en: 'Upper/Middle/Lower Bands' },
+      bias: { zh: 'BIAS 乖离率', en: 'BIAS' },
+      biasDesc: { zh: '收盘价相对均线的偏离程度', en: 'Deviation of price from moving average' },
       fibonacci: { zh: '斐波那契回撤', en: 'Fibonacci' },
       fibonacciDesc: { zh: '阻力/支撑位写入 AI 文本', en: 'Resistance/support levels in AI prompt' },
       volume: { zh: '成交量', en: 'Volume' },
@@ -129,6 +131,8 @@ export function IndicatorEditor({
         zh: '例如设置 0.5，多单将在价格跌破均线 0.5% 后才触发平仓，防止假跌破插针。',
         en: 'e.g. 0.5: long closes only when price is 0.5% below the line, avoiding fake breakdowns.',
       },
+      enableATRTrailing: { zh: 'ATR 移动止盈止损', en: 'ATR trailing TP/SL' },
+      enableATRTrailingDesc: { zh: '开启后开仓不设固定止盈止损，由 AI 输出 ATR 倍数，机器狗按价格监控触发', en: 'When on, no fixed TP/SL on open; AI outputs ATR multipliers, watchdog triggers by price' },
 
       // NofxOS Data Provider
       nofxosTitle: { zh: 'NofxOS 量化数据源', en: 'NofxOS Data Provider' },
@@ -723,6 +727,7 @@ export function IndicatorEditor({
               { key: 'enable_atr', label: 'atr', desc: 'atrDesc', color: '#60a5fa', periodKey: 'atr_periods', defaultPeriods: '14' },
               { key: 'enable_adx', label: 'adx', desc: 'adxDesc', color: '#A855F7', periodKey: 'adx_periods', defaultPeriods: '14' },
               { key: 'enable_boll', label: 'boll', desc: 'bollDesc', color: '#ec4899', periodKey: 'boll_periods', defaultPeriods: '20' },
+              { key: 'enable_bias', label: 'bias', desc: 'biasDesc', color: '#14b8a6', periodKey: 'bias_periods', defaultPeriods: '6,12,24' },
               { key: 'enable_fibonacci', label: 'fibonacci', desc: 'fibonacciDesc', color: '#f59e0b' },
             ].map(({ key, label, desc, color, periodKey, defaultPeriods }) => (
               <div
@@ -826,6 +831,20 @@ export function IndicatorEditor({
           <span className="text-xs" style={{ color: '#848E9C' }}>- {t('trailingPanelDesc')}</span>
         </div>
         <div className="p-3 space-y-3">
+          <div className="flex items-center justify-between p-2.5 rounded-lg" style={{ background: config.enable_atr_trailing ? 'rgba(20, 184, 166, 0.08)' : 'transparent', border: config.enable_atr_trailing ? '1px solid rgba(20, 184, 166, 0.3)' : '1px solid #2B3139' }}>
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 rounded-full" style={{ background: '#14b8a6' }} />
+              <span className="text-xs font-medium" style={{ color: '#EAECEF' }}>{t('enableATRTrailing')}</span>
+            </div>
+            <input
+              type="checkbox"
+              checked={config.enable_atr_trailing || false}
+              onChange={(e) => !disabled && onChange({ ...config, enable_atr_trailing: e.target.checked })}
+              disabled={disabled}
+              className="w-4 h-4 rounded accent-teal-500"
+            />
+          </div>
+          <p className="text-[10px] mb-1.5" style={{ color: '#5E6673' }}>{t('enableATRTrailingDesc')}</p>
           <div className="flex items-center justify-between p-2.5 rounded-lg" style={{ background: config.enable_indicator_trailing ? 'rgba(245, 158, 11, 0.08)' : 'transparent', border: config.enable_indicator_trailing ? '1px solid rgba(245, 158, 11, 0.3)' : '1px solid #2B3139' }}>
             <div className="flex items-center gap-2">
               <div className="w-2 h-2 rounded-full" style={{ background: '#f59e0b' }} />

@@ -643,6 +643,27 @@ func calculateATR(klines []Kline, period int) float64 {
 	return atr
 }
 
+// calculateBIAS 乖离率: (当前收盘 - N日均线) / N日均线 * 100. 使用 SMA(Close, N).
+func calculateBIAS(klines []Kline, period int) float64 {
+	if len(klines) < period {
+		return 0
+	}
+	closes := make([]float64, len(klines))
+	for i, k := range klines {
+		closes[i] = k.Close
+	}
+	last := len(closes) - 1
+	sum := 0.0
+	for i := last - period + 1; i <= last; i++ {
+		sum += closes[i]
+	}
+	ma := sum / float64(period)
+	if ma == 0 {
+		return 0
+	}
+	return (closes[last] - ma) / ma * 100
+}
+
 // calculateBOLL calculates Bollinger Bands (upper, middle, lower)
 // period: typically 20, multiplier: typically 2
 func calculateBOLL(klines []Kline, period int, multiplier float64) (upper, middle, lower float64) {
@@ -669,6 +690,7 @@ func defaultIndicatorParams() *IndicatorParams {
 		ATRPeriods:  []int{14},
 		ADXPeriods:  []int{14},
 		BOLLPeriods: []int{20},
+		BIASPeriods: []int{6, 12, 24},
 		MACDFast:    12,
 		MACDSlow:    26,
 		MACDSignal:  9,
@@ -762,6 +784,12 @@ func fillDynamicIndicators(klines []Kline, opts *IndicatorParams) map[string]flo
 			out[fmt.Sprintf("boll_upper_%d", p)] = u
 			out[fmt.Sprintf("boll_middle_%d", p)] = m
 			out[fmt.Sprintf("boll_lower_%d", p)] = l
+		}
+	}
+	// BIAS 乖离率: (Close - MA(Close,N)) / MA(Close,N) * 100
+	for _, p := range opts.BIASPeriods {
+		if len(klines) >= p {
+			out[fmt.Sprintf("bias_%d", p)] = calculateBIAS(klines, p)
 		}
 	}
 	return out

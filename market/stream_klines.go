@@ -19,6 +19,22 @@ type klineSeriesKey struct {
 	Interval coinank_enum.Interval
 }
 
+// KlineUpdateEvent 表示某条 K 线序列有推送更新（数据流驱动，非轮询）
+type KlineUpdateEvent struct {
+	Symbol   string // 如 POWERUSDT
+	Exchange string // 如 binance, okx
+	Interval string // 如 5m, 15m
+}
+
+var (
+	klineUpdateCh = make(chan KlineUpdateEvent, 256) // 数据流推送时写入，供 ATR 机器狗等消费
+)
+
+// SubscribeKlineUpdates 返回 K 线更新流；交易所推送新数据时写入，避免轮询与封禁
+func SubscribeKlineUpdates() <-chan KlineUpdateEvent {
+	return klineUpdateCh
+}
+
 // klineRing is a simple in-memory ring buffer for Kline data.
 type klineRing struct {
 	mu   sync.RWMutex
@@ -149,12 +165,13 @@ func ensureKlineStream(symbol, interval, exchange string) {
 		logger.Warnf("⚠️ K-line REST pre-warm failed (%s %s %s): %v, WS will fill from live only", key.Symbol, key.Exchange, key.Interval, err)
 	}
 
-	go runKlineStream(key, ring)
+	go runKlineStream(key, ring, symbol, interval, exchange)
 }
 
 // runKlineStream maintains a dedicated CoinAnk kline WebSocket subscription for a single series,
 // with automatic reconnection and heartbeat watchdog.
-func runKlineStream(key klineSeriesKey, ring *klineRing) {
+// symbolStr, intervalStr, exchangeStr 为可读字符串，用于广播 KlineUpdateEvent（数据流驱动）。
+func runKlineStream(key klineSeriesKey, ring *klineRing, symbolStr, intervalStr, exchangeStr string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -234,7 +251,7 @@ func runKlineStream(key klineSeriesKey, ring *klineRing) {
 			}
 		}(ws.Close)
 
-		// Consume kline channel.
+		// Consume kline channel (数据流：有推送才处理，不轮询)
 		for msg := range ws.KlineCh {
 			lastMsgAt = time.Now()
 			if msg == nil || !msg.Success {
@@ -252,6 +269,12 @@ func runKlineStream(key klineSeriesKey, ring *klineRing) {
 				CloseTime: k.EndTime,
 			}
 			ring.append(kline)
+			// 广播：有 K 线更新，供 ATR 机器狗等按数据流触发（避免 5s 轮询与封禁）
+			select {
+			case klineUpdateCh <- KlineUpdateEvent{Symbol: symbolStr, Exchange: exchangeStr, Interval: intervalStr}:
+			default:
+				// 通道满时非阻塞丢弃，避免阻塞 WS 消费
+			}
 		}
 
 		<-heartbeatDone

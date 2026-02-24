@@ -135,6 +135,7 @@ type IndicatorConfig struct {
 	EnableATR         bool `json:"enable_atr"`
 	EnableADX         bool `json:"enable_adx"`         // ADX (Average Directional Index)
 	EnableBOLL        bool `json:"enable_boll"`        // Bollinger Bands
+	EnableBIAS        bool `json:"enable_bias"`        // 乖离率 BIAS
 	EnableFibonacci   bool `json:"enable_fibonacci"`    // 斐波那契回撤位写入 AI Prompt
 	EnableVolume      bool `json:"enable_volume"`
 	EnableOI          bool `json:"enable_oi"`
@@ -144,6 +145,7 @@ type IndicatorConfig struct {
 	ATRPeriods        []int `json:"atr_periods,omitempty"`
 	ADXPeriods        []int `json:"adx_periods,omitempty"` // default [14]
 	BOLLPeriods       []int `json:"boll_periods,omitempty"`
+	BIASPeriods       []int `json:"bias_periods,omitempty"` // 乖离率周期，如 [6, 12, 24]
 	// external data sources
 	ExternalDataSources []ExternalDataSource `json:"external_data_sources,omitempty"`
 
@@ -176,6 +178,9 @@ type IndicatorConfig struct {
 	TrailingIndicator       string  `json:"trailing_indicator,omitempty"`   // 平仓线指标，如 "ema_20", "ema_50", "boll_middle_20"
 	TrailingTimeframe       string  `json:"trailing_timeframe,omitempty"`   // 风控计算周期，如 "1m","5m","15m","1h","4h"，默认 "5m"
 	TrailingOffsetPercent   float64 `json:"trailing_offset_percent"`       // 触发偏移量(%)，多单跌破均线-偏移%才平仓，空单突破均线+偏移%才平仓，防插针，默认 0
+
+	// ATR 移动止盈止损：开启后开仓不设交易所固定 TP/SL，由 AI 输出 ATR 倍数，机器狗按价格流监控并触发
+	EnableATRTrailing bool `json:"enable_atr_trailing"` // 是否使用 ATR 倍数移动止盈止损（AI 输出 atr_sl_mult / atr_tp_mult / atr_tp_stages）
 }
 
 // KlineConfig K-line configuration
@@ -276,6 +281,7 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 			EnableRSI:         false,
 			EnableATR:         false,
 			EnableBOLL:        false,
+			EnableBIAS:        false,
 			EnableADX:         false,
 			EnableFibonacci:   false,
 			EnableVolume:      true,
@@ -309,6 +315,8 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 			TrailingIndicator:       "ema_20",
 			TrailingTimeframe:       "5m",
 			TrailingOffsetPercent:   0,
+			EnableATRTrailing:       false,
+			BIASPeriods:             []int{6, 12, 24},
 		},
 		RiskControl: RiskControlConfig{
 			MaxPositions:                    3,   // Max 3 coins simultaneously (CODE ENFORCED)

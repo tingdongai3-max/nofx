@@ -536,6 +536,7 @@ export interface IndicatorConfig {
   enable_atr: boolean;
   enable_adx: boolean;
   enable_boll: boolean;
+  enable_bias?: boolean;
   enable_fibonacci: boolean;
   enable_volume: boolean;
   enable_oi: boolean;
@@ -545,6 +546,7 @@ export interface IndicatorConfig {
   atr_periods?: number[];
   adx_periods?: number[];
   boll_periods?: number[];
+  bias_periods?: number[];
   external_data_sources?: ExternalDataSource[];
 
   // ========== NofxOS 数据源统一配置 ==========
@@ -576,6 +578,8 @@ export interface IndicatorConfig {
   trailing_indicator?: string;  // 平仓线指标，如 "ema_20", "ema_50", "boll_middle_20"
   trailing_timeframe?: string; // 风控计算周期，如 "1m","5m","15m","1h","4h"，默认 "5m"
   trailing_offset_percent?: number; // 触发偏移量(%)，防插针，默认 0
+  // ATR 移动止盈止损：开启后开仓不设固定 TP/SL，由 AI 输出 ATR 倍数，机器狗监控价格触发
+  enable_atr_trailing?: boolean;
 }
 
 export interface KlineConfig {

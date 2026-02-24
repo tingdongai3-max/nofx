@@ -246,6 +246,22 @@ func (s *DecisionStore) GetRecordsByDate(traderID string, date time.Time) ([]*De
 	return records, nil
 }
 
+// GetRecordsInRange gets decision records for a trader within [fromTime, toTime] (inclusive).
+func (s *DecisionStore) GetRecordsInRange(traderID string, fromTime, toTime time.Time) ([]*DecisionRecord, error) {
+	var dbRecords []*DecisionRecordDB
+	err := s.db.Where("trader_id = ? AND timestamp >= ? AND timestamp <= ?", traderID, fromTime, toTime).
+		Order("timestamp ASC").
+		Find(&dbRecords).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to query decision records: %w", err)
+	}
+	records := make([]*DecisionRecord, len(dbRecords))
+	for i, db := range dbRecords {
+		records[i] = db.toRecord()
+	}
+	return records, nil
+}
+
 // CleanOldRecords cleans old records from N days ago
 func (s *DecisionStore) CleanOldRecords(traderID string, days int) (int64, error) {
 	cutoffTime := time.Now().AddDate(0, 0, -days)

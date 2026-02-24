@@ -132,6 +132,8 @@ export function TraderDashboardPage({
     const [closingPosition, setClosingPosition] = useState<string | null>(null)
     const [selectedChartSymbol, setSelectedChartSymbol] = useState<string | undefined>(undefined)
     const [chartUpdateKey, setChartUpdateKey] = useState<number>(0)
+    const [exportPeriod, setExportPeriod] = useState<'last_24h' | 'last_7d' | 'last_30d'>('last_7d')
+    const [exporting, setExporting] = useState(false)
     const chartSectionRef = useRef<HTMLDivElement>(null)
     const [showWalletAddress, setShowWalletAddress] = useState<boolean>(false)
     const [copiedAddress, setCopiedAddress] = useState<boolean>(false)
@@ -176,6 +178,39 @@ export function TraderDashboardPage({
             setTimeout(() => setCopiedAddress(false), 2000)
         } catch (err) {
             console.error('Failed to copy address:', err)
+        }
+    }
+
+    // Export AI decisions (machine-readable JSON)
+    const handleExportDecisions = async () => {
+        if (!selectedTraderId) return
+        setExporting(true)
+        try {
+            const data = await api.getDecisionsExport(selectedTraderId, {
+                period: exportPeriod,
+                includePrompts: false,
+            })
+            const blob = new Blob([JSON.stringify(data, null, 2)], {
+                type: 'application/json',
+            })
+            const url = URL.createObjectURL(blob)
+            const a = document.createElement('a')
+            a.href = url
+            a.download = `decisions-${selectedTraderId}-${data.from.slice(0, 10)}.json`
+            a.click()
+            URL.revokeObjectURL(url)
+            notify.success(
+                language === 'zh'
+                    ? `已导出 ${data.count} 条决策`
+                    : `Exported ${data.count} decisions`
+            )
+        } catch (e) {
+            notify.error(
+                language === 'zh' ? '导出失败' : 'Export failed',
+                (e as Error)?.message
+            )
+        } finally {
+            setExporting(false)
         }
     }
 
@@ -787,6 +822,43 @@ export function TraderDashboardPage({
                                 <option value={50}>50</option>
                                 <option value={100}>100</option>
                             </select>
+                            {/* Export period + Export button */}
+                            <select
+                                value={exportPeriod}
+                                onChange={(e) =>
+                                    setExportPeriod(
+                                        e.target.value as 'last_24h' | 'last_7d' | 'last_30d'
+                                    )
+                                }
+                                className="px-3 py-1.5 rounded-lg text-sm font-medium cursor-pointer transition-all bg-black/40 text-nofx-text-muted border border-white/10 hover:border-white/20 focus:outline-none"
+                                title={language === 'zh' ? '导出时间范围' : 'Export time range'}
+                            >
+                                <option value="last_24h">
+                                    {language === 'zh' ? '最近24小时' : 'Last 24h'}
+                                </option>
+                                <option value="last_7d">
+                                    {language === 'zh' ? '最近7天' : 'Last 7 days'}
+                                </option>
+                                <option value="last_30d">
+                                    {language === 'zh' ? '最近30天' : 'Last 30 days'}
+                                </option>
+                            </select>
+                            <button
+                                type="button"
+                                onClick={handleExportDecisions}
+                                disabled={!selectedTraderId || exporting}
+                                className="px-3 py-1.5 rounded-lg text-sm font-medium transition-all bg-black/40 text-nofx-accent border border-nofx-accent/50 hover:bg-nofx-accent/10 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+                                title={language === 'zh' ? '导出 AI 决策分析（机器可读 JSON）' : 'Export AI decisions (machine-readable JSON)'}
+                            >
+                                {exporting ? (
+                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                ) : (
+                                    <>
+                                        <span className="text-base">📥</span>
+                                        {language === 'zh' ? '导出决策' : 'Export'}
+                                    </>
+                                )}
+                            </button>
                         </div>
 
                         {/* Decisions List - Scrollable */}

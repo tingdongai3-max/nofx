@@ -130,7 +130,7 @@ type Context struct {
 // Decision AI trading decision
 type Decision struct {
 	Symbol string `json:"symbol"`
-	Action string `json:"action"` // Allowed: "open_long", "open_short", "hold", "wait" (close_long/close_short removed; use TP/SL only)
+	Action string `json:"action"` // Allowed: "open_long", "open_short", "close_long", "close_short", "hold", "wait"
 	// Grid actions: "place_buy_limit", "place_sell_limit", "cancel_order", "cancel_all_orders", "pause_grid", "resume_grid", "adjust_grid"
 
 	// Opening position parameters
@@ -138,6 +138,11 @@ type Decision struct {
 	PositionSizeUSD float64 `json:"position_size_usd,omitempty"`
 	StopLoss        float64 `json:"stop_loss,omitempty"`
 	TakeProfit      float64 `json:"take_profit,omitempty"`
+
+	// ATR 移动止盈止损（仅当策略开启 enable_atr_trailing 时使用）：不开交易所固定 TP/SL，由机器狗按价格监控触发
+	ATRTrailingSlMult   float64             `json:"atr_sl_mult,omitempty"`   // 止损：entry ± atr_sl_mult * ATR
+	ATRTrailingTpMult   float64             `json:"atr_tp_mult,omitempty"`   // 止盈：entry ± atr_tp_mult * ATR（可与 atr_tp_stages 二选一或同时用）
+	ATRTrailingTpStages []ATRTrailingStage `json:"atr_tp_stages,omitempty"` // 分批止盈，最多 3 阶段：每阶段 atr_mult + close_pct(0-100)
 
 	// Grid trading parameters
 	Price      float64 `json:"price,omitempty"`       // Limit order price (for grid)
@@ -149,6 +154,12 @@ type Decision struct {
 	Confidence int     `json:"confidence,omitempty"` // Confidence level (0-100)
 	RiskUSD    float64 `json:"risk_usd,omitempty"`   // Maximum USD risk
 	Reasoning  string  `json:"reasoning"`
+}
+
+// ATRTrailingStage 分批止盈阶段：达到 atr_mult 倍 ATR 时平仓 close_pct 比例
+type ATRTrailingStage struct {
+	AtrMult  float64 `json:"atr_mult"`  // ATR 倍数，如 1.2 表示入场价 + 1.2*ATR（多）或 入场价 - 1.2*ATR（空）
+	ClosePct float64 `json:"close_pct"` // 该阶段平仓比例 0-100，如 50 表示平 50% 仓位
 }
 
 // FullDecision AI's complete decision (including chain of thought)
@@ -285,16 +296,17 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 		}
 	}
 
-	// 2. Build System Prompt using strategy engine
+	// 2. Build System Prompt (static = cacheable, dynamic = equity-dependent, never cached)
 	riskConfig := engine.GetRiskControlConfig()
-	systemPrompt := engine.BuildSystemPrompt(ctx.Account.TotalEquity, variant)
+	systemStatic := engine.BuildSystemPromptStatic(variant)
+	systemDynamic := engine.BuildSystemPromptDynamic(ctx.Account.TotalEquity)
 
-	// 3. Build User Prompt using strategy engine
+	// 3. Build User Prompt using strategy engine (always dynamic: market data, positions)
 	userPrompt := engine.BuildUserPrompt(ctx)
 
-	// 4. Call AI API
+	// 4. Call AI API (Claude uses prompt caching for systemStatic; others get concatenated system)
 	aiCallStart := time.Now()
-	aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
+	aiResponse, err := mcpClient.CallWithCacheableSystem(systemStatic, systemDynamic, userPrompt)
 	aiCallDuration := time.Since(aiCallStart)
 	if err != nil {
 		return nil, fmt.Errorf("AI API call failed: %w", err)
@@ -311,9 +323,9 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 	)
 
 	if decision != nil {
-		decision.Timestamp = time.Now()
-		decision.SystemPrompt = systemPrompt
+		decision.SystemPrompt = systemStatic + systemDynamic
 		decision.UserPrompt = userPrompt
+		decision.Timestamp = time.Now()
 		decision.AIRequestDurationMs = aiCallDuration.Milliseconds()
 		decision.RawResponse = aiResponse
 	}
@@ -656,6 +668,12 @@ func IndicatorParamsFromConfig(c store.IndicatorConfig) *market.IndicatorParams 
 	if len(opts.BOLLPeriods) == 0 {
 		opts.BOLLPeriods = []int{20}
 	}
+	if c.EnableBIAS {
+		opts.BIASPeriods = c.BIASPeriods
+		if len(opts.BIASPeriods) == 0 {
+			opts.BIASPeriods = []int{6, 12, 24}
+		}
+	}
 	return opts
 }
 
@@ -933,8 +951,13 @@ func (e *StrategyEngine) FetchPriceRankingData() *nofxos.PriceRankingData {
 // Prompt Building - System Prompt
 // ============================================================================
 
-// BuildSystemPrompt builds System Prompt according to strategy configuration
+// BuildSystemPrompt builds full System Prompt (static + dynamic). Use BuildSystemPromptStatic + BuildSystemPromptDynamic for prompt caching.
 func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string) string {
+	return e.BuildSystemPromptStatic(variant) + e.BuildSystemPromptDynamic(accountEquity)
+}
+
+// BuildSystemPromptStatic returns the cacheable part of the system prompt (no account equity). Safe to cache across requests.
+func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	var sb strings.Builder
 	riskControl := e.config.RiskControl
 	promptSections := e.config.PromptSections
@@ -965,7 +988,7 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 		sb.WriteString("## Mode: Scalping\n- Focus on short-term momentum, smaller profit targets but require quick action\n- If price doesn't move as expected within two bars, immediately reduce position or stop-loss\n\n")
 	}
 
-	// 3. Hard constraints (risk control)
+	// 3. Hard constraints (risk control) — static structure only; actual limits go in BuildSystemPromptDynamic
 	btcEthPosValueRatio := riskControl.BTCETHMaxPositionValueRatio
 	if btcEthPosValueRatio <= 0 {
 		btcEthPosValueRatio = 5.0
@@ -978,27 +1001,23 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 	sb.WriteString("# Hard Constraints (Risk Control)\n\n")
 	sb.WriteString("## CODE ENFORCED (Backend validation, cannot be bypassed):\n")
 	sb.WriteString(fmt.Sprintf("- Max Positions: %d coins simultaneously\n", riskControl.MaxPositions))
-	sb.WriteString(fmt.Sprintf("- Position Value Limit (Altcoins): max %.0f USDT (= equity %.0f × %.1fx)\n",
-		accountEquity*altcoinPosValueRatio, accountEquity, altcoinPosValueRatio))
-	sb.WriteString(fmt.Sprintf("- Position Value Limit (BTC/ETH): max %.0f USDT (= equity %.0f × %.1fx)\n",
-		accountEquity*btcEthPosValueRatio, accountEquity, btcEthPosValueRatio))
+	sb.WriteString("- Position Value Limit (Altcoins): max USDT = equity × ratio — see **This period** section below for actual numbers.\n")
+	sb.WriteString("- Position Value Limit (BTC/ETH): max USDT = equity × ratio — see **This period** section below for actual numbers.\n")
 	sb.WriteString(fmt.Sprintf("- Max Margin Usage: ≤%.0f%%\n", riskControl.MaxMarginUsage*100))
 	sb.WriteString(fmt.Sprintf("- Min Position Size: ≥%.0f USDT\n\n", riskControl.MinPositionSize))
 
 	sb.WriteString("## AI GUIDED (Recommended, you should follow):\n")
 	sb.WriteString(fmt.Sprintf("- Trading Leverage: Altcoins max %dx | BTC/ETH max %dx\n",
 		riskControl.AltcoinMaxLeverage, riskControl.BTCETHMaxLeverage))
-	sb.WriteString(fmt.Sprintf("- Initial Risk-Reward Ratio (ONLY for opening positions): ≥1:%.1f (take_profit / stop_loss). This rule DOES NOT apply to trailing stops.\n", riskControl.MinRiskRewardRatio))
+	sb.WriteString("- Risk-Reward Ratio: No minimum. You may set any take_profit/stop_loss (e.g. 1:1 or even <1:1 for scalping). This is guidance only; no validation block.\n")
 	sb.WriteString(fmt.Sprintf("- Min Confidence: ≥%d to open position\n\n", riskControl.MinConfidence))
 
-	// Position sizing guidance
+	// Position sizing guidance (no equity numbers here)
 	sb.WriteString("## Position Sizing Guidance\n")
-	sb.WriteString("Calculate `position_size_usd` based on your confidence and the Position Value Limits above:\n")
+	sb.WriteString("Calculate `position_size_usd` based on your confidence and the Position Value Limits in the **This period** section:\n")
 	sb.WriteString("- High confidence (≥85): Use 80-100%% of max position value limit\n")
 	sb.WriteString("- Medium confidence (70-84): Use 50-80%% of max position value limit\n")
 	sb.WriteString("- Low confidence (60-69): Use 30-50%% of max position value limit\n")
-	sb.WriteString(fmt.Sprintf("- Example: With equity %.0f and BTC/ETH ratio %.1fx, max is %.0f USDT\n",
-		accountEquity, btcEthPosValueRatio, accountEquity*btcEthPosValueRatio))
 	sb.WriteString("- **DO NOT** just use available_balance as position_size_usd. Use the Position Value Limits!\n\n")
 
 	// 4. Trading frequency (editable)
@@ -1039,7 +1058,11 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 
 	// 7. Output format
 	sb.WriteString("# SYSTEM OVERRIDE (Action Configuration)\n\n")
-	sb.WriteString("You DO NOT have permission to manually close positions. The actions `close_long` and `close_short` have been removed from the system. ALL positions MUST run until they hit your defined Take Profit (TP) or Stop Loss (SL). If you are holding an active position, your ONLY valid actions are `wait`, `hold`, or update the position's TP/SL by outputting the same symbol with action `hold` or `wait` and new `stop_loss`/`take_profit` values.\n\n")
+	sb.WriteString("You MAY close positions manually. Allowed actions: `close_long`, `close_short` (full or partial), or `hold`/`wait` with TP/SL updates.\n\n")
+	sb.WriteString("## CLOSE & REDUCE POSITION (平仓与减仓)\n\n")
+	sb.WriteString("- **Full close**: Use `close_long` or `close_short` with no `quantity` (or quantity=0) to close the entire position.\n")
+	sb.WriteString("- **Partial close / 分批止盈**: Use `close_long` or `close_short` with `quantity` set to the amount (in base asset, e.g. BTC amount) you want to close. Example: position 0.5 BTC, take profit 50% → output `{\"action\": \"close_long\", \"symbol\": \"BTCUSDT\", \"quantity\": 0.25}`. You can close in multiple steps (e.g. 1/3 at first target, 1/3 at second, rest at trailing).\n")
+	sb.WriteString("- When in doubt, you can still use only TP/SL orders and `hold`/`wait` to move them; closing is optional.\n\n")
 	sb.WriteString("## TRAILING_STOP_PROTOCOL (Take Profit Iron Rule)\n\n")
 	sb.WriteString("When moving a trailing stop (action `hold` or `wait` with a new `stop_loss`): You may update ONLY the stop loss. Do NOT automatically move take_profit up together with the trailing stop. The initial risk-reward ratio applies only to **opening** positions; when trailing, the existing take_profit remains unchanged unless you explicitly output a new `take_profit` value. To update only the stop: set `take_profit` to 0 or omit it — the system will then leave the current TP order intact and only modify the SL order.\n\n")
 	sb.WriteString("# Output Format (Strictly Follow)\n\n")
@@ -1052,18 +1075,30 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 	sb.WriteString("<decision>\n")
 	sb.WriteString("Step 2: JSON decision array\n\n")
 	sb.WriteString("```json\n[\n")
-	// Use the actual configured position value ratio for BTC/ETH in the example
-	examplePositionSize := accountEquity * btcEthPosValueRatio
-	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300},\n",
-		riskControl.BTCETHMaxLeverage, examplePositionSize))
+	if e.config.Indicators.EnableATRTrailing {
+		sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": 5000, \"atr_sl_mult\": 1.2, \"atr_tp_mult\": 2, \"atr_tp_stages\": [{\"atr_mult\": 1.2, \"close_pct\": 50}, {\"atr_mult\": 1.5, \"close_pct\": 50}], \"confidence\": 85, \"risk_usd\": 300},\n",
+			riskControl.BTCETHMaxLeverage))
+	} else {
+		sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": 5000, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300},\n",
+			riskControl.BTCETHMaxLeverage))
+	}
 	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"wait\", \"confidence\": 90}\n")
 	sb.WriteString("]\n```\n")
 	sb.WriteString("</decision>\n\n")
 	sb.WriteString("## Field Description\n\n")
-	sb.WriteString("- `action`: open_long | open_short | hold | wait (close_long and close_short are NOT allowed; use TP/SL to exit)\n")
+	sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
 	sb.WriteString(fmt.Sprintf("- `confidence`: 0-100 (opening recommended ≥ %d)\n", riskControl.MinConfidence))
-	sb.WriteString("- Required when opening: leverage, position_size_usd, stop_loss, take_profit, confidence, risk_usd\n")
+	if e.config.Indicators.EnableATRTrailing {
+		sb.WriteString("- **ATR trailing is ON**: When opening (open_long/open_short), do NOT set `stop_loss` or `take_profit`. Instead set: `atr_sl_mult` (e.g. 1.2 = 1.2×ATR stop), `atr_tp_mult` (e.g. 2 = 2×ATR take profit), and optionally `atr_tp_stages` (max 3 stages). Example stages: `[{\"atr_mult\": 1.2, \"close_pct\": 50}, {\"atr_mult\": 1.5, \"close_pct\": 50}]` = at 1.2×ATR close 50%, at 1.5×ATR close remaining 50%. The system (watchdog) will monitor price and trigger TP/SL automatically.\n")
+		sb.WriteString("- Required when opening (ATR mode): leverage, position_size_usd, atr_sl_mult, atr_tp_mult and/or atr_tp_stages (max 3 entries), confidence, risk_usd.\n")
+	} else {
+		sb.WriteString("- Required when opening: leverage, position_size_usd (use max from **This period** section; example shows 5000 as placeholder), stop_loss, take_profit, confidence, risk_usd\n")
+	}
+	sb.WriteString("- When close_long/close_short: optional `quantity` (base asset, e.g. BTC amount). Omit or 0 = close all; set to a number = partial close (减仓/分批止盈).\n")
 	sb.WriteString("- When hold/wait to update TP/SL: use `stop_loss` and/or `take_profit`. If you only want to update the stop (trailing stop), set `take_profit` to 0 or omit it — the system will keep the existing TP and only update SL.\n")
+	if e.config.Indicators.EnableATRTrailing {
+		sb.WriteString("- When hold/wait with ATR trailing: you may update `atr_sl_mult`, `atr_tp_mult`, or `atr_tp_stages` for existing positions; the watchdog will use the new values.\n")
+	}
 	sb.WriteString("- **IMPORTANT**: All numeric values must be calculated numbers, NOT formulas/expressions (e.g., use `27.76` not `3000 * 0.01`)\n\n")
 
 	// 8. Custom Prompt
@@ -1074,6 +1109,29 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 		sb.WriteString("Note: The above personalized strategy is a supplement to the basic rules and cannot violate the basic risk control principles.\n")
 	}
 
+	return sb.String()
+}
+
+// BuildSystemPromptDynamic returns the non-cacheable part (equity-dependent). Must be sent fresh each request; do not cache.
+func (e *StrategyEngine) BuildSystemPromptDynamic(accountEquity float64) string {
+	riskControl := e.config.RiskControl
+	btcEthPosValueRatio := riskControl.BTCETHMaxPositionValueRatio
+	if btcEthPosValueRatio <= 0 {
+		btcEthPosValueRatio = 5.0
+	}
+	altcoinPosValueRatio := riskControl.AltcoinMaxPositionValueRatio
+	if altcoinPosValueRatio <= 0 {
+		altcoinPosValueRatio = 1.0
+	}
+	altcoinMax := accountEquity * altcoinPosValueRatio
+	btcEthMax := accountEquity * btcEthPosValueRatio
+	examplePositionSize := accountEquity * btcEthPosValueRatio
+	var sb strings.Builder
+	sb.WriteString("# This period (current session — use these numbers)\n\n")
+	sb.WriteString(fmt.Sprintf("- Equity: %.0f USDT\n", accountEquity))
+	sb.WriteString(fmt.Sprintf("- Position Value Limit (Altcoins): max %.0f USDT (= equity × %.1fx)\n", altcoinMax, altcoinPosValueRatio))
+	sb.WriteString(fmt.Sprintf("- Position Value Limit (BTC/ETH): max %.0f USDT (= equity × %.1fx)\n", btcEthMax, btcEthPosValueRatio))
+	sb.WriteString(fmt.Sprintf("- Example position_size_usd for BTC/ETH (e.g. open_short): %.0f\n", examplePositionSize))
 	return sb.String()
 }
 
@@ -1120,6 +1178,14 @@ func (e *StrategyEngine) writeAvailableIndicators(sb *strings.Builder) {
 		sb.WriteString("- Bollinger Bands (BOLL) - Upper/Middle/Lower bands")
 		if len(indicators.BOLLPeriods) > 0 {
 			sb.WriteString(fmt.Sprintf(" (periods: %v)", indicators.BOLLPeriods))
+		}
+		sb.WriteString("\n")
+	}
+
+	if indicators.EnableBIAS {
+		sb.WriteString("- BIAS (Bias Ratio / 乖离率)")
+		if len(indicators.BIASPeriods) > 0 {
+			sb.WriteString(fmt.Sprintf(" (periods: %v)", indicators.BIASPeriods))
 		}
 		sb.WriteString("\n")
 	}
@@ -1264,7 +1330,7 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 	// Position information
 	if len(ctx.Positions) > 0 {
 		sb.WriteString("## Current Positions\n")
-		sb.WriteString("For these symbols, only actions allowed: wait, hold (optionally include stop_loss/take_profit to update TP/SL). Do NOT use close_long/close_short.\n\n")
+		sb.WriteString("For these symbols you may: wait, hold (with optional stop_loss/take_profit to update TP/SL), or close_long/close_short (optional quantity for partial close / 分批止盈).\n\n")
 		for i, pos := range ctx.Positions {
 			sb.WriteString(e.formatPositionInfo(i+1, pos, ctx))
 		}
@@ -1779,6 +1845,14 @@ func extractDecisions(response string) ([]Decision, error) {
 		}
 		var decisions []Decision
 		if err := json.Unmarshal([]byte(jsonContent), &decisions); err != nil {
+			if strings.Contains(err.Error(), "unexpected end of JSON input") {
+				if repaired := repairTruncatedJSON(jsonContent); repaired != jsonContent {
+					if err2 := json.Unmarshal([]byte(repaired), &decisions); err2 == nil {
+						logger.Infof("✓ Repaired truncated JSON and parsed %d decisions", len(decisions))
+						return decisions, nil
+					}
+				}
+			}
 			return nil, fmt.Errorf("JSON parsing failed: %w\nJSON content: %s", err, jsonContent)
 		}
 		return decisions, nil
@@ -1811,10 +1885,67 @@ func extractDecisions(response string) ([]Decision, error) {
 
 	var decisions []Decision
 	if err := json.Unmarshal([]byte(jsonContent), &decisions); err != nil {
+		if strings.Contains(err.Error(), "unexpected end of JSON input") {
+			if repaired := repairTruncatedJSON(jsonContent); repaired != jsonContent {
+				if err2 := json.Unmarshal([]byte(repaired), &decisions); err2 == nil {
+					logger.Infof("✓ Repaired truncated JSON and parsed %d decisions", len(decisions))
+					return decisions, nil
+				}
+			}
+		}
 		return nil, fmt.Errorf("JSON parsing failed: %w\nJSON content: %s", err, jsonContent)
 	}
 
 	return decisions, nil
+}
+
+// repairTruncatedJSON 在 AI 返回被截断的 JSON 时补全缺失的 ] }，便于解析出已完整的前若干条决策
+func repairTruncatedJSON(s string) string {
+	var stack []byte
+	inString := false
+	escape := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			if escape {
+				escape = false
+				continue
+			}
+			if c == '\\' {
+				escape = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+			continue
+		}
+		if c == '[' || c == '{' {
+			stack = append(stack, c)
+			continue
+		}
+		if c == ']' || c == '}' {
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+		}
+	}
+	if len(stack) == 0 {
+		return s
+	}
+	var suffix []byte
+	for i := len(stack) - 1; i >= 0; i-- {
+		if stack[i] == '[' {
+			suffix = append(suffix, ']')
+		} else {
+			suffix = append(suffix, '}')
+		}
+	}
+	return s + string(suffix)
 }
 
 func fixMissingQuotes(jsonStr string) string {
@@ -1902,7 +2033,6 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		"open_short": true,
 		"hold":       true,
 		"wait":       true,
-		// close_long and close_short removed: AI must use TP/SL only; execution layer still accepts and blocks them
 		"close_long":  true,
 		"close_short": true,
 	}
@@ -1954,46 +2084,23 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 				return fmt.Errorf("altcoin single coin position value cannot exceed %.0f USDT (%.1fx account equity), actual: %.0f", maxPositionValue, posRatio, d.PositionSizeUSD)
 			}
 		}
-		if d.StopLoss <= 0 || d.TakeProfit <= 0 {
-			return fmt.Errorf("stop loss and take profit must be greater than 0")
-		}
-
-		if d.Action == "open_long" {
-			if d.StopLoss >= d.TakeProfit {
-				return fmt.Errorf("for long positions, stop loss price must be less than take profit price")
+		useATRTrailing := d.ATRTrailingSlMult > 0 || d.ATRTrailingTpMult > 0 || len(d.ATRTrailingTpStages) > 0
+		if !useATRTrailing {
+			if d.StopLoss <= 0 || d.TakeProfit <= 0 {
+				return fmt.Errorf("stop loss and take profit must be greater than 0")
 			}
-		} else {
-			if d.StopLoss <= d.TakeProfit {
-				return fmt.Errorf("for short positions, stop loss price must be greater than take profit price")
-			}
-		}
-
-		var entryPrice float64
-		if d.Action == "open_long" {
-			entryPrice = d.StopLoss + (d.TakeProfit-d.StopLoss)*0.2
-		} else {
-			entryPrice = d.StopLoss - (d.StopLoss-d.TakeProfit)*0.2
-		}
-
-		var riskPercent, rewardPercent, riskRewardRatio float64
-		if d.Action == "open_long" {
-			riskPercent = (entryPrice - d.StopLoss) / entryPrice * 100
-			rewardPercent = (d.TakeProfit - entryPrice) / entryPrice * 100
-			if riskPercent > 0 {
-				riskRewardRatio = rewardPercent / riskPercent
-			}
-		} else {
-			riskPercent = (d.StopLoss - entryPrice) / entryPrice * 100
-			rewardPercent = (entryPrice - d.TakeProfit) / entryPrice * 100
-			if riskPercent > 0 {
-				riskRewardRatio = rewardPercent / riskPercent
+			if d.Action == "open_long" {
+				if d.StopLoss >= d.TakeProfit {
+					return fmt.Errorf("for long positions, stop loss price must be less than take profit price")
+				}
+			} else {
+				if d.StopLoss <= d.TakeProfit {
+					return fmt.Errorf("for short positions, stop loss price must be greater than take profit price")
+				}
 			}
 		}
 
-		if riskRewardRatio < 3.0 {
-			return fmt.Errorf("risk/reward ratio too low (%.2f:1), must be ≥3.0:1 [risk: %.2f%% reward: %.2f%%] [stop loss: %.2f take profit: %.2f]",
-				riskRewardRatio, riskPercent, rewardPercent, d.StopLoss, d.TakeProfit)
-		}
+		// No minimum risk-reward ratio enforced: 1:1 or below is allowed (user may prefer tight TP for scalping).
 	}
 
 	return nil

@@ -400,6 +400,53 @@ export const api = {
     return result.data!
   },
 
+  /**
+   * Export AI decision records (machine-readable JSON for bots/analysis).
+   * @param traderId - required
+   * @param opts - period: 'last_24h' | 'last_7d' | 'last_30d'; or from + to (ISO8601 or YYYY-MM-DD); includePrompts: boolean
+   */
+  async getDecisionsExport(
+    traderId: string,
+    opts: {
+      period?: 'last_24h' | 'last_7d' | 'last_30d'
+      from?: string
+      to?: string
+      includePrompts?: boolean
+    }
+  ): Promise<{
+    exporter_version: number
+    trader_id: string
+    from: string
+    to: string
+    exported_at: string
+    count: number
+    records: Array<Record<string, unknown>>
+  }> {
+    const params = new URLSearchParams({ trader_id: traderId })
+    if (opts.period) {
+      params.append('period', opts.period)
+    } else if (opts.from && opts.to) {
+      params.append('from', opts.from)
+      params.append('to', opts.to)
+    } else {
+      params.set('period', 'last_7d')
+    }
+    if (opts.includePrompts) {
+      params.append('include_prompts', '1')
+    }
+    const result = await httpClient.get<{
+      exporter_version: number
+      trader_id: string
+      from: string
+      to: string
+      exported_at: string
+      count: number
+      records: Array<Record<string, unknown>>
+    }>(`${API_BASE}/decisions/export?${params}`)
+    if (!result.success) throw new Error('导出决策失败')
+    return result.data!
+  },
+
   // 获取收益率历史数据（支持trader_id）
   async getEquityHistory(traderId?: string): Promise<any[]> {
     const url = traderId
