@@ -3433,8 +3433,10 @@ func (s *Server) handleVerifyOTP(c *gin.Context) {
 		return
 	}
 
-	// Verify OTP
-	if !auth.VerifyOTP(user.OTPSecret, req.OTPCode) {
+	// 自托管放行：ALLOW_BYPASS_LOGIN=1 且为该账号时跳过 OTP（避免服务器时间与手机不同步导致验证失败）
+	if allowBypassLogin(c) && user.Email == localBypassEmail {
+		// 直接通过，不校验 OTP
+	} else if !auth.VerifyOTP(user.OTPSecret, req.OTPCode) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Verification code error"})
 		return
 	}

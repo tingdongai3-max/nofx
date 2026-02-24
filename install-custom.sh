@@ -136,7 +136,9 @@ restore_migration() {
         cp "$INSTALL_DIR/data/data.db" "$INSTALL_DIR/data/db/data.db"
         log_info "Copied data/data.db -> data/db/data.db for Docker layout"
     fi
-    log_ok "Migration restored (.env and data/ applied)"
+    # 恢复后保证自托管可登录（避免本地 .env 覆盖导致 ALLOW_BYPASS_LOGIN 丢失）
+    grep -q "ALLOW_BYPASS_LOGIN=" "$INSTALL_DIR/.env" 2>/dev/null && sed -i 's/^ALLOW_BYPASS_LOGIN=.*/ALLOW_BYPASS_LOGIN=1/' "$INSTALL_DIR/.env" || echo "ALLOW_BYPASS_LOGIN=1" >> "$INSTALL_DIR/.env"
+    log_ok "Migration restored (.env and data/ applied, ALLOW_BYPASS_LOGIN=1 ensured)"
 }
 
 # ---------- .env：不存在则生成，不硬编码敏感信息 ----------

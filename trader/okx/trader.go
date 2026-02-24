@@ -1104,11 +1104,13 @@ func (t *OKXTrader) CancelTakeProfitOrders(symbol string) error {
 	return t.cancelAlgoOrders(symbol, "tp")
 }
 
-// cancelAlgoOrders cancels algo orders
+// cancelAlgoOrders cancels algo orders. orderType: "sl" = only stop-loss, "tp" = only take-profit, "" = all conditional.
+// OKX API returns each conditional order with either slTriggerPx or tpTriggerPx set; we must filter so that
+// moving TP does not cancel SL and vice versa (see OKX docs: Get order algo list returns slTriggerPx/tpTriggerPx).
 func (t *OKXTrader) cancelAlgoOrders(symbol string, orderType string) error {
 	instId := t.convertSymbol(symbol)
 
-	// Get pending algo orders
+	// Get pending algo orders (response includes slTriggerPx / tpTriggerPx to distinguish SL vs TP)
 	path := fmt.Sprintf("%s?instType=SWAP&instId=%s&ordType=conditional", okxAlgoPendingPath, instId)
 	data, err := t.doRequest("GET", path, nil)
 	if err != nil {
@@ -1116,8 +1118,10 @@ func (t *OKXTrader) cancelAlgoOrders(symbol string, orderType string) error {
 	}
 
 	var orders []struct {
-		AlgoId string `json:"algoId"`
-		InstId string `json:"instId"`
+		AlgoId      string `json:"algoId"`
+		InstId      string `json:"instId"`
+		SlTriggerPx string `json:"slTriggerPx"`
+		TpTriggerPx string `json:"tpTriggerPx"`
 	}
 
 	if err := json.Unmarshal(data, &orders); err != nil {
@@ -1126,6 +1130,21 @@ func (t *OKXTrader) cancelAlgoOrders(symbol string, orderType string) error {
 
 	canceledCount := 0
 	for _, order := range orders {
+		// Filter by type: only cancel orders matching orderType (OKX uses empty string when not set)
+		isSL := strings.TrimSpace(order.SlTriggerPx) != ""
+		isTP := strings.TrimSpace(order.TpTriggerPx) != ""
+		switch orderType {
+		case "sl":
+			if !isSL {
+				continue
+			}
+		case "tp":
+			if !isTP {
+				continue
+			}
+		}
+		// orderType == "" means cancel all (e.g. CancelAllOrders / CancelStopOrders)
+
 		body := []map[string]interface{}{
 			{
 				"algoId": order.AlgoId,
