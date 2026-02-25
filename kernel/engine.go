@@ -138,6 +138,7 @@ type Decision struct {
 	PositionSizeUSD float64 `json:"position_size_usd,omitempty"`
 	StopLoss        float64 `json:"stop_loss,omitempty"`
 	TakeProfit      float64 `json:"take_profit,omitempty"`
+	TakeProfitStages []TakeProfitStage `json:"take_profit_stages,omitempty"`
 
 	// ATR 移动止盈止损（仅当策略开启 enable_atr_trailing 时使用）：不开交易所固定 TP/SL，由机器狗按价格监控触发
 	ATRTrailingSlMult   float64             `json:"atr_sl_mult,omitempty"`   // 止损：entry ± atr_sl_mult * ATR
@@ -156,7 +157,13 @@ type Decision struct {
 	Reasoning  string  `json:"reasoning"`
 }
 
-// ATRTrailingStage 分批止盈阶段：达到 atr_mult 倍 ATR 时平仓 close_pct 比例
+// TakeProfitStage 静态分批止盈阶段：到达指定 price 时平掉 close_pct 比例的仓位（使用交易所分批 TP 功能）
+type TakeProfitStage struct {
+	Price    float64 `json:"price"`     // 目标止盈价
+	ClosePct float64 `json:"close_pct"` // 该阶段平仓比例 0-100，如 30 表示平 30% 仓位
+}
+
+// ATRTrailingStage 分批止盈阶段：达到 atr_mult 倍 ATR 时平仓 close_pct 比例（由 ATR 狗监控价格触发）
 type ATRTrailingStage struct {
 	AtrMult  float64 `json:"atr_mult"`  // ATR 倍数，如 1.2 表示入场价 + 1.2*ATR（多）或 入场价 - 1.2*ATR（空）
 	ClosePct float64 `json:"close_pct"` // 该阶段平仓比例 0-100，如 50 表示平 50% 仓位
@@ -1106,6 +1113,13 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	} else {
 		sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": 5000, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300},\n",
 			riskControl.BTCETHMaxLeverage))
+		sb.WriteString("  // 或使用多档静态分批止盈（不开 ATR），例如:\n")
+		sb.WriteString("  // {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": 10, \"position_size_usd\": 5000, \"stop_loss\": 97000,\n")
+		sb.WriteString("  //   \"take_profit_stages\": [\n")
+		sb.WriteString("  //     {\"price\": 91000, \"close_pct\": 30},\n")
+		sb.WriteString("  //     {\"price\": 90000, \"close_pct\": 30},\n")
+		sb.WriteString("  //     {\"price\": 89000, \"close_pct\": 40}\n")
+		sb.WriteString("  //   ], \"confidence\": 85, \"risk_usd\": 300},\n")
 	}
 	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"wait\", \"confidence\": 90}\n")
 	sb.WriteString("]\n```\n")
@@ -1114,15 +1128,16 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
 	sb.WriteString(fmt.Sprintf("- `confidence`: 0-100 (opening recommended ≥ %d)\n", riskControl.MinConfidence))
 	if e.config.Indicators.EnableATRTrailing {
-		sb.WriteString("- **ATR trailing is ON**: When opening (open_long/open_short), do NOT set `stop_loss` or `take_profit`. Instead set: `atr_sl_mult` (e.g. 1.2 = 1.2×ATR stop), `atr_tp_mult` (e.g. 2 = 2×ATR take profit), and optionally `atr_tp_stages` (max 3 stages). Example stages: `[{\"atr_mult\": 1.2, \"close_pct\": 50}, {\"atr_mult\": 1.5, \"close_pct\": 50}]` = at 1.2×ATR close 50%, at 1.5×ATR close remaining 50%. The system (watchdog) will monitor price and trigger TP/SL automatically.\n")
-		sb.WriteString("- Required when opening (ATR mode): leverage, position_size_usd, atr_sl_mult, atr_tp_mult and/or atr_tp_stages (max 3 entries), confidence, risk_usd.\n")
+		sb.WriteString("- **ATR trailing is ON**: Set `atr_sl_mult`, `atr_tp_mult`, and/or `atr_tp_stages` (max 3) for the watchdog to monitor and trigger. You may **also** set `stop_loss` and/or `take_profit`/`take_profit_stages` to place **exchange fixed orders** (e.g. hard stop or backup TP); ATR and exchange orders are **not mutually exclusive**.\n")
+		sb.WriteString("- Required when opening (ATR mode): leverage, position_size_usd, atr_sl_mult, atr_tp_mult and/or atr_tp_stages (max 3 entries), confidence, risk_usd. Optional: stop_loss, take_profit, or take_profit_stages for exchange orders.\n")
 	} else {
-		sb.WriteString("- Required when opening: leverage, position_size_usd (use max from **This period** section; example shows 5000 as placeholder), stop_loss, take_profit, confidence, risk_usd\n")
+		sb.WriteString("- Required when opening: leverage, position_size_usd (use max from **This period** section; example shows 5000 as placeholder), stop_loss, **either** take_profit **or** take_profit_stages, confidence, risk_usd\n")
+		sb.WriteString("- Static multi-stage TP (分批挂单止盈，非 ATR): use `take_profit_stages` = [{\"price\": x, \"close_pct\": y}, ...], prices strictly increasing for long positions and strictly decreasing for short positions; total close_pct ≤ 100 (percent of current position size).\n")
 	}
 	sb.WriteString("- When close_long/close_short: optional `quantity` (base asset, e.g. BTC amount). Omit or 0 = close all; set to a number = partial close (减仓/分批止盈).\n")
-	sb.WriteString("- When hold/wait to update TP/SL: use `stop_loss` and/or `take_profit`. If you only want to update the stop (trailing stop), set `take_profit` to 0 or omit it — the system will keep the existing TP and only update SL.\n")
+	sb.WriteString("- When hold/wait to update TP/SL: use `stop_loss` and/or `take_profit` / `take_profit_stages`. If you only want to update the stop (trailing stop), set `take_profit` and `take_profit_stages` to 0/empty or omit them — the system will keep the existing TP orders and only update SL.\n")
 	if e.config.Indicators.EnableATRTrailing {
-		sb.WriteString("- When hold/wait with ATR trailing: you may update `atr_sl_mult`, `atr_tp_mult`, or `atr_tp_stages` for existing positions; the watchdog will use the new values.\n")
+		sb.WriteString("- When hold/wait with ATR trailing: you may update `atr_sl_mult`, `atr_tp_mult`, or `atr_tp_stages`; you may also set `stop_loss`/`take_profit`/`take_profit_stages` to update exchange fixed orders (both can coexist).\n")
 	}
 	sb.WriteString("- **IMPORTANT**: All numeric values must be calculated numbers, NOT formulas/expressions (e.g., use `27.76` not `3000 * 0.01`)\n\n")
 
@@ -2111,16 +2126,61 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		}
 		useATRTrailing := d.ATRTrailingSlMult > 0 || d.ATRTrailingTpMult > 0 || len(d.ATRTrailingTpStages) > 0
 		if !useATRTrailing {
-			if d.StopLoss <= 0 || d.TakeProfit <= 0 {
-				return fmt.Errorf("stop loss and take profit must be greater than 0")
+			// 静态 TP/SL 模式：必须至少提供一个止损 +（单一 TP 或分批 TP）
+			if d.StopLoss <= 0 {
+				return fmt.Errorf("stop loss must be greater than 0")
 			}
-			if d.Action == "open_long" {
-				if d.StopLoss >= d.TakeProfit {
-					return fmt.Errorf("for long positions, stop loss price must be less than take profit price")
+
+			hasSingleTP := d.TakeProfit > 0
+			hasStages := len(d.TakeProfitStages) > 0
+			if !hasSingleTP && !hasStages {
+				return fmt.Errorf("either take_profit or take_profit_stages must be provided when ATR trailing is disabled")
+			}
+			if hasSingleTP && hasStages {
+				return fmt.Errorf("use either take_profit or take_profit_stages, not both")
+			}
+
+			if hasSingleTP {
+				if d.Action == "open_long" {
+					if d.StopLoss >= d.TakeProfit {
+						return fmt.Errorf("for long positions, stop loss price must be less than take profit price")
+					}
+				} else {
+					if d.StopLoss <= d.TakeProfit {
+						return fmt.Errorf("for short positions, stop loss price must be greater than take profit price")
+					}
 				}
-			} else {
-				if d.StopLoss <= d.TakeProfit {
-					return fmt.Errorf("for short positions, stop loss price must be greater than take profit price")
+			}
+
+			if hasStages {
+				var sumPct float64
+				var prevPrice float64
+				for idx, st := range d.TakeProfitStages {
+					if st.Price <= 0 {
+						return fmt.Errorf("take_profit_stages[%d].price must be > 0", idx)
+					}
+					if st.ClosePct <= 0 || st.ClosePct > 100 {
+						return fmt.Errorf("take_profit_stages[%d].close_pct must be in (0,100]", idx)
+					}
+					sumPct += st.ClosePct
+
+					if idx == 0 {
+						prevPrice = st.Price
+						continue
+					}
+					if d.Action == "open_long" {
+						if st.Price <= prevPrice {
+							return fmt.Errorf("for long positions, take_profit_stages prices must be strictly increasing")
+						}
+					} else { // open_short
+						if st.Price >= prevPrice {
+							return fmt.Errorf("for short positions, take_profit_stages prices must be strictly decreasing")
+						}
+					}
+					prevPrice = st.Price
+				}
+				if sumPct > 100.01 {
+					return fmt.Errorf("sum of take_profit_stages.close_pct must be ≤ 100, got %.2f", sumPct)
 				}
 			}
 		}

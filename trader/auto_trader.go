@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"nofx/experience"
 	"nofx/kernel"
 	"nofx/logger"
@@ -1123,8 +1124,8 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *kernel.Decision, actio
 	case "close_short":
 		return at.executeCloseShortWithRecord(decision, actionRecord)
 	case "hold", "wait":
-		// 动态止盈止损：若已有持仓且 AI 给出新 TP/SL 或 ATR 倍数，先撤旧单再挂新单（或仅更新 ATR 状态）
-		hasTpSl := decision.TakeProfit > 0 || decision.StopLoss > 0
+		// 动态止盈止损：若已有持仓且 AI 给出新 TP/SL / take_profit_stages 或 ATR 倍数，先撤旧单再挂新单（或仅更新 ATR 状态）
+		hasTpSl := decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0 || decision.StopLoss > 0
 		hasATR := at.config.StrategyConfig != nil && at.config.StrategyConfig.Indicators.EnableATRTrailing &&
 			(decision.ATRTrailingSlMult > 0 || decision.ATRTrailingTpMult > 0 || len(decision.ATRTrailingTpStages) > 0)
 		if (hasTpSl || hasATR) && at.updateTpSlForExistingPosition(decision) {
@@ -1244,24 +1245,17 @@ func (at *AutoTrader) updateTpSlForExistingPosition(decision *kernel.Decision) b
 			logger.Infof("  ✓ [updateTpSl] ATR trailing state created %s %s entry=%.4f origQty=%.4f", decision.Symbol, posSide, entryPrice, quantity)
 		}
 		at.atrTrailingMu.Unlock()
-		return true
+		// 不 return：若 AI 同时给出固定 stop_loss / take_profit / take_profit_stages，下面一并挂到交易所
 	}
 
 	sideUpper := strings.ToUpper(posSide)
-	updateTP := decision.TakeProfit > 0
+	updateTP := decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0
 	updateSL := decision.StopLoss > 0
-	logger.Infof("  📍 [updateTpSl] %s 已有 %s 持仓 qty=%.4f，updateTP=%v updateSL=%v (TP=%.4f SL=%.4f)",
-		decision.Symbol, posSide, quantity, updateTP, updateSL, decision.TakeProfit, decision.StopLoss)
-	// Only cancel and set TP when AI provided a new take_profit; otherwise keep existing TP (trailing stop = SL only).
+	logger.Infof("  📍 [updateTpSl] %s 已有 %s 持仓 qty=%.4f，updateTP=%v updateSL=%v (TP=%.4f, stages=%d, SL=%.4f)",
+		decision.Symbol, posSide, quantity, updateTP, updateSL, decision.TakeProfit, len(decision.TakeProfitStages), decision.StopLoss)
+	// Only cancel and set TP when AI provided a new take_profit / take_profit_stages; otherwise keep existing TP (trailing stop = SL only).
 	if updateTP {
-		if err := at.trader.CancelTakeProfitOrders(decision.Symbol); err != nil {
-			logger.Infof("  ⚠️ [updateTpSl] cancel take profit orders: %v", err)
-		}
-		if err := at.trader.SetTakeProfit(decision.Symbol, sideUpper, quantity, decision.TakeProfit); err != nil {
-			logger.Infof("  ⚠️ [updateTpSl] set take profit: %v", err)
-		} else {
-			logger.Infof("  ✓ [updateTpSl] take profit set: %.4f", decision.TakeProfit)
-		}
+		at.applyStaticTakeProfit(decision.Symbol, sideUpper, quantity, decision)
 	} else {
 		logger.Infof("  ✓ [updateTpSl] take_profit not set (≤0 or omitted), keeping existing TP order")
 	}
@@ -1277,6 +1271,113 @@ func (at *AutoTrader) updateTpSlForExistingPosition(decision *kernel.Decision) b
 		}
 	}
 	return true
+}
+
+// applyStaticTakeProfit 使用交易所原生 TP 功能挂静态分批止盈：
+// - 若 decision.TakeProfitStages 非空，则根据各档 close_pct 按当前持仓数量拆分多笔 TP 单；
+// - 否则退回到单一 take_profit。
+// 注意：这里的 close_pct 是针对“当前剩余仓位”的百分比，而不是开仓时的原始仓位。
+func (at *AutoTrader) applyStaticTakeProfit(symbol, posSideUpper string, quantity float64, decision *kernel.Decision) {
+	stages := at.normalizeStaticTakeProfitStages(decision.TakeProfitStages, posSideUpper)
+
+	// 先撤掉原有 TP 单，避免旧档位残留
+	if err := at.trader.CancelTakeProfitOrders(symbol); err != nil {
+		logger.Infof("  ⚠️ [applyStaticTakeProfit] cancel take profit orders: %v", err)
+	}
+
+	// 若没有分档配置，则退回到单一 take_profit
+	if len(stages) == 0 {
+		if decision.TakeProfit <= 0 {
+			logger.Infof("  ⚠️ [applyStaticTakeProfit] no valid take_profit_stages and take_profit ≤ 0, skip setting TP")
+			return
+		}
+		if err := at.trader.SetTakeProfit(symbol, posSideUpper, quantity, decision.TakeProfit); err != nil {
+			logger.Infof("  ⚠️ [applyStaticTakeProfit] set single take profit: %v", err)
+		} else {
+			logger.Infof("  ✓ [applyStaticTakeProfit] single take profit set: price=%.4f qty=%.4f", decision.TakeProfit, quantity)
+		}
+		return
+	}
+
+	remaining := quantity
+	var assigned float64
+	for idx, st := range stages {
+		if remaining <= 0 {
+			break
+		}
+		stageQty := quantity * (st.ClosePct / 100.0)
+		// 最后一档用“剩余全部”兜底，避免浮点误差导致总和 < 100%
+		if idx == len(stages)-1 {
+			stageQty = quantity - assigned
+		}
+		if stageQty <= 0 {
+			continue
+		}
+		if stageQty > remaining {
+			stageQty = remaining
+		}
+
+		if err := at.trader.SetTakeProfit(symbol, posSideUpper, stageQty, st.Price); err != nil {
+			logger.Infof("  ⚠️ [applyStaticTakeProfit] set TP stage %d failed: price=%.4f qty=%.4f (%.2f%% of %.4f): %v",
+				idx+1, st.Price, stageQty, st.ClosePct, quantity, err)
+		} else {
+			logger.Infof("  ✓ [applyStaticTakeProfit] TP stage %d set: price=%.4f qty=%.4f (%.2f%% of %.4f)",
+				idx+1, st.Price, stageQty, st.ClosePct, quantity)
+		}
+
+		assigned += stageQty
+		remaining -= stageQty
+	}
+}
+
+// normalizeStaticTakeProfitStages 过滤非法 close_pct/price，并根据多空方向做价格排序；最多保留 5 档，避免过多 TP 订单。
+func (at *AutoTrader) normalizeStaticTakeProfitStages(stages []kernel.TakeProfitStage, posSideUpper string) []kernel.TakeProfitStage {
+	if len(stages) == 0 {
+		return nil
+	}
+
+	// 过滤非法值
+	filtered := make([]kernel.TakeProfitStage, 0, len(stages))
+	for _, st := range stages {
+		if st.Price <= 0 {
+			continue
+		}
+		if st.ClosePct <= 0 {
+			continue
+		}
+		filtered = append(filtered, st)
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+
+	// 排序：多头按 price 升序，空头按 price 降序
+	isLong := strings.ToUpper(posSideUpper) == "LONG"
+	sort.Slice(filtered, func(i, j int) bool {
+		if isLong {
+			return filtered[i].Price < filtered[j].Price
+		}
+		return filtered[i].Price > filtered[j].Price
+	})
+
+	// 限制最多 5 档，避免一次挂太多单
+	if len(filtered) > 5 {
+		filtered = filtered[:5]
+	}
+
+	// 防止 close_pct 总和明显 > 100，在这里做一次缩放（验证层已经做过 ≤100 的硬校验，这里仅应对浮点误差）
+	var sumPct float64
+	for _, st := range filtered {
+		sumPct += st.ClosePct
+	}
+	if sumPct > 100 && sumPct > 0 {
+		scale := 100.0 / sumPct
+		for i := range filtered {
+			filtered[i].ClosePct *= scale
+		}
+	}
+
+	return filtered
 }
 
 // ExecuteDecision executes a trading decision from external sources (e.g., debate consensus)
@@ -1412,7 +1513,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 	posKey := decision.Symbol + "_long"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 
-	// ATR 移动止盈止损：不挂交易所 TP/SL，由机器狗按价格监控；每档按开仓总仓位百分比，倍数严格递增
+	// ATR 移动止盈止损：可选；若 AI 给出 atr_sl_mult/atr_tp_mult/atr_tp_stages，则注册由机器狗按价格监控
 	if at.config.StrategyConfig != nil && at.config.StrategyConfig.Indicators.EnableATRTrailing &&
 		(decision.ATRTrailingSlMult > 0 || decision.ATRTrailingTpMult > 0 || len(decision.ATRTrailingTpStages) > 0) {
 		stages := normalizeATRStages(decision.ATRTrailingTpStages)
@@ -1430,13 +1531,16 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 		}
 		at.atrTrailingMu.Unlock()
 		logger.Infof("  ✓ ATR trailing registered: sl=%.2f× tp=%.2f× stages=%d (origQty=%.4f)", decision.ATRTrailingSlMult, decision.ATRTrailingTpMult, len(stages), quantity)
-	} else {
+	}
+
+	// 交易所固定止盈止损：与 ATR 不互斥；AI 若同时给出 stop_loss / take_profit / take_profit_stages，则一并挂到交易所（如硬止损/保底止盈）
+	if decision.StopLoss > 0 {
 		if err := at.trader.SetStopLoss(decision.Symbol, "LONG", quantity, decision.StopLoss); err != nil {
 			logger.Infof("  ⚠ Failed to set stop loss: %v", err)
 		}
-		if err := at.trader.SetTakeProfit(decision.Symbol, "LONG", quantity, decision.TakeProfit); err != nil {
-			logger.Infof("  ⚠ Failed to set take profit: %v", err)
-		}
+	}
+	if decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0 {
+		at.applyStaticTakeProfit(decision.Symbol, "LONG", quantity, decision)
 	}
 
 	return nil
@@ -1548,7 +1652,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 	posKey := decision.Symbol + "_short"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 
-	// ATR 移动止盈止损：不挂交易所 TP/SL，由机器狗按价格监控；每档按开仓总仓位百分比，倍数严格递增
+	// ATR 移动止盈止损：可选；若 AI 给出 atr_sl_mult/atr_tp_mult/atr_tp_stages，则注册由机器狗按价格监控
 	if at.config.StrategyConfig != nil && at.config.StrategyConfig.Indicators.EnableATRTrailing &&
 		(decision.ATRTrailingSlMult > 0 || decision.ATRTrailingTpMult > 0 || len(decision.ATRTrailingTpStages) > 0) {
 		stages := normalizeATRStages(decision.ATRTrailingTpStages)
@@ -1566,13 +1670,16 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 		}
 		at.atrTrailingMu.Unlock()
 		logger.Infof("  ✓ ATR trailing registered: sl=%.2f× tp=%.2f× stages=%d (origQty=%.4f)", decision.ATRTrailingSlMult, decision.ATRTrailingTpMult, len(stages), quantity)
-	} else {
+	}
+
+	// 交易所固定止盈止损：与 ATR 不互斥；AI 若同时给出 stop_loss / take_profit / take_profit_stages，则一并挂到交易所
+	if decision.StopLoss > 0 {
 		if err := at.trader.SetStopLoss(decision.Symbol, "SHORT", quantity, decision.StopLoss); err != nil {
 			logger.Infof("  ⚠ Failed to set stop loss: %v", err)
 		}
-		if err := at.trader.SetTakeProfit(decision.Symbol, "SHORT", quantity, decision.TakeProfit); err != nil {
-			logger.Infof("  ⚠ Failed to set take profit: %v", err)
-		}
+	}
+	if decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0 {
+		at.applyStaticTakeProfit(decision.Symbol, "SHORT", quantity, decision)
 	}
 
 	return nil
@@ -2159,6 +2266,19 @@ func (at *AutoTrader) checkPositionDrawdown() {
 			drawdownPct = ((peakPnLPct - currentPnLPct) / peakPnLPct) * 100
 		}
 
+		// 1. 绝对止损断头台 (硬性风控底线)
+		const MaxAllowedLossPct = -30.0 // 最大允许亏损百分比 (带杠杆后的 PnL%)
+		if currentPnLPct <= MaxAllowedLossPct {
+			logger.Infof("🚨 [FATAL RISK] 触发物理断头台！%s %s 亏损达到 %.2f%%，无视 AI，立即强制平仓！", symbol, side, currentPnLPct)
+			if err := at.emergencyClosePosition(symbol, side); err != nil {
+				logger.Infof("❌ 断头台平仓失败 (%s %s): %v", symbol, side, err)
+			} else {
+				logger.Infof("✅ 断头台强制平仓成功: %s %s", symbol, side)
+				at.ClearPeakPnLCache(symbol, side)
+			}
+			continue // 处理完毕，跳过该币种后续判断
+		}
+
 		// Check close position condition: profit > 5% and drawdown >= 40%
 		if currentPnLPct > 5.0 && drawdownPct >= 40.0 {
 			logger.Infof("🚨 Drawdown close position condition triggered: %s %s | Current profit: %.2f%% | Peak profit: %.2f%% | Drawdown: %.2f%%",
@@ -2198,7 +2318,8 @@ func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
 	default:
 		return fmt.Errorf("unknown position direction: %s", side)
 	}
-
+	// 清除 ATR 移动止盈止损状态，避免 watchdog 继续追踪已平仓位
+	at.onATRFullClose(symbol, side)
 	return nil
 }
 
