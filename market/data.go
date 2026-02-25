@@ -733,18 +733,9 @@ func fillDynamicIndicators(klines []Kline, opts *IndicatorParams) map[string]flo
 			}
 		}
 	}
-	// MACD (fast, slow, signal)
+	// MACD (fast, slow, signal) - 当 fast/slow/sig 为正数时才计算，避免在未启用 MACD 时仍输出
 	fast, slow, sig := opts.MACDFast, opts.MACDSlow, opts.MACDSignal
-	if fast <= 0 {
-		fast = 12
-	}
-	if slow <= 0 {
-		slow = 26
-	}
-	if sig <= 0 {
-		sig = 9
-	}
-	if len(klines) >= slow {
+	if fast > 0 && slow > 0 && sig > 0 && len(klines) >= slow {
 		macd, signal, hist := talib.Macd(closes, fast, slow, sig)
 		if len(macd) > 0 {
 			out["macd"] = macd[len(macd)-1]

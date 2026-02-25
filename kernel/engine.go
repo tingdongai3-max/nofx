@@ -640,40 +640,65 @@ func (e *StrategyEngine) getOILowCoins(limit int) ([]CandidateCoin, error) {
 // ============================================================================
 
 // IndicatorParamsFromConfig 将策略指标配置转为 market.IndicatorParams，供 Get/GetWithTimeframes 动态计算指标（供 debate/api 等调用）
+// 注意：只有在对应 Enable* 为 true 时，才会填充该类指标的参数，避免在策略关闭 EMA/RSI/BOLL 等时仍计算并暴露给 AI。
 func IndicatorParamsFromConfig(c store.IndicatorConfig) *market.IndicatorParams {
-	opts := &market.IndicatorParams{
-		EMAPeriods:  c.EMAPeriods,
-		RSIPeriods:  c.RSIPeriods,
-		ATRPeriods:  c.ATRPeriods,
-		BOLLPeriods: c.BOLLPeriods,
-		MACDFast:    12,
-		MACDSlow:    26,
-		MACDSignal:  9,
+	opts := &market.IndicatorParams{}
+
+	// EMA
+	if c.EnableEMA {
+		opts.EMAPeriods = append([]int{}, c.EMAPeriods...)
+		if len(opts.EMAPeriods) == 0 {
+			opts.EMAPeriods = []int{20, 50}
+		}
 	}
-	if len(opts.EMAPeriods) == 0 {
-		opts.EMAPeriods = []int{20, 50}
+
+	// RSI
+	if c.EnableRSI {
+		opts.RSIPeriods = append([]int{}, c.RSIPeriods...)
+		if len(opts.RSIPeriods) == 0 {
+			opts.RSIPeriods = []int{7, 14}
+		}
 	}
-	if len(opts.RSIPeriods) == 0 {
-		opts.RSIPeriods = []int{7, 14}
+
+	// ATR
+	if c.EnableATR {
+		opts.ATRPeriods = append([]int{}, c.ATRPeriods...)
+		if len(opts.ATRPeriods) == 0 {
+			opts.ATRPeriods = []int{14}
+		}
 	}
-	if len(opts.ATRPeriods) == 0 {
-		opts.ATRPeriods = []int{14}
-	}
+
+	// ADX
 	if c.EnableADX {
-		opts.ADXPeriods = c.ADXPeriods
+		opts.ADXPeriods = append([]int{}, c.ADXPeriods...)
 		if len(opts.ADXPeriods) == 0 {
 			opts.ADXPeriods = []int{14}
 		}
 	}
-	if len(opts.BOLLPeriods) == 0 {
-		opts.BOLLPeriods = []int{20}
+
+	// BOLL
+	if c.EnableBOLL {
+		opts.BOLLPeriods = append([]int{}, c.BOLLPeriods...)
+		if len(opts.BOLLPeriods) == 0 {
+			opts.BOLLPeriods = []int{20}
+		}
 	}
+
+	// MACD：通过将周期设为 0/负数来关闭，在 fillDynamicIndicators 中检测 fast/slow/sig 是否有效
+	if c.EnableMACD {
+		opts.MACDFast = 12
+		opts.MACDSlow = 26
+		opts.MACDSignal = 9
+	}
+
+	// BIAS
 	if c.EnableBIAS {
-		opts.BIASPeriods = c.BIASPeriods
+		opts.BIASPeriods = append([]int{}, c.BIASPeriods...)
 		if len(opts.BIASPeriods) == 0 {
 			opts.BIASPeriods = []int{6, 12, 24}
 		}
 	}
+
 	return opts
 }
 
@@ -1632,26 +1657,26 @@ func (e *StrategyEngine) formatTimeframeSeriesData(sb *strings.Builder, data *ma
 		}
 	}
 
-	// 只要有数据就输出 EMA/RSI/MACD/BOLL/ATR，不因 Enable* 标志而漏掉，避免 AI 抱怨无指标数据
-	if len(data.EMA20Values) > 0 {
+	// 按策略开关输出 EMA/RSI/MACD/BOLL/ATR：未启用的指标不计算/不暴露给 AI
+	if indicators.EnableEMA && len(data.EMA20Values) > 0 {
 		sb.WriteString(fmt.Sprintf("EMA20: %s\n", formatFloatSlice(data.EMA20Values)))
 	}
-	if len(data.EMA50Values) > 0 {
+	if indicators.EnableEMA && len(data.EMA50Values) > 0 {
 		sb.WriteString(fmt.Sprintf("EMA50: %s\n", formatFloatSlice(data.EMA50Values)))
 	}
-	if len(data.MACDValues) > 0 {
+	if indicators.EnableMACD && len(data.MACDValues) > 0 {
 		sb.WriteString(fmt.Sprintf("MACD: %s\n", formatFloatSlice(data.MACDValues)))
 	}
-	if len(data.RSI7Values) > 0 {
+	if indicators.EnableRSI && len(data.RSI7Values) > 0 {
 		sb.WriteString(fmt.Sprintf("RSI7: %s\n", formatFloatSlice(data.RSI7Values)))
 	}
-	if len(data.RSI14Values) > 0 {
+	if indicators.EnableRSI && len(data.RSI14Values) > 0 {
 		sb.WriteString(fmt.Sprintf("RSI14: %s\n", formatFloatSlice(data.RSI14Values)))
 	}
-	if data.ATR14 > 0 {
+	if indicators.EnableATR && data.ATR14 > 0 {
 		sb.WriteString(fmt.Sprintf("ATR14: %.4f\n", data.ATR14))
 	}
-	if len(data.BOLLUpper) > 0 {
+	if indicators.EnableBOLL && len(data.BOLLUpper) > 0 {
 		sb.WriteString(fmt.Sprintf("BOLL Upper: %s\n", formatFloatSlice(data.BOLLUpper)))
 		sb.WriteString(fmt.Sprintf("BOLL Middle: %s\n", formatFloatSlice(data.BOLLMiddle)))
 		sb.WriteString(fmt.Sprintf("BOLL Lower: %s\n", formatFloatSlice(data.BOLLLower)))

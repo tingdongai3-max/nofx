@@ -20,17 +20,19 @@ curl -fsSL https://raw.githubusercontent.com/tingdongai3-max/nofx/my-custom-vers
 
 ### 方式二：已手动 git pull 后，只重建并重启
 
-若已在服务器上执行过 `git pull`，在**安装目录**下执行一条命令即可：
+若已在服务器上执行过 `git pull`，在**安装目录**下执行一条命令即可。
 
+**Docker Compose V2（`docker compose` 带空格）：**
 ```bash
 cd ~/nofx && docker compose -f docker-compose.custom.yml build --no-cache && docker compose -f docker-compose.custom.yml up -d --force-recreate
 ```
 
-或先 pull 再构建重启（仍是一条命令）：
-
+**旧版（`docker-compose` 带连字符，若报 unknown shorthand flag 'f' 用这条）：**
 ```bash
-cd ~/nofx && git pull origin my-custom-version && docker compose -f docker-compose.custom.yml build --no-cache && docker compose -f docker-compose.custom.yml up -d --force-recreate
+cd ~/nofx && docker-compose -f docker-compose.custom.yml build --no-cache && docker-compose -f docker-compose.custom.yml up -d --force-recreate
 ```
+
+或先 pull 再构建重启（任选上面两种写法之一，把 `cd ~/nofx &&` 换成 `cd ~/nofx && git pull origin my-custom-version &&` 即可）。
 
 ## 说明
 

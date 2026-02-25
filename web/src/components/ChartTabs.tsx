@@ -5,6 +5,8 @@ import { useLanguage } from '../contexts/LanguageContext'
 import { t } from '../i18n/translations'
 import { BarChart3, CandlestickChart, ChevronDown, Search } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
+import { httpClient } from '../lib/httpClient'
+import { notify } from '../lib/notify'
 
 interface ChartTabsProps {
   traderId: string
@@ -15,6 +17,7 @@ interface ChartTabsProps {
 
 type ChartTab = 'equity' | 'kline'
 type Interval = '1m' | '5m' | '15m' | '30m' | '1h' | '4h' | '1d'
+type ExportInterval = Interval | '3m' | '2h' | '6h' | '8h' | '12h' | '3d' | '1w'
 type MarketType = 'hyperliquid' | 'crypto' | 'stocks' | 'forex' | 'metals'
 
 interface SymbolInfo {
@@ -62,6 +65,12 @@ export function ChartTabs({ traderId, selectedSymbol, updateKey, exchangeId }: C
   const [showDropdown, setShowDropdown] = useState(false)
   const [searchFilter, setSearchFilter] = useState('')
   const dropdownRef = useRef<HTMLDivElement>(null)
+  // K线导出状态
+  const [exportPanelOpen, setExportPanelOpen] = useState(false)
+  const [exportingKlines, setExportingKlines] = useState(false)
+  const [exportFrom, setExportFrom] = useState<string>('')
+  const [exportTo, setExportTo] = useState<string>('')
+  const [exportIntervals, setExportIntervals] = useState<ExportInterval[]>(['1m', '5m', '15m', '1h', '4h', '1d', '1w'])
 
   // 当交易所ID变化时，自动切换市场类型
   useEffect(() => {
@@ -143,6 +152,107 @@ export function ChartTabs({ traderId, selectedSymbol, updateKey, exchangeId }: C
   }
 
   console.log('[ChartTabs] rendering, activeTab:', activeTab)
+
+  // 将 YYYY-MM-DD 转为 UTC 毫秒时间戳区间
+  const getDateRangeMs = () => {
+    if (!exportFrom || !exportTo) return null
+    const from = new Date(exportFrom + 'T00:00:00Z')
+    const to = new Date(exportTo + 'T23:59:59.999Z')
+    if (isNaN(from.getTime()) || isNaN(to.getTime())) return null
+    const fromMs = from.getTime()
+    const toMs = to.getTime()
+    return fromMs <= toMs ? { fromMs, toMs } : { fromMs: toMs, toMs: fromMs }
+  }
+
+  const handleToggleExportInterval = (tf: ExportInterval) => {
+    setExportIntervals((prev) =>
+      prev.includes(tf) ? prev.filter((x) => x !== tf) : [...prev, tf]
+    )
+  }
+
+  const handleExportKlines = async () => {
+    if (!chartSymbol) {
+      notify.error(language === 'zh' ? '请先选择交易标的' : 'Please select a symbol first')
+      return
+    }
+    if (exportIntervals.length === 0) {
+      notify.error(language === 'zh' ? '请至少选择一个周期' : 'Please select at least one timeframe')
+      return
+    }
+    const range = getDateRangeMs()
+    if (!range) {
+      notify.error(language === 'zh' ? '请先选择导出起止日期' : 'Please select export date range')
+      return
+    }
+
+    setExportingKlines(true)
+    try {
+      for (const tf of exportIntervals) {
+        const limit = 1500
+        const url = `/api/klines?symbol=${encodeURIComponent(chartSymbol)}&interval=${tf}&limit=${limit}&exchange=${currentExchange}`
+        const result = await httpClient.get<any[]>(url)
+        if (!result.success || !Array.isArray(result.data)) {
+          throw new Error(language === 'zh' ? `获取 ${tf} K线失败` : `Failed to fetch ${tf} klines`)
+        }
+
+        const klines = result.data as Array<{
+          openTime: number
+          open: number
+          high: number
+          low: number
+          close: number
+          volume: number
+          quoteVolume?: number
+        }>
+
+        const filtered = klines.filter((k) => k.openTime >= range.fromMs && k.openTime <= range.toMs)
+        if (filtered.length === 0) {
+          continue
+        }
+
+        const header = 'instrument_name,open,high,low,close,vol,vol_ccy,vol_quote,open_time,confirm\n'
+        const rows = filtered
+          .map((k) =>
+            [
+              chartSymbol,
+              k.open.toFixed(4),
+              k.high.toFixed(4),
+              k.low.toFixed(4),
+              k.close.toFixed(4),
+              k.volume.toString(),
+              k.volume.toString(),
+              (k.quoteVolume ?? 0).toString(),
+              k.openTime.toString(),
+              '1',
+            ].join(',')
+          )
+          .join('\n')
+
+        const csv = header + rows + '\n'
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+        const urlObj = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        const safeSymbol = chartSymbol.replace(/[:/]/g, '-')
+        const datePart = exportFrom === exportTo ? exportFrom : `${exportFrom}_to_${exportTo}`
+        a.href = urlObj
+        a.download = `${safeSymbol}-${tf}-candlesticks-${datePart}.csv`
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(urlObj)
+      }
+
+      notify.success(
+        language === 'zh' ? 'K线数据已导出（按选定周期分别生成 CSV）' : 'Kline data exported (one CSV per timeframe)'
+      )
+      setExportPanelOpen(false)
+    } catch (err: any) {
+      const msg = err?.message || (language === 'zh' ? '导出K线失败' : 'Failed to export klines')
+      notify.error(language === 'zh' ? '导出K线失败' : 'Failed to export klines', { description: msg })
+    } finally {
+      setExportingKlines(false)
+    }
+  }
 
   return (
     <div className={`nofx-glass rounded-lg border border-white/5 relative z-10 w-full flex flex-col transition-all duration-300 ${typeof window !== 'undefined' && window.innerWidth < 768 ? 'h-[500px]' : 'h-[600px]'
@@ -294,6 +404,86 @@ export function ChartTabs({ traderId, selectedSymbol, updateKey, exchangeId }: C
                 Go
               </button>
             </form>
+
+            {/* K线导出下拉 */}
+            <div className="relative shrink-0">
+              <button
+                type="button"
+                onClick={() => setExportPanelOpen((v) => !v)}
+                className="px-2.5 py-1 text-[10px] font-medium rounded-md border border-nofx-accent/40 text-nofx-accent bg-black/40 hover:bg-nofx-accent/10 transition-all flex items-center gap-1.5"
+              >
+                <span className="text-xs">📤</span>
+                {language === 'zh' ? '导出K线' : 'Export Klines'}
+              </button>
+              {exportPanelOpen && (
+                <div className="absolute right-0 mt-2 w-72 bg-[#0B0E11] border border-white/10 rounded-lg shadow-[0_10px_40px_-10px_rgba(0,0,0,0.6)] z-50 p-3 space-y-3 text-[11px] text-nofx-text-main">
+                  <div className="font-semibold mb-1">
+                    {language === 'zh' ? '导出设置' : 'Export settings'}
+                  </div>
+                  <div className="space-y-1">
+                    <div className="text-[10px] text-nofx-text-muted">
+                      {language === 'zh' ? '选择周期（多选）' : 'Select timeframes'}
+                    </div>
+                    <div className="grid grid-cols-4 gap-1">
+                      {['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w'].map(
+                        (tf) => (
+                          <label key={tf} className="flex items-center gap-1 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              className="w-3 h-3"
+                              checked={exportIntervals.includes(tf as ExportInterval)}
+                              onChange={() => handleToggleExportInterval(tf as ExportInterval)}
+                            />
+                            <span>{tf}</span>
+                          </label>
+                        )
+                      )}
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <div className="text-[10px] text-nofx-text-muted">
+                      {language === 'zh' ? '时间范围（UTC，按开盘时间）' : 'Date range (UTC, open time)'}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="date"
+                        value={exportFrom}
+                        onChange={(e) => setExportFrom(e.target.value)}
+                        className="flex-1 bg-black/40 border border-white/10 rounded px-2 py-1 text-[10px] focus:outline-none focus:border-nofx-gold/60"
+                      />
+                      <span className="text-nofx-text-muted">~</span>
+                      <input
+                        type="date"
+                        value={exportTo}
+                        onChange={(e) => setExportTo(e.target.value)}
+                        className="flex-1 bg-black/40 border border-white/10 rounded px-2 py-1 text-[10px] focus:outline-none focus:border-nofx-gold/60"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between pt-1 border-t border-white/10 mt-1">
+                    <span className="text-[10px] text-nofx-text-muted">
+                      {language === 'zh'
+                        ? '每个周期导出一个 CSV 文件'
+                        : 'One CSV per timeframe'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleExportKlines}
+                      disabled={exportingKlines}
+                      className="px-2 py-1 rounded-md bg-nofx-accent text-black text-[10px] font-semibold hover:bg-nofx-accent/90 disabled:opacity-60 disabled:cursor-not-allowed"
+                    >
+                      {exportingKlines
+                        ? language === 'zh'
+                          ? '导出中...'
+                          : 'Exporting...'
+                        : language === 'zh'
+                          ? '导出'
+                          : 'Export'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>
