@@ -27,6 +27,11 @@ type ATRTrailingState struct {
 	AtrTpMult      float64
 	TpStages       []kernel.ATRTrailingStage // 最多 3 阶段，atr_mult 必须严格递增
 	TriggeredStage [3]bool                   // 已触发的阶段（每档只触发一次，更新 AI 参数也不重复触发）
+	// 1R 首批止盈 + 动态追踪止损
+	EntryATR        float64 // 开仓时 ATR，用于 1R 计算
+	FirstBatchClosed bool    // 是否已执行 1R 首批 40% 止盈
+	TrailingSLPrice  float64 // 1R 后追踪止损价（仅向有利方向移动）
+	AIStopLoss       float64 // AI 通过 hold/wait 下发的 stop_loss 价；与 TrailingSLPrice 取并集（谁先触发听谁的）
 }
 
 var (

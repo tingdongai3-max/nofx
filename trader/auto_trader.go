@@ -1151,6 +1151,49 @@ func (at *AutoTrader) getATRTrailingStateSnapshot() map[string]*ATRTrailingState
 	return out
 }
 
+// getPositionQuantity 从交易所获取当前仓位数量（正数）。用于平仓前 clamping，避免“实际可平 < 计划平”导致 -2022。
+func (at *AutoTrader) getPositionQuantity(symbol string, side string) (float64, bool) {
+	positions, err := at.trader.GetPositions()
+	if err != nil {
+		return 0, false
+	}
+	sideLower := strings.ToLower(side)
+	for _, pos := range positions {
+		if pos["symbol"] != symbol {
+			continue
+		}
+		s, _ := pos["side"].(string)
+		if strings.ToLower(s) != sideLower {
+			continue
+		}
+		amt, _ := pos["positionAmt"].(float64)
+		if amt < 0 {
+			amt = -amt
+		}
+		if amt > 0 {
+			return amt, true
+		}
+		return 0, true
+	}
+	return 0, false
+}
+
+// getEntryATR 获取开仓时 ATR（用于 1R 首批止盈与追踪止损）。策略未配置 ATR 或获取失败时返回 0。
+func (at *AutoTrader) getEntryATR(symbol string) float64 {
+	if at.config.StrategyConfig == nil {
+		return 0
+	}
+	opts := kernel.IndicatorParamsFromConfig(at.config.StrategyConfig.Indicators)
+	data, err := market.GetWithExchange(symbol, at.exchange, opts)
+	if err != nil || data == nil || data.DynamicIndicators == nil {
+		return 0
+	}
+	if v, ok := data.DynamicIndicators["atr_14"]; ok && v > 0 {
+		return v
+	}
+	return 0
+}
+
 func (at *AutoTrader) onATRPartialClose(symbol, side string, closedQty float64, stageIndex int) {
 	key := symbol + "_" + strings.ToLower(side)
 	at.atrTrailingMu.Lock()
@@ -1229,20 +1272,31 @@ func (at *AutoTrader) updateTpSlForExistingPosition(decision *kernel.Decision) b
 			if entryPrice > 0 {
 				s.EntryPrice = entryPrice
 			}
+			if decision.StopLoss > 0 {
+				s.AIStopLoss = decision.StopLoss // 与 TrailingSLPrice 并集，谁先触发听谁的
+			}
 			// 不覆盖 OriginalQty、不重置 TriggeredStage，避免 AI 调低倍数后重复触发同一档
 			logger.Infof("  ✓ [updateTpSl] ATR trailing updated %s %s: sl=%.2f× tp=%.2f× stages=%d (triggered unchanged)", decision.Symbol, posSide, s.AtrSlMult, s.AtrTpMult, len(s.TpStages))
 		} else {
-			at.atrTrailingState[key] = &ATRTrailingState{
-				Symbol:      decision.Symbol,
-				Side:        posSide,
-				EntryPrice:  entryPrice,
-				OriginalQty: quantity,
-				CurrentQty:  quantity,
-				AtrSlMult:   decision.ATRTrailingSlMult,
-				AtrTpMult:   decision.ATRTrailingTpMult,
-				TpStages:    stages,
+			entryATR := at.getEntryATR(decision.Symbol)
+			aiSL := 0.0
+			if decision.StopLoss > 0 {
+				aiSL = decision.StopLoss
 			}
-			logger.Infof("  ✓ [updateTpSl] ATR trailing state created %s %s entry=%.4f origQty=%.4f", decision.Symbol, posSide, entryPrice, quantity)
+			at.atrTrailingState[key] = &ATRTrailingState{
+				Symbol:           decision.Symbol,
+				Side:             posSide,
+				EntryPrice:       entryPrice,
+				OriginalQty:      quantity,
+				CurrentQty:       quantity,
+				AtrSlMult:        decision.ATRTrailingSlMult,
+				AtrTpMult:        decision.ATRTrailingTpMult,
+				TpStages:         stages,
+				EntryATR:         entryATR,
+				FirstBatchClosed: false,
+				AIStopLoss:       aiSL,
+			}
+			logger.Infof("  ✓ [updateTpSl] ATR trailing state created %s %s entry=%.4f origQty=%.4f entryATR=%.4f", decision.Symbol, posSide, entryPrice, quantity, entryATR)
 		}
 		at.atrTrailingMu.Unlock()
 		// 不 return：若 AI 同时给出固定 stop_loss / take_profit / take_profit_stages，下面一并挂到交易所
@@ -1513,24 +1567,27 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 	posKey := decision.Symbol + "_long"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 
-	// ATR 移动止盈止损：可选；若 AI 给出 atr_sl_mult/atr_tp_mult/atr_tp_stages，则注册由机器狗按价格监控
+	// ATR 移动止盈止损：可选；若 AI 给出 atr_sl_mult/atr_tp_mult/atr_tp_stages，则注册由机器狗按价格监控（含 1R 首批止盈用 EntryATR）
 	if at.config.StrategyConfig != nil && at.config.StrategyConfig.Indicators.EnableATRTrailing &&
 		(decision.ATRTrailingSlMult > 0 || decision.ATRTrailingTpMult > 0 || len(decision.ATRTrailingTpStages) > 0) {
 		stages := normalizeATRStages(decision.ATRTrailingTpStages)
+		entryATR := at.getEntryATR(decision.Symbol)
 		key := decision.Symbol + "_long"
 		at.atrTrailingMu.Lock()
 		at.atrTrailingState[key] = &ATRTrailingState{
-			Symbol:      decision.Symbol,
-			Side:        "long",
-			EntryPrice:  marketData.CurrentPrice,
-			OriginalQty: quantity,
-			CurrentQty:  quantity,
-			AtrSlMult:   decision.ATRTrailingSlMult,
-			AtrTpMult:   decision.ATRTrailingTpMult,
-			TpStages:    stages,
+			Symbol:           decision.Symbol,
+			Side:             "long",
+			EntryPrice:       marketData.CurrentPrice,
+			OriginalQty:      quantity,
+			CurrentQty:       quantity,
+			AtrSlMult:        decision.ATRTrailingSlMult,
+			AtrTpMult:        decision.ATRTrailingTpMult,
+			TpStages:         stages,
+			EntryATR:         entryATR,
+			FirstBatchClosed: false,
 		}
 		at.atrTrailingMu.Unlock()
-		logger.Infof("  ✓ ATR trailing registered: sl=%.2f× tp=%.2f× stages=%d (origQty=%.4f)", decision.ATRTrailingSlMult, decision.ATRTrailingTpMult, len(stages), quantity)
+		logger.Infof("  ✓ ATR trailing registered: sl=%.2f× tp=%.2f× stages=%d (origQty=%.4f, entryATR=%.4f)", decision.ATRTrailingSlMult, decision.ATRTrailingTpMult, len(stages), quantity, entryATR)
 	}
 
 	// 交易所固定止盈止损：与 ATR 不互斥；AI 若同时给出 stop_loss / take_profit / take_profit_stages，则一并挂到交易所（如硬止损/保底止盈）
@@ -1656,20 +1713,23 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 	if at.config.StrategyConfig != nil && at.config.StrategyConfig.Indicators.EnableATRTrailing &&
 		(decision.ATRTrailingSlMult > 0 || decision.ATRTrailingTpMult > 0 || len(decision.ATRTrailingTpStages) > 0) {
 		stages := normalizeATRStages(decision.ATRTrailingTpStages)
+		entryATR := at.getEntryATR(decision.Symbol)
 		key := decision.Symbol + "_short"
 		at.atrTrailingMu.Lock()
 		at.atrTrailingState[key] = &ATRTrailingState{
-			Symbol:      decision.Symbol,
-			Side:        "short",
-			EntryPrice:  marketData.CurrentPrice,
-			OriginalQty: quantity,
-			CurrentQty:  quantity,
-			AtrSlMult:   decision.ATRTrailingSlMult,
-			AtrTpMult:   decision.ATRTrailingTpMult,
-			TpStages:    stages,
+			Symbol:           decision.Symbol,
+			Side:             "short",
+			EntryPrice:       marketData.CurrentPrice,
+			OriginalQty:      quantity,
+			CurrentQty:       quantity,
+			AtrSlMult:        decision.ATRTrailingSlMult,
+			AtrTpMult:        decision.ATRTrailingTpMult,
+			TpStages:         stages,
+			EntryATR:         entryATR,
+			FirstBatchClosed: false,
 		}
 		at.atrTrailingMu.Unlock()
-		logger.Infof("  ✓ ATR trailing registered: sl=%.2f× tp=%.2f× stages=%d (origQty=%.4f)", decision.ATRTrailingSlMult, decision.ATRTrailingTpMult, len(stages), quantity)
+		logger.Infof("  ✓ ATR trailing registered: sl=%.2f× tp=%.2f× stages=%d (origQty=%.4f, entryATR=%.4f)", decision.ATRTrailingSlMult, decision.ATRTrailingTpMult, len(stages), quantity, entryATR)
 	}
 
 	// 交易所固定止盈止损：与 ATR 不互斥；AI 若同时给出 stop_loss / take_profit / take_profit_stages，则一并挂到交易所
@@ -1731,13 +1791,31 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 		logger.Infof("  📊 Using exchange position data: qty=%.8f, entry=%.2f", quantity, entryPrice)
 	}
 
-	// Close quantity: 0 or omit = full close; >0 = partial close (减仓/分批止盈)
+	// Close quantity: 0 or omit = full close; quantity>0 = 按数量平仓; quantity_pct in (0,1] = 按比例平仓
 	closeQty := quantity
 	if decision.Quantity > 0 {
 		if decision.Quantity < quantity {
 			closeQty = decision.Quantity
 			logger.Infof("  📉 Partial close (减仓): closing %.8f of %.8f", closeQty, quantity)
 		}
+	} else if decision.QuantityPct > 0 && decision.QuantityPct <= 1.0 {
+		closeQty = quantity * decision.QuantityPct
+		if closeQty < quantity {
+			logger.Infof("  📉 Partial close by quantity_pct=%.2f: closing %.8f (%.0f%%) of %.8f", decision.QuantityPct, closeQty, decision.QuantityPct*100, quantity)
+		}
+	}
+
+	// 下单前用交易所最新仓位做上限，避免与 1R 自动平 40% 等“同时开枪”导致 -2022 ReduceOnly
+	actualQty, _ := at.getPositionQuantity(decision.Symbol, "long")
+	if actualQty <= 0 {
+		logger.Infof("  ✓ 仓位已无或已平，跳过 close_long (避免 -2022)")
+		at.onATRFullClose(decision.Symbol, "long")
+		return nil
+	}
+	if closeQty > actualQty {
+		logger.Infof("  📌 计划平 %.8f，实际可平 %.8f，按实际可平数量下单（避免 -2022）", closeQty, actualQty)
+		closeQty = actualQty
+		quantity = actualQty
 	}
 
 	order, err := at.trader.CloseLong(decision.Symbol, closeQty)
@@ -1815,13 +1893,31 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 		logger.Infof("  📊 Using exchange position data: qty=%.8f, entry=%.2f", quantity, entryPrice)
 	}
 
-	// Close quantity: 0 or omit = full close; >0 = partial close (减仓/分批止盈)
+	// Close quantity: 0 or omit = full close; quantity>0 = 按数量平仓; quantity_pct in (0,1] = 按比例平仓
 	closeQty := quantity
 	if decision.Quantity > 0 {
 		if decision.Quantity < quantity {
 			closeQty = decision.Quantity
 			logger.Infof("  📉 Partial close (减仓): closing %.8f of %.8f", closeQty, quantity)
 		}
+	} else if decision.QuantityPct > 0 && decision.QuantityPct <= 1.0 {
+		closeQty = quantity * decision.QuantityPct
+		if closeQty < quantity {
+			logger.Infof("  📉 Partial close by quantity_pct=%.2f: closing %.8f of %.8f", decision.QuantityPct, closeQty, quantity)
+		}
+	}
+
+	// 下单前用交易所最新仓位做上限，避免与 1R 自动平 40% 等“同时开枪”导致 -2022 ReduceOnly
+	actualQty, _ := at.getPositionQuantity(decision.Symbol, "short")
+	if actualQty <= 0 {
+		logger.Infof("  ✓ 仓位已无或已平，跳过 close_short (避免 -2022)")
+		at.onATRFullClose(decision.Symbol, "short")
+		return nil
+	}
+	if closeQty > actualQty {
+		logger.Infof("  📌 计划平 %.8f，实际可平 %.8f，按实际可平数量下单（避免 -2022）", closeQty, actualQty)
+		closeQty = actualQty
+		quantity = actualQty
 	}
 
 	order, err := at.trader.CloseShort(decision.Symbol, closeQty)
@@ -2277,6 +2373,100 @@ func (at *AutoTrader) checkPositionDrawdown() {
 				at.ClearPeakPnLCache(symbol, side)
 			}
 			continue // 处理完毕，跳过该币种后续判断
+		}
+
+		// 2. 1R 首批止盈 + 0.8R 动态追踪止损（仅当 ATR 状态存在且 EntryATR>0 时）
+		at.atrTrailingMu.Lock()
+		state := at.atrTrailingState[posKey]
+		at.atrTrailingMu.Unlock()
+		if state != nil && state.EntryATR > 0 {
+			isLong := side == "long"
+			profitR := (markPrice - entryPrice) / state.EntryATR
+			if !isLong {
+				profitR = (entryPrice - markPrice) / state.EntryATR
+			}
+			// 2a. 1R 首批止盈：未执行过且利润达到 1R，平 40%
+			if !state.FirstBatchClosed && profitR >= 1.0 {
+				closeQty := quantity * 0.4
+				if closeQty <= 0 {
+					at.atrTrailingMu.Lock()
+					state.FirstBatchClosed = true
+					state.TrailingSLPrice = markPrice - 0.8*state.EntryATR
+					if !isLong {
+						state.TrailingSLPrice = markPrice + 0.8*state.EntryATR
+					}
+					at.atrTrailingMu.Unlock()
+				} else {
+					var err error
+					if isLong {
+						_, err = at.trader.CloseLong(symbol, closeQty)
+					} else {
+						_, err = at.trader.CloseShort(symbol, closeQty)
+					}
+					if err != nil {
+						logger.Infof("❌ 1R 首批止盈平仓失败 (%s %s): %v", symbol, side, err)
+					} else {
+						logger.Infof("✅ 1R 首批止盈: %s %s 平仓 40%% (profitR=%.2f, qty=%.4f)", symbol, side, profitR, closeQty)
+						at.atrTrailingMu.Lock()
+						state.FirstBatchClosed = true
+						state.TrailingSLPrice = markPrice - 0.8*state.EntryATR
+						if !isLong {
+							state.TrailingSLPrice = markPrice + 0.8*state.EntryATR
+						}
+						at.atrTrailingMu.Unlock()
+						at.onATRPartialClose(symbol, side, closeQty, -1)
+					}
+				}
+				continue
+			}
+			// 2b. 追踪止损与 AI 止损并集：取谁先触发听谁（多头取更高 SL，空头取更低 SL），防御力最高
+			if state.FirstBatchClosed && state.TrailingSLPrice > 0 {
+				if isLong {
+					if markPrice > state.EntryPrice {
+						newSL := markPrice - 0.8*state.EntryATR
+						at.atrTrailingMu.Lock()
+						if newSL > state.TrailingSLPrice {
+							state.TrailingSLPrice = newSL
+						}
+						at.atrTrailingMu.Unlock()
+					}
+					effectiveSL := state.TrailingSLPrice
+					if state.AIStopLoss > 0 && state.AIStopLoss > effectiveSL {
+						effectiveSL = state.AIStopLoss
+					}
+					if markPrice <= effectiveSL {
+						logger.Infof("🚨 追踪/AI 止损触发: %s %s 价格 %.4f <= 有效SL %.4f (Trailing=%.4f AI=%.4f)，全平", symbol, side, markPrice, effectiveSL, state.TrailingSLPrice, state.AIStopLoss)
+						if err := at.emergencyClosePosition(symbol, side); err != nil {
+							logger.Infof("❌ 追踪止损平仓失败 (%s %s): %v", symbol, side, err)
+						} else {
+							at.ClearPeakPnLCache(symbol, side)
+						}
+						continue
+					}
+				} else {
+					if markPrice < state.EntryPrice {
+						newSL := markPrice + 0.8*state.EntryATR
+						at.atrTrailingMu.Lock()
+						if newSL < state.TrailingSLPrice {
+							state.TrailingSLPrice = newSL
+						}
+						at.atrTrailingMu.Unlock()
+					}
+					effectiveSL := state.TrailingSLPrice
+					if state.AIStopLoss > 0 && state.AIStopLoss < effectiveSL {
+						effectiveSL = state.AIStopLoss
+					}
+					if markPrice >= effectiveSL {
+						logger.Infof("🚨 追踪/AI 止损触发: %s %s 价格 %.4f >= 有效SL %.4f (Trailing=%.4f AI=%.4f)，全平", symbol, side, markPrice, effectiveSL, state.TrailingSLPrice, state.AIStopLoss)
+						if err := at.emergencyClosePosition(symbol, side); err != nil {
+							logger.Infof("❌ 追踪止损平仓失败 (%s %s): %v", symbol, side, err)
+						} else {
+							at.ClearPeakPnLCache(symbol, side)
+						}
+						continue
+					}
+				}
+			}
 		}
 
 		// Check close position condition: profit > 5% and drawdown >= 40%

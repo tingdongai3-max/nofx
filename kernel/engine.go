@@ -152,9 +152,10 @@ type Decision struct {
 	OrderID    string  `json:"order_id,omitempty"`    // Order ID (for cancel)
 
 	// Common parameters
-	Confidence int     `json:"confidence,omitempty"` // Confidence level (0-100)
-	RiskUSD    float64 `json:"risk_usd,omitempty"`   // Maximum USD risk
-	Reasoning  string  `json:"reasoning"`
+	Confidence  int     `json:"confidence,omitempty"`  // Confidence level (0-100)
+	RiskUSD     float64 `json:"risk_usd,omitempty"`    // Maximum USD risk
+	Reasoning   string  `json:"reasoning"`
+	QuantityPct float64 `json:"quantity_pct,omitempty"` // 比例平仓：0~1，如 0.4 表示平掉当前仓位的 40%（仅 close_long/close_short 时有效）
 }
 
 // TakeProfitStage 静态分批止盈阶段：到达指定 price 时平掉 close_pct 比例的仓位（使用交易所分批 TP 功能）
@@ -1134,7 +1135,7 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 		sb.WriteString("- Required when opening: leverage, position_size_usd (use max from **This period** section; example shows 5000 as placeholder), stop_loss, **either** take_profit **or** take_profit_stages, confidence, risk_usd\n")
 		sb.WriteString("- Static multi-stage TP (分批挂单止盈，非 ATR): use `take_profit_stages` = [{\"price\": x, \"close_pct\": y}, ...], prices strictly increasing for long positions and strictly decreasing for short positions; total close_pct ≤ 100 (percent of current position size).\n")
 	}
-	sb.WriteString("- When close_long/close_short: optional `quantity` (base asset, e.g. BTC amount). Omit or 0 = close all; set to a number = partial close (减仓/分批止盈).\n")
+	sb.WriteString("- When close_long/close_short: you have **full permission** to close or reduce positions. Use optional `quantity` (base asset amount) or `quantity_pct` (0~1, e.g. 0.4 = close 40%% of current position). Omit both or 0 = close all; set `quantity` = partial close by amount, or `quantity_pct` = partial close by ratio (减仓/分批止盈).\n")
 	sb.WriteString("- When hold/wait to update TP/SL: use `stop_loss` and/or `take_profit` / `take_profit_stages`. If you only want to update the stop (trailing stop), set `take_profit` and `take_profit_stages` to 0/empty or omit them — the system will keep the existing TP orders and only update SL.\n")
 	if e.config.Indicators.EnableATRTrailing {
 		sb.WriteString("- When hold/wait with ATR trailing: you may update `atr_sl_mult`, `atr_tp_mult`, or `atr_tp_stages`; you may also set `stop_loss`/`take_profit`/`take_profit_stages` to update exchange fixed orders (both can coexist).\n")
