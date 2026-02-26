@@ -93,4 +93,7 @@ func (c *CoinankClient) Post(ctx context.Context, path string, data any) (string
 
 var client = &http.Client{
 	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		Proxy: nil, // Disable environment proxies for CoinAnk to avoid routing through Binance proxies
+	},
 }

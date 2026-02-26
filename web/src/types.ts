@@ -604,6 +604,9 @@ export interface ExternalDataSource {
 }
 
 export interface RiskControlConfig {
+  // Global switch: whether AI may actively close positions via close_long / close_short.
+  enable_ai_close?: boolean;
+
   // Max number of coins held simultaneously (CODE ENFORCED)
   max_positions: number;
 
@@ -621,6 +624,41 @@ export interface RiskControlConfig {
   min_position_size: number;       // Min position size in USDT (CODE ENFORCED)
   min_risk_reward_ratio: number;   // Min take_profit / stop_loss ratio (AI guided)
   min_confidence: number;          // Min AI confidence to open position (AI guided)
+}
+
+// Indicator analysis types
+export interface IndicatorDimensionAverages {
+  profit_entry_avg: number;
+  profit_entry_median: number;
+  profit_exit_avg: number;
+  profit_exit_median: number;
+  loss_entry_avg: number;
+  loss_entry_median: number;
+  loss_exit_avg: number;
+  loss_exit_median: number;
+
+  profit_entry_count: number;
+  profit_exit_count: number;
+  loss_entry_count: number;
+  loss_exit_count: number;
+}
+
+export interface IndicatorAnalysisResult {
+  trader_id: string;
+  timeframe: string;
+  rsi_period: number;
+  ema_period: number;
+  from: number | null;
+  to: number | null;
+  trade_count: number;
+  /** All trades (no side filter) */
+  indicators_all: Record<string, IndicatorDimensionAverages>;
+  /** Long positions only */
+  indicators_long: Record<string, IndicatorDimensionAverages>;
+  /** Short positions only */
+  indicators_short: Record<string, IndicatorDimensionAverages>;
+  /** @deprecated use indicators_all / indicators_long / indicators_short */
+  indicators?: Record<string, IndicatorDimensionAverages>;
 }
 
 // Debate Arena Types
@@ -758,6 +796,10 @@ export interface HistoricalPosition {
   exit_time: string;
   realized_pnl: number;
   fee: number;
+  /** MFE 最大浮盈 (USD) */
+  max_favorable_excursion?: number;
+  /** MAE 最大浮亏 (USD) */
+  max_adverse_excursion?: number;
   leverage: number;
   status: string;
   close_reason: string;

@@ -208,6 +208,10 @@ type ExternalDataSource struct {
 
 // RiskControlConfig risk control configuration
 type RiskControlConfig struct {
+	// Global switch: whether AI is allowed to actively close positions via close_long / close_short.
+	// When false, exit is fully delegated to backend watchdog / ATR engine; AI should not output close actions.
+	EnableAIClose bool `json:"enable_ai_close"`
+
 	// Max number of coins held simultaneously (CODE ENFORCED)
 	MaxPositions int `json:"max_positions"`
 
@@ -319,6 +323,7 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 			BIASPeriods:             []int{6, 12, 24},
 		},
 		RiskControl: RiskControlConfig{
+			EnableAIClose:                false, // By default, exits are handled by backend watchdog/ATR; AI focuses on entries
 			MaxPositions:                    3,   // Max 3 coins simultaneously (CODE ENFORCED)
 			BTCETHMaxLeverage:               5,   // BTC/ETH exchange leverage (AI guided)
 			AltcoinMaxLeverage:              5,   // Altcoin exchange leverage (AI guided)

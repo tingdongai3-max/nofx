@@ -19,6 +19,8 @@ import type {
     Statistics,
     TraderInfo,
     Exchange,
+    IndicatorAnalysisResult,
+    IndicatorDimensionAverages,
 } from '../types'
 
 // --- Helper Functions ---
@@ -142,6 +144,16 @@ export function TraderDashboardPage({
     const [positionsPageSize, setPositionsPageSize] = useState<number>(20)
     const [positionsCurrentPage, setPositionsCurrentPage] = useState<number>(1)
 
+    // Indicator analysis controls
+    const [indicatorTimeframe, setIndicatorTimeframe] = useState<string>('5m')
+    const [indicatorRSIPeriod, setIndicatorRSIPeriod] = useState<number>(14)
+    const [indicatorEMAPeriod, setIndicatorEMAPeriod] = useState<number>(20)
+    const [indicatorAnalysis, setIndicatorAnalysis] = useState<IndicatorAnalysisResult | null>(null)
+    const [indicatorLoading, setIndicatorLoading] = useState<boolean>(false)
+    const [indicatorError, setIndicatorError] = useState<string | null>(null)
+    type IndicatorSideFilter = 'all' | 'long' | 'short'
+    const [indicatorSideFilter, setIndicatorSideFilter] = useState<IndicatorSideFilter>('all')
+
     // Calculate paginated positions
     const totalPositions = positions?.length || 0
     const totalPositionPages = Math.ceil(totalPositions / positionsPageSize)
@@ -149,6 +161,49 @@ export function TraderDashboardPage({
         (positionsCurrentPage - 1) * positionsPageSize,
         positionsCurrentPage * positionsPageSize
     ) || []
+
+    // Fetch indicator analysis when trader / params change
+    useEffect(() => {
+        if (!selectedTraderId) {
+            setIndicatorAnalysis(null)
+            return
+        }
+        let aborted = false
+        const fetchAnalysis = async () => {
+            setIndicatorLoading(true)
+            setIndicatorError(null)
+            try {
+                const params = new URLSearchParams({
+                    trader_id: selectedTraderId,
+                    timeframe: indicatorTimeframe,
+                    rsi_period: String(indicatorRSIPeriod),
+                    ema_period: String(indicatorEMAPeriod),
+                })
+                const resp = await fetch(`/api/statistics/indicator-analysis?${params.toString()}`)
+                const data = (await resp.json()) as IndicatorAnalysisResult & { error?: string; code?: string; details?: string }
+                if (!resp.ok) {
+                    const msg = data?.error && data?.details ? `${data.error}: ${data.details}` : data?.error || `HTTP ${resp.status}`
+                    throw new Error(msg)
+                }
+                if (!aborted) {
+                    setIndicatorAnalysis(data)
+                }
+            } catch (err: any) {
+                if (!aborted) {
+                    setIndicatorError(err?.message || 'Failed to load indicator analysis')
+                    setIndicatorAnalysis(null)
+                }
+            } finally {
+                if (!aborted) {
+                    setIndicatorLoading(false)
+                }
+            }
+        }
+        fetchAnalysis()
+        return () => {
+            aborted = true
+        }
+    }, [selectedTraderId, indicatorTimeframe, indicatorRSIPeriod, indicatorEMAPeriod])
 
     // Reset page when positions change
     useEffect(() => {
@@ -883,19 +938,315 @@ export function TraderDashboardPage({
                     </div>
                 </div>
 
-                {/* Position History Section */}
+                {/* Indicator Analysis + Position History Section: single column, indicator on top then history */}
                 {selectedTraderId && (
-                    <div
-                        className="nofx-glass p-6 animate-slide-in"
-                        style={{ animationDelay: '0.25s' }}
-                    >
-                        <div className="flex items-center justify-between mb-5">
-                            <h2 className="text-xl font-bold flex items-center gap-2 text-nofx-text-main">
-                                <span className="text-2xl">📜</span>
-                                {t('positionHistory.title', language)}
-                            </h2>
+                    <div className="flex flex-col gap-6 animate-slide-in w-full" style={{ animationDelay: '0.25s' }}>
+                        {/* Trading Indicator Analysis Panel — full width */}
+                        <div className="nofx-glass p-6 w-full">
+                            <div className="flex items-center justify-between mb-4">
+                                <div className="flex items-center gap-2">
+                                    <span className="text-2xl">📊</span>
+                                    <div>
+                                        <h2 className="text-lg font-bold text-nofx-text-main">
+                                            {language === 'zh' ? '交易指标分析' : 'Trading Indicator Analysis'}
+                                        </h2>
+                                        <p className="text-xs text-nofx-text-muted">
+                                            {language === 'zh'
+                                                ? '基于历史平仓交易，在开仓/平仓时刻回溯关键指标均值（盈利 vs 亏损）'
+                                                : 'Backtest key indicators at entry/exit for winning vs losing trades.'}
+                                        </p>
+                                    </div>
+                                </div>
+                                <div className="flex flex-col items-end gap-2">
+                                    {/* Timeframe selector */}
+                                    <div className="flex items-center gap-2">
+                                        <span className="text-xs text-nofx-text-muted">
+                                            {language === 'zh' ? '周期' : 'Timeframe'}
+                                        </span>
+                                        <select
+                                            value={indicatorTimeframe}
+                                            onChange={(e) => setIndicatorTimeframe(e.target.value)}
+                                            className="px-2 py-1 rounded-md text-xs bg-black/40 border border-white/10 text-nofx-text-main focus:outline-none focus:border-nofx-accent/60"
+                                        >
+                                            {['1m', '5m', '15m', '1h', '1d'].map((tf) => (
+                                                <option key={tf} value={tf}>
+                                                    {tf}
+                                                </option>
+                                            ))}
+                                        </select>
+                                    </div>
+                                    {/* Quick parameter buttons */}
+                                    <div className="flex flex-wrap gap-2 justify-end">
+                                        <button
+                                            type="button"
+                                            onClick={() => setIndicatorRSIPeriod(7)}
+                                            className={`px-2 py-0.5 rounded-full text-[10px] border ${indicatorRSIPeriod === 7 ? 'bg-nofx-accent/20 border-nofx-accent text-nofx-accent' : 'border-white/10 text-nofx-text-muted hover:border-nofx-accent/50'}`}
+                                        >
+                                            RSI-7
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setIndicatorRSIPeriod(14)}
+                                            className={`px-2 py-0.5 rounded-full text-[10px] border ${indicatorRSIPeriod === 14 ? 'bg-nofx-accent/20 border-nofx-accent text-nofx-accent' : 'border-white/10 text-nofx-text-muted hover:border-nofx-accent/50'}`}
+                                        >
+                                            RSI-14
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setIndicatorEMAPeriod(20)}
+                                            className={`px-2 py-0.5 rounded-full text-[10px] border ${indicatorEMAPeriod === 20 ? 'bg-nofx-gold/20 border-nofx-gold text-nofx-gold' : 'border-white/10 text-nofx-text-muted hover:border-nofx-gold/50'}`}
+                                        >
+                                            EMA-20
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setIndicatorEMAPeriod(50)}
+                                            className={`px-2 py-0.5 rounded-full text-[10px] border ${indicatorEMAPeriod === 50 ? 'bg-nofx-gold/20 border-nofx-gold text-nofx-gold' : 'border-white/10 text-nofx-text-muted hover:border-nofx-gold/50'}`}
+                                        >
+                                            EMA-50
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="border-t border-white/5 pt-3 mt-2">
+                                {indicatorLoading && (
+                                    <div className="text-xs text-nofx-text-muted flex items-center gap-2">
+                                        <Loader2 className="w-3 h-3 animate-spin" />
+                                        {language === 'zh' ? '加载指标分析中...' : 'Loading indicator analysis...'}
+                                    </div>
+                                )}
+                                {indicatorError && !indicatorLoading && (
+                                    <div className="text-xs text-nofx-red">
+                                        {language === 'zh' ? '指标分析加载失败：' : 'Failed to load indicator analysis: '}
+                                        {indicatorError}
+                                    </div>
+                                )}
+                                {indicatorAnalysis && indicatorAnalysis.trade_count > 0 && !indicatorLoading && !indicatorError && (
+                                    <>
+                                        {/* Side filter tabs: 全部 / 做多 / 做空 */}
+                                        <div className="flex gap-1 mb-4 p-1 rounded-lg bg-black/30 border border-white/10">
+                                            {(
+                                                [
+                                                    { id: 'all' as const, zh: '全部', en: 'All' },
+                                                    { id: 'long' as const, zh: '做多', en: 'Long' },
+                                                    { id: 'short' as const, zh: '做空', en: 'Short' },
+                                                ] as const
+                                            ).map(({ id, zh, en }) => (
+                                                <button
+                                                    key={id}
+                                                    type="button"
+                                                    onClick={() => setIndicatorSideFilter(id)}
+                                                    className={`flex-1 py-1.5 px-3 rounded-md text-xs font-medium transition-all duration-200 ${
+                                                        indicatorSideFilter === id
+                                                            ? 'bg-nofx-accent/30 text-nofx-accent border border-nofx-accent/50'
+                                                            : 'text-nofx-text-muted hover:text-nofx-text-main hover:bg-white/5 border border-transparent'
+                                                    }`}
+                                                >
+                                                    {language === 'zh' ? zh : en}
+                                                </button>
+                                            ))}
+                                        </div>
+
+                                        {/* 指标卡片：每行一张 W-full，三列 标题|开仓|平仓，盈利/亏损上下堆叠+横向柱状图 */}
+                                        {(() => {
+                                            const indicators =
+                                                indicatorSideFilter === 'long'
+                                                    ? indicatorAnalysis.indicators_long
+                                                    : indicatorSideFilter === 'short'
+                                                      ? indicatorAnalysis.indicators_short
+                                                      : indicatorAnalysis.indicators_all
+                                            const rsiPeriod = indicatorAnalysis.rsi_period ?? 14
+                                            const emaPeriod = indicatorAnalysis.ema_period ?? 20
+                                            const config: { key: string; label: string; unit: string; signed?: boolean; volMult?: boolean }[] = [
+                                                { key: 'rsi', label: `RSI (${rsiPeriod})`, unit: '' },
+                                                { key: 'emabias', label: language === 'zh' ? `EMA 偏离 (${emaPeriod})` : `EMA Bias (${emaPeriod})`, unit: '%', signed: true },
+                                                { key: 'boll_pct', label: language === 'zh' ? 'BOLL 带内 (20)' : 'BOLL Band % (20)', unit: '%' },
+                                                { key: 'atr_pct', label: 'ATR % (14)', unit: '%' },
+                                                { key: 'macd', label: language === 'zh' ? 'MACD (柱)' : 'MACD (Histogram)', unit: '', signed: true },
+                                                { key: 'adx', label: 'ADX (14)', unit: '' },
+                                                { key: 'bias', label: language === 'zh' ? '乖离率 (Bias)' : 'Bias', unit: '%', signed: true },
+                                                { key: 'vol_mult', label: language === 'zh' ? '成交量倍数' : 'Vol Mult', unit: 'x', volMult: true },
+                                            ]
+                                            const formatNum = (val: number | undefined) =>
+                                                val === undefined || Number.isNaN(val) ? null : val.toFixed(2)
+                                            const formatBiasSuffix = (val: number | undefined) =>
+                                                val == null || val === 0 ? '' : val < 0 ? (language === 'zh' ? ' (EMA下)' : ' (Below)') : (language === 'zh' ? ' (EMA上)' : ' (Above)')
+                                            const hasAny = (d: IndicatorDimensionAverages) =>
+                                                (d?.profit_entry_count ?? 0) + (d?.profit_exit_count ?? 0) + (d?.loss_entry_count ?? 0) + (d?.loss_exit_count ?? 0) > 0
+
+                                            // Debug: 核对后端返回的字段名与中位数（浏览器控制台）
+                                            if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+                                                console.log('Indicator Data:', indicatorAnalysis)
+                                            }
+
+                                            // 单行：Avg | Med 数值 + 下方横向柱状图，进度条上可选白线标中位数位置
+                                            const BarRow = ({
+                                                avgValue,
+                                                medianValue,
+                                                unit,
+                                                isWin,
+                                                barPct,
+                                                medianBarPct,
+                                                biasSuffix,
+                                            }: {
+                                                avgValue: number | undefined
+                                                medianValue: number | undefined
+                                                unit: string
+                                                isWin: boolean
+                                                barPct: number
+                                                medianBarPct: number
+                                                biasSuffix?: string
+                                            }) => {
+                                                const hasVal = avgValue != null && !Number.isNaN(avgValue)
+                                                // 中位数：包括 0（如 MACD 刚好为 0）也要显示 Med: 0.00
+                                                const hasMed = typeof medianValue === 'number' && Number.isFinite(medianValue)
+                                                const safeBarPct = Number.isFinite(barPct) ? Math.min(100, Math.max(0, barPct)) : 0
+                                                const safeMedPct = Number.isFinite(medianBarPct) ? Math.min(100, Math.max(0, medianBarPct)) : NaN
+                                                const showMedLine = hasMed && !Number.isNaN(safeMedPct) && safeMedPct >= 0 && safeMedPct <= 100
+                                                return (
+                                                    <div className="min-w-0">
+                                                        <div className="font-mono text-lg font-bold flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-1.5" style={{ color: '#EAECEF' }}>
+                                                            {hasVal ? (
+                                                                <>
+                                                                    <span>Avg: {avgValue!.toFixed(2)}{unit && <span className="text-sm opacity-60">{unit}</span>}</span>
+                                                                    {hasMed && (
+                                                                        <span className="text-sm text-white/40 font-normal">Med: {medianValue!.toFixed(2)}{unit && <span className="opacity-60">{unit}</span>}</span>
+                                                                    )}
+                                                                    {biasSuffix && <span className="text-[10px]" style={{ color: isWin ? '#00ffad' : '#ff3b30', opacity: 0.9 }}>{biasSuffix}</span>}
+                                                                </>
+                                                            ) : (
+                                                                <span className="opacity-60">–</span>
+                                                            )}
+                                                        </div>
+                                                        <div className="h-2 w-full rounded-full overflow-hidden bg-white/10 relative">
+                                                            {hasVal && safeBarPct > 0 ? (
+                                                                <>
+                                                                    <div
+                                                                        className="h-full rounded-full transition-all duration-300 absolute inset-y-0 left-0"
+                                                                        style={{
+                                                                            width: `${safeBarPct}%`,
+                                                                            backgroundColor: isWin ? 'rgba(0, 255, 173, 0.4)' : 'rgba(255, 59, 48, 0.4)',
+                                                                        }}
+                                                                    />
+                                                                    {showMedLine && (
+                                                                        <div
+                                                                            className="absolute top-0 bottom-0 w-0.5 bg-white/70 rounded-full pointer-events-none"
+                                                                            style={{ left: `${safeMedPct}%`, transform: 'translateX(-50%)' }}
+                                                                            title={`Median: ${medianValue!.toFixed(2)}`}
+                                                                        />
+                                                                    )}
+                                                                </>
+                                                            ) : (
+                                                                <div className="h-full w-full rounded-full border border-dashed border-[#2B3139]/80 bg-transparent absolute inset-0" style={{ boxSizing: 'border-box' }} />
+                                                            )}
+                                                        </div>
+                                                    </div>
+                                                )
+                                            }
+
+                                            return (
+                                                <div key={indicatorSideFilter} className="grid grid-cols-1 gap-4 animate-fade-in w-full">
+                                                    {config
+                                                        .filter((item) => {
+                                                            const d = indicators[item.key]
+                                                            return d && hasAny(d)
+                                                        })
+                                                        .map((row) => {
+                                                            const data = indicators[row.key]!
+                                                            const entryWin = data.profit_entry_count > 0 ? data.profit_entry_avg : undefined
+                                                            const entryWinMed = data.profit_entry_count > 0 ? data.profit_entry_median : undefined
+                                                            const entryLoss = data.loss_entry_count > 0 ? data.loss_entry_avg : undefined
+                                                            const entryLossMed = data.loss_entry_count > 0 ? data.loss_entry_median : undefined
+                                                            const exitWin = data.profit_exit_count > 0 ? data.profit_exit_avg : undefined
+                                                            const exitWinMed = data.profit_exit_count > 0 ? data.profit_exit_median : undefined
+                                                            const exitLoss = data.loss_exit_count > 0 ? data.loss_exit_avg : undefined
+                                                            const exitLossMed = data.loss_exit_count > 0 ? data.loss_exit_median : undefined
+                                                            const allVals = [entryWin, entryLoss, exitWin, exitLoss].filter((v): v is number => v != null && !Number.isNaN(v))
+                                                            // 进度条比例：左对齐 0 起。Bias/EMABias/MACD 用正负区间映射；VolMult 上限 max(5, 样本最大)
+                                                            let getBarPct: (val: number | undefined) => number
+                                                            if (row.signed) {
+                                                                const min = allVals.length ? Math.min(...allVals, -1.5) : -1.5
+                                                                const max = allVals.length ? Math.max(...allVals, 1.5) : 1.5
+                                                                const range = max - min || 1
+                                                                getBarPct = (val) => (val == null || Number.isNaN(val) ? 0 : ((val - min) / range) * 100)
+                                                            } else if (row.volMult) {
+                                                                const cap = allVals.length ? Math.max(5, ...allVals) : 5
+                                                                getBarPct = (val) => (val == null || Number.isNaN(val) ? 0 : (Math.max(0, val) / cap) * 100)
+                                                            } else {
+                                                                const cap = allVals.length ? Math.max(1, ...allVals) : 1
+                                                                getBarPct = (val) => (val == null || Number.isNaN(val) ? 0 : (Math.max(0, val) / cap) * 100)
+                                                            }
+
+                                                            const entryWinPct = getBarPct(entryWin)
+                                                            const entryWinMedPct = getBarPct(entryWinMed)
+                                                            const entryLossPct = getBarPct(entryLoss)
+                                                            const entryLossMedPct = getBarPct(entryLossMed)
+                                                            const exitWinPct = getBarPct(exitWin)
+                                                            const exitWinMedPct = getBarPct(exitWinMed)
+                                                            const exitLossPct = getBarPct(exitLoss)
+                                                            const exitLossMedPct = getBarPct(exitLossMed)
+
+                                                            return (
+                                                                <div
+                                                                    key={row.key}
+                                                                    className="rounded-xl p-5 border transition-all duration-200 bg-[#161A1E] border-[#2B3139] w-full grid grid-cols-1 md:grid-cols-[1fr_2fr_2fr] gap-5 md:gap-6 items-stretch min-w-0"
+                                                                >
+                                                                    {/* 标题区：指标名+周期 text-base，居中 */}
+                                                                    <div className="flex items-center justify-center md:justify-center text-center">
+                                                                        <span className="text-base font-medium" style={{ color: '#848E9C' }}>
+                                                                            {row.label}
+                                                                        </span>
+                                                                    </div>
+                                                                    {/* 开仓区：盈利上、亏损下，各带横向柱状图 */}
+                                                                    <div className="min-w-0 flex flex-col gap-5">
+                                                                        <div className="text-xs mb-0.5" style={{ color: '#848E9C' }}>
+                                                                            {language === 'zh' ? '开仓' : 'Entry'}
+                                                                        </div>
+                                                                        <BarRow avgValue={entryWin} medianValue={entryWinMed} unit={row.unit} isWin={true} barPct={entryWinPct} medianBarPct={entryWinMedPct} biasSuffix={row.key === 'bias' ? formatBiasSuffix(entryWin) : undefined} />
+                                                                        <BarRow avgValue={entryLoss} medianValue={entryLossMed} unit={row.unit} isWin={false} barPct={entryLossPct} medianBarPct={entryLossMedPct} biasSuffix={row.key === 'bias' ? formatBiasSuffix(entryLoss) : undefined} />
+                                                                    </div>
+                                                                    {/* 平仓区：盈利上、亏损下，各带横向柱状图 */}
+                                                                    <div className="min-w-0 flex flex-col gap-5">
+                                                                        <div className="text-xs mb-0.5" style={{ color: '#848E9C' }}>
+                                                                            {language === 'zh' ? '平仓' : 'Exit'}
+                                                                        </div>
+                                                                        <BarRow avgValue={exitWin} medianValue={exitWinMed} unit={row.unit} isWin={true} barPct={exitWinPct} medianBarPct={exitWinMedPct} biasSuffix={row.key === 'bias' ? formatBiasSuffix(exitWin) : undefined} />
+                                                                        <BarRow avgValue={exitLoss} medianValue={exitLossMed} unit={row.unit} isWin={false} barPct={exitLossPct} medianBarPct={exitLossMedPct} biasSuffix={row.key === 'bias' ? formatBiasSuffix(exitLoss) : undefined} />
+                                                                    </div>
+                                                                </div>
+                                                            )
+                                                        })}
+                                                </div>
+                                            )
+                                        })()}
+                                        <div className="mt-3 text-[10px] text-nofx-text-muted">
+                                            {language === 'zh'
+                                                ? `样本笔数：${indicatorAnalysis.trade_count}（仅统计已有足够历史 K 线的交易）`
+                                                : `Sample trades: ${indicatorAnalysis.trade_count} (only trades with sufficient kline history are included).`}
+                                        </div>
+                                    </>
+                                )}
+                                {!indicatorLoading && !indicatorError && (!indicatorAnalysis || indicatorAnalysis.trade_count === 0) && (
+                                    <div className="text-xs text-nofx-text-muted">
+                                        {language === 'zh'
+                                            ? '暂无可用的历史平仓交易用于指标分析。'
+                                            : 'No sufficient closed trades available for indicator analysis yet.'}
+                                    </div>
+                                )}
+                            </div>
                         </div>
-                        <PositionHistory traderId={selectedTraderId} />
+
+                        {/* Position History Panel — full width below indicator */}
+                        <div className="nofx-glass p-6 w-full">
+                            <div className="flex items-center justify-between mb-5">
+                                <h2 className="text-xl font-bold flex items-center gap-2 text-nofx-text-main">
+                                    <span className="text-2xl">📜</span>
+                                    {t('positionHistory.title', language)}
+                                </h2>
+                            </div>
+                            <PositionHistory traderId={selectedTraderId} />
+                        </div>
                     </div>
                 )}
             </div>

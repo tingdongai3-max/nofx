@@ -994,6 +994,7 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	var sb strings.Builder
 	riskControl := e.config.RiskControl
 	promptSections := e.config.PromptSections
+	enableAIClose := riskControl.EnableAIClose
 
 	// 0. Data Dictionary & Schema (ensure AI understands all fields)
 	lang := e.GetLanguage()
@@ -1089,13 +1090,23 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 		sb.WriteString("3. Write chain of thought first, then output structured JSON\n\n")
 	}
 
-	// 7. Output format
+	// 7. Output format & critical system rules
 	sb.WriteString("# SYSTEM OVERRIDE (Action Configuration)\n\n")
-	sb.WriteString("You MAY close positions manually. Allowed actions: `close_long`, `close_short` (full or partial), or `hold`/`wait` with TP/SL updates.\n\n")
-	sb.WriteString("## CLOSE & REDUCE POSITION (平仓与减仓)\n\n")
-	sb.WriteString("- **Full close**: Use `close_long` or `close_short` with no `quantity` (or quantity=0) to close the entire position.\n")
-	sb.WriteString("- **Partial close / 分批止盈**: Use `close_long` or `close_short` with `quantity` set to the amount (in base asset, e.g. BTC amount) you want to close. Example: position 0.5 BTC, take profit 50% → output `{\"action\": \"close_long\", \"symbol\": \"BTCUSDT\", \"quantity\": 0.25}`. You can close in multiple steps (e.g. 1/3 at first target, 1/3 at second, rest at trailing).\n")
-	sb.WriteString("- When in doubt, you can still use only TP/SL orders and `hold`/`wait` to move them; closing is optional.\n\n")
+	if enableAIClose {
+		// Hybrid guardrail: AI may actively close positions, but still must respect watchdog/ATR rules.
+		sb.WriteString("## CRITICAL_SYSTEM_RULES — Hybrid Guardrail Mode (混合护盘架构)\n\n")
+		sb.WriteString("You MAY close positions manually. Allowed actions: `close_long`, `close_short` (full or partial), or `hold`/`wait` with TP/SL / ATR updates. Use closes for **professional scaling-out / risk reduction**, not for emotional over-trading.\n\n")
+		sb.WriteString("## CLOSE & REDUCE POSITION (平仓与减仓)\n\n")
+		sb.WriteString("- **Full close**: Use `close_long` or `close_short` with no `quantity` (or quantity=0) to close the entire position.\n")
+		sb.WriteString("- **Partial close / 分批止盈**: Use `close_long` or `close_short` with `quantity` set to the amount (in base asset, e.g. BTC amount) you want to close. Example: position 0.5 BTC, take profit 50% → output `{\"action\": \"close_long\", \"symbol\": \"BTCUSDT\", \"quantity\": 0.25}`. You can close in multiple steps (e.g. 1/3 at first target, 1/3 at second, rest at trailing).\n")
+		sb.WriteString("- When in doubt, you can still use only TP/SL orders and `hold`/`wait` to move them; closing is optional.\n\n")
+	} else {
+		// Fully automated kill-switch: AI has no permission to close; backend watchdog/ATR owns all exits.
+		sb.WriteString("## CRITICAL_SYSTEM_RULES — Automated Kill-Switch Mode (物理断头台 / 全自动护盘)\n\n")
+		sb.WriteString("- **System Notice**: Your manual close permission has been REVOKED at the engine level. You are an **entry decision engine only**.\n")
+		sb.WriteString("- **DO NOT** output `close_long` or `close_short` under any circumstances. Any such actions will be ignored by the backend.\n")
+		sb.WriteString("- Position exits (take profit / stop loss / emergency kill) are fully managed by the backend watchdog / ATR auto-cruise system. You focus on selecting high-quality entries and updating TP/SL parameters via `hold` / `wait` only.\n\n")
+	}
 	sb.WriteString("## TRAILING_STOP_PROTOCOL (Take Profit Iron Rule)\n\n")
 	sb.WriteString("When moving a trailing stop (action `hold` or `wait` with a new `stop_loss`): You may update ONLY the stop loss. Do NOT automatically move take_profit up together with the trailing stop. The initial risk-reward ratio applies only to **opening** positions; when trailing, the existing take_profit remains unchanged unless you explicitly output a new `take_profit` value. To update only the stop: set `take_profit` to 0 or omit it — the system will then leave the current TP order intact and only modify the SL order.\n\n")
 	sb.WriteString("# Output Format (Strictly Follow)\n\n")
@@ -1126,7 +1137,12 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	sb.WriteString("]\n```\n")
 	sb.WriteString("</decision>\n\n")
 	sb.WriteString("## Field Description\n\n")
-	sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
+	if enableAIClose {
+		sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
+	} else {
+		sb.WriteString("- `action`: open_long | open_short | hold | wait\n")
+		sb.WriteString("- **You MUST NOT** output `close_long` or `close_short`; closing is handled by the backend watchdog / ATR engine. Any close_* actions will be discarded.\n")
+	}
 	sb.WriteString(fmt.Sprintf("- `confidence`: 0-100 (opening recommended ≥ %d)\n", riskControl.MinConfidence))
 	if e.config.Indicators.EnableATRTrailing {
 		sb.WriteString("- **ATR trailing is ON**: Set `atr_sl_mult`, `atr_tp_mult`, and/or `atr_tp_stages` (max 3) for the watchdog to monitor and trigger. You may **also** set `stop_loss` and/or `take_profit`/`take_profit_stages` to place **exchange fixed orders** (e.g. hard stop or backup TP); ATR and exchange orders are **not mutually exclusive**.\n")
@@ -1135,8 +1151,10 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 		sb.WriteString("- Required when opening: leverage, position_size_usd (use max from **This period** section; example shows 5000 as placeholder), stop_loss, **either** take_profit **or** take_profit_stages, confidence, risk_usd\n")
 		sb.WriteString("- Static multi-stage TP (分批挂单止盈，非 ATR): use `take_profit_stages` = [{\"price\": x, \"close_pct\": y}, ...], prices strictly increasing for long positions and strictly decreasing for short positions; total close_pct ≤ 100 (percent of current position size).\n")
 	}
-	sb.WriteString("- When close_long/close_short: you have **full permission** to close or reduce positions. Use optional `quantity` (base asset amount) or `quantity_pct` (0~1, e.g. 0.4 = close 40%% of current position). Omit both or 0 = close all; set `quantity` = partial close by amount, or `quantity_pct` = partial close by ratio (减仓/分批止盈).\n")
-	sb.WriteString("- When hold/wait to update TP/SL: use `stop_loss` and/or `take_profit` / `take_profit_stages`. If you only want to update the stop (trailing stop), set `take_profit` and `take_profit_stages` to 0/empty or omit them — the system will keep the existing TP orders and only update SL.\n")
+	if enableAIClose {
+		sb.WriteString("- When close_long/close_short: you have **full permission** to close or reduce positions. Use optional `quantity` (base asset amount) or `quantity_pct` (0~1, e.g. 0.4 = close 40%% of current position). Omit both or 0 = close all; set `quantity` = partial close by amount, or `quantity_pct` = partial close by ratio (减仓/分批止盈).\n")
+	}
+	sb.WriteString("- When hold/wait to update TP/SL or ATR: use `stop_loss` and/or `take_profit` / `take_profit_stages` and/or ATR fields. If you only want to update the stop (trailing stop), set `take_profit` and `take_profit_stages` to 0/empty or omit them — the system will keep the existing TP orders and only update SL.\n")
 	if e.config.Indicators.EnableATRTrailing {
 		sb.WriteString("- When hold/wait with ATR trailing: you may update `atr_sl_mult`, `atr_tp_mult`, or `atr_tp_stages`; you may also set `stop_loss`/`take_profit`/`take_profit_stages` to update exchange fixed orders (both can coexist).\n")
 	}

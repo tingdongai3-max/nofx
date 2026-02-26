@@ -282,6 +282,7 @@ func (t *BybitTrader) SyncOrdersFromBybit(traderID string, exchangeID string, ex
 			symbol, positionSide, trade.OrderAction,
 			trade.ExecQty, trade.ExecPrice, trade.ExecFee, trade.ClosedPnL,
 			execTimeMs, trade.ExecID,
+			0, 0,
 		); err != nil {
 			logger.Infof("  ⚠️ Failed to sync position for trade %s: %v", trade.ExecID, err)
 		} else {

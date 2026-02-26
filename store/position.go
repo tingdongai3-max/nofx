@@ -95,6 +95,8 @@ type TraderPosition struct {
 	ExitTime           int64   `gorm:"column:exit_time;index:idx_positions_exit" json:"exit_time"` // Unix milliseconds UTC, 0 means not set
 	RealizedPnL        float64 `gorm:"column:realized_pnl;default:0" json:"realized_pnl"`
 	Fee                float64 `gorm:"column:fee;default:0" json:"fee"`
+	MaxFavorableExcursion  float64 `gorm:"column:max_favorable_excursion;default:0" json:"max_favorable_excursion"` // MFE 最大浮盈 (USD)
+	MaxAdverseExcursion    float64 `gorm:"column:max_adverse_excursion;default:0" json:"max_adverse_excursion"`     // MAE 最大浮亏 (USD)
 	Leverage           int     `gorm:"column:leverage;default:1" json:"leverage"`
 	Status             string  `gorm:"column:status;default:OPEN;index:idx_positions_status" json:"status"`
 	CloseReason        string  `gorm:"column:close_reason;default:''" json:"close_reason"`
@@ -248,16 +250,18 @@ func (s *PositionStore) ReducePositionQuantity(id int64, reduceQty float64, exit
 	// Check if position should be fully closed (quantity reduced to ~0)
 	const QUANTITY_TOLERANCE = 0.0001
 	if newQty <= QUANTITY_TOLERANCE {
-		// Auto-close: set status to CLOSED
+		// Auto-close: set status to CLOSED (MFE/MAE not tracked for partial-close path)
 		return s.db.Model(&TraderPosition{}).Where("id = ?", id).Updates(map[string]interface{}{
-			"quantity":     0,
-			"fee":          newFee,
-			"exit_price":   newExitPrice,
-			"realized_pnl": newPnL,
-			"status":       "CLOSED",
-			"exit_time":    nowMs,
-			"close_reason": "sync",
-			"updated_at":   nowMs,
+			"quantity":                  0,
+			"fee":                       newFee,
+			"exit_price":                newExitPrice,
+			"realized_pnl":              newPnL,
+			"status":                    "CLOSED",
+			"exit_time":                 nowMs,
+			"close_reason":              "sync",
+			"max_favorable_excursion":   0,
+			"max_adverse_excursion":    0,
+			"updated_at":                nowMs,
 		}).Error
 	}
 
@@ -281,8 +285,8 @@ func (s *PositionStore) UpdatePositionExchangeInfo(id int64, exchangeID, exchang
 }
 
 // ClosePositionFully marks position as fully closed
-// exitTimeMs is Unix milliseconds UTC
-func (s *PositionStore) ClosePositionFully(id int64, exitPrice float64, exitOrderID string, exitTimeMs int64, totalRealizedPnL float64, totalFee float64, closeReason string) error {
+// exitTimeMs is Unix milliseconds UTC; mfe/mae are Max Favorable / Max Adverse Excursion in USD
+func (s *PositionStore) ClosePositionFully(id int64, exitPrice float64, exitOrderID string, exitTimeMs int64, totalRealizedPnL float64, totalFee float64, closeReason string, mfe, mae float64) error {
 	var pos TraderPosition
 	if err := s.db.First(&pos, id).Error; err != nil {
 		return fmt.Errorf("failed to get position: %w", err)
@@ -293,7 +297,7 @@ func (s *PositionStore) ClosePositionFully(id int64, exitPrice float64, exitOrde
 		quantity = pos.EntryQuantity
 	}
 
-	return s.db.Model(&TraderPosition{}).Where("id = ?", id).Updates(map[string]interface{}{
+	upd := map[string]interface{}{
 		"quantity":       quantity,
 		"exit_price":     exitPrice,
 		"exit_order_id":  exitOrderID,
@@ -303,7 +307,10 @@ func (s *PositionStore) ClosePositionFully(id int64, exitPrice float64, exitOrde
 		"status":         "CLOSED",
 		"close_reason":   closeReason,
 		"updated_at":     time.Now().UTC().UnixMilli(),
-	}).Error
+	}
+	upd["max_favorable_excursion"] = mfe
+	upd["max_adverse_excursion"] = mae
+	return s.db.Model(&TraderPosition{}).Where("id = ?", id).Updates(upd).Error
 }
 
 // DeleteAllOpenPositions deletes all OPEN positions for a trader

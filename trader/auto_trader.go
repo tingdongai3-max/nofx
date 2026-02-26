@@ -1114,14 +1114,25 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 
 // executeDecisionWithRecord executes AI decision and records detailed information
 func (at *AutoTrader) executeDecisionWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction) error {
+	// Global guardrail: whether AI is allowed to issue manual close actions.
+	enableAIClose := at.config.StrategyConfig != nil && at.config.StrategyConfig.RiskControl.EnableAIClose
+
 	switch decision.Action {
 	case "open_long":
 		return at.executeOpenLongWithRecord(decision, actionRecord)
 	case "open_short":
 		return at.executeOpenShortWithRecord(decision, actionRecord)
 	case "close_long":
+		if !enableAIClose {
+			logger.Infof("  ⛔ [RISK CONTROL] AI close_long blocked by config (enable_ai_close=false); ignoring action")
+			return nil
+		}
 		return at.executeCloseLongWithRecord(decision, actionRecord)
 	case "close_short":
+		if !enableAIClose {
+			logger.Infof("  ⛔ [RISK CONTROL] AI close_short blocked by config (enable_ai_close=false); ignoring action")
+			return nil
+		}
 		return at.executeCloseShortWithRecord(decision, actionRecord)
 	case "hold", "wait":
 		// 动态止盈止损：若已有持仓且 AI 给出新 TP/SL / take_profit_stages 或 ATR 倍数，先撤旧单再挂新单（或仅更新 ATR 状态）
@@ -2703,16 +2714,23 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 		}
 
 	case "close_long", "close_short":
-		// Close position using PositionBuilder for consistent handling
-		// PositionBuilder will handle both cases:
-		// 1. If open position exists: close it properly
-		// 2. If no open position (e.g., table cleared): create a closed position record
+		// Compute MFE (Max Favorable Excursion) from peak PnL cache before closing
+		var mfe, mae float64
+		if openPos, err := at.store.Position().GetOpenPositionBySymbol(at.id, symbol, side); err == nil && openPos != nil {
+			peakCache := at.GetPeakPnLCache()
+			posKey := symbol + "_" + side
+			if peakPct, ok := peakCache[posKey]; ok && peakPct > 0 {
+				notional := openPos.EntryPrice * openPos.Quantity
+				mfe = notional * (peakPct / 100)
+			}
+		}
 		posBuilder := store.NewPositionBuilder(at.store.Position())
 		if err := posBuilder.ProcessTrade(
 			at.id, at.exchangeID, at.exchange,
 			symbol, side, action,
 			quantity, price, fee, 0, // realizedPnL will be calculated
 			time.Now().UTC().UnixMilli(), orderID,
+			mfe, mae,
 		); err != nil {
 			logger.Infof("  ⚠️ Failed to process close position: %v", err)
 		} else {

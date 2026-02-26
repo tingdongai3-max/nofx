@@ -76,4 +76,7 @@ func get(ctx context.Context, path string, paramsMap map[string]string) (string,
 
 var client = &http.Client{
 	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		Proxy: nil, // Disable environment proxies for CoinAnk Kline API
+	},
 }

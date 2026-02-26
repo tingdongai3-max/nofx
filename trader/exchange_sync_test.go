@@ -143,6 +143,7 @@ func runStandardTests(t *testing.T, exchangeName string) {
 					trade.Quantity, trade.Price, trade.Fee, trade.RealizedPnL,
 					time.Now().Add(time.Duration(i)*time.Second).UnixMilli(),
 					"",
+					0, 0,
 				)
 				if err != nil {
 					t.Fatalf("Failed to process trade %d (%s): %v", i, trade.Action, err)
@@ -229,6 +230,7 @@ func TestPositionAccumulationBug(t *testing.T) {
 			0.1, 3500+float64(i*10), 0.5, 0,
 			time.Now().Add(time.Duration(i*2)*time.Second).UnixMilli(),
 			"",
+			0, 0,
 		)
 		if err != nil {
 			t.Fatalf("Failed to open long %d: %v", i, err)
@@ -241,6 +243,7 @@ func TestPositionAccumulationBug(t *testing.T) {
 			0.1, 3600+float64(i*10), 0.5, 10,
 			time.Now().Add(time.Duration(i*2+1)*time.Second).UnixMilli(),
 			"",
+			0, 0,
 		)
 		if err != nil {
 			t.Fatalf("Failed to close long %d: %v", i, err)
@@ -311,6 +314,7 @@ func TestQuantityPrecision(t *testing.T) {
 		0.01, 50000, 1.0, 0,
 		time.Now().UnixMilli(),
 		"",
+		0, 0,
 	)
 	if err != nil {
 		t.Fatalf("Failed to open: %v", err)
@@ -324,6 +328,7 @@ func TestQuantityPrecision(t *testing.T) {
 		0.00999999, 51000, 1.0, 10,
 		time.Now().Add(time.Second).UnixMilli(),
 		"",
+		0, 0,
 	)
 	if err != nil {
 		t.Fatalf("Failed to close: %v", err)

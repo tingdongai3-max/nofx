@@ -11,14 +11,16 @@ import (
 	"time"
 )
 
-const (
-	baseURL = "https://fapi.binance.com"
-)
+const defaultMarketBaseURL = "https://fapi.binance.com"
 
 type APIClient struct {
-	client *http.Client
+	client  *http.Client
+	baseURL string
 }
 
+// NewAPIClient creates a new API client with default configuration.
+// The underlying *http.Client can be overridden by hooks (e.g. CoinAnk, proxy, etc.)
+// so that all market data requests automatically respect user's data provider settings.
 func NewAPIClient() *APIClient {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
@@ -31,12 +33,29 @@ func NewAPIClient() *APIClient {
 	}
 
 	return &APIClient{
-		client: client,
+		client:  client,
+		baseURL: defaultMarketBaseURL,
 	}
 }
 
+// GetBaseURL returns the current market data base URL (e.g. Binance or CoinAnk proxy).
+// Used by GetKlinesRange and other callers so requests can go through configured provider.
+func (c *APIClient) GetBaseURL() string {
+	if c.baseURL != "" {
+		return c.baseURL
+	}
+	return defaultMarketBaseURL
+}
+
+// GetAPIClient is a convenience alias that returns a new APIClient.
+// Prefer using this in other packages when fetching market data so that
+// all K-line requests go through the unified, hook-aware HTTP client.
+func GetAPIClient() *APIClient {
+	return NewAPIClient()
+}
+
 func (c *APIClient) GetExchangeInfo() (*ExchangeInfo, error) {
-	url := fmt.Sprintf("%s/fapi/v1/exchangeInfo", baseURL)
+	url := fmt.Sprintf("%s/fapi/v1/exchangeInfo", c.GetBaseURL())
 	resp, err := c.client.Get(url)
 	if err != nil {
 		return nil, err
@@ -57,7 +76,7 @@ func (c *APIClient) GetExchangeInfo() (*ExchangeInfo, error) {
 }
 
 func (c *APIClient) GetKlines(symbol, interval string, limit int) ([]Kline, error) {
-	url := fmt.Sprintf("%s/fapi/v1/klines", baseURL)
+	url := fmt.Sprintf("%s/fapi/v1/klines", c.GetBaseURL())
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -124,7 +143,7 @@ func parseKline(kr KlineResponse) (Kline, error) {
 }
 
 func (c *APIClient) GetCurrentPrice(symbol string) (float64, error) {
-	url := fmt.Sprintf("%s/fapi/v1/ticker/price", baseURL)
+	url := fmt.Sprintf("%s/fapi/v1/ticker/price", c.GetBaseURL())
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return 0, err

@@ -127,6 +127,7 @@ func (t *AsterTrader) SyncOrdersFromAster(traderID string, exchangeID string, ex
 			symbol, positionSide, orderAction,
 			trade.Quantity, trade.Price, trade.Fee, trade.RealizedPnL,
 			tradeTimeMs, trade.TradeID,
+			0, 0,
 		); err != nil {
 			logger.Infof("  ⚠️ Failed to sync position for trade %s: %v", trade.TradeID, err)
 		} else {

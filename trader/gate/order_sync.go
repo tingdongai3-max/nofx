@@ -202,6 +202,7 @@ func (t *GateTrader) SyncOrdersFromGate(traderID string, exchangeID string, exch
 					symbol, positionSide, trade.OrderAction,
 					trade.FillQty, trade.FillPrice, trade.Fee, trade.ProfitLoss,
 					execTimeMs, trade.TradeID,
+					0, 0,
 				); err != nil {
 					logger.Infof("  ⚠️ Retry position update for existing trade %s failed: %v", trade.TradeID, err)
 				}
@@ -274,6 +275,7 @@ func (t *GateTrader) SyncOrdersFromGate(traderID string, exchangeID string, exch
 				symbol, positionSide, trade.OrderAction,
 				trade.FillQty, trade.FillPrice, trade.Fee, trade.ProfitLoss,
 				execTimeMs, trade.TradeID,
+				0, 0,
 			); err != nil {
 				logger.Infof("  ⚠️ Failed to sync position for trade %s: %v", trade.TradeID, err)
 			} else {

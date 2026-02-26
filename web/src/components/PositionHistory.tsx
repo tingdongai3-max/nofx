@@ -313,6 +313,20 @@ function PositionRow({ position }: { position: HistoricalPosition }) {
         </div>
       </td>
 
+      {/* Max Profit (MFE) */}
+      <td className="py-3 px-4 text-right font-mono text-sm" style={{ color: 'rgba(0, 255, 173, 0.8)' }}>
+        {position.max_favorable_excursion != null && position.max_favorable_excursion > 0
+          ? `+${formatNumber(position.max_favorable_excursion)}`
+          : '–'}
+      </td>
+
+      {/* Max Loss (MAE) */}
+      <td className="py-3 px-4 text-right font-mono text-sm" style={{ color: 'rgba(255, 59, 48, 0.8)' }}>
+        {position.max_adverse_excursion != null && position.max_adverse_excursion < 0
+          ? formatNumber(position.max_adverse_excursion)
+          : '–'}
+      </td>
+
       {/* Fee - show more precision for small fees */}
       <td className="py-3 px-4 text-right font-mono text-xs" style={{ color: '#848E9C' }}>
         -{((position.fee || 0) < 0.01 && (position.fee || 0) > 0)
@@ -773,6 +787,18 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
                   style={{ color: '#848E9C' }}
                 >
                   {t('positionHistory.pnl', language)}
+                </th>
+                <th
+                  className="py-3 px-4 text-right text-xs font-semibold uppercase tracking-wider"
+                  style={{ color: '#848E9C' }}
+                >
+                  {t('positionHistory.maxProfit', language)}
+                </th>
+                <th
+                  className="py-3 px-4 text-right text-xs font-semibold uppercase tracking-wider"
+                  style={{ color: '#848E9C' }}
+                >
+                  {t('positionHistory.maxLoss', language)}
                 </th>
                 <th
                   className="py-3 px-4 text-right text-xs font-semibold uppercase tracking-wider"

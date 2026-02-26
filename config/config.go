@@ -45,6 +45,10 @@ type Config struct {
 	AlpacaAPIKey    string // Alpaca API key for US stocks
 	AlpacaSecretKey string // Alpaca secret key
 	TwelveDataKey   string // TwelveData API key for forex & metals
+
+	// MarketSource controls where historical K-lines are fetched from.
+	// Supported: "coinank" (default), "binance".
+	MarketSource string
 }
 
 // Init initializes global configuration (from .env)
@@ -110,6 +114,13 @@ func Init() {
 	cfg.AlpacaAPIKey = os.Getenv("ALPACA_API_KEY")
 	cfg.AlpacaSecretKey = os.Getenv("ALPACA_SECRET_KEY")
 	cfg.TwelveDataKey = os.Getenv("TWELVEDATA_API_KEY")
+
+	// Market source selection (default coinank; override via MARKET_SOURCE)
+	if v := os.Getenv("MARKET_SOURCE"); v != "" {
+		cfg.MarketSource = strings.ToLower(strings.TrimSpace(v))
+	} else {
+		cfg.MarketSource = "coinank"
+	}
 
 	// Database configuration
 	// Railway provides DATABASE_URL; when set, use PostgreSQL

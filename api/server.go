@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"nofx/auth"
@@ -30,6 +31,7 @@ import (
 	"nofx/trader/lighter"
 	"nofx/trader/okx"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,7 +44,7 @@ import (
 const accountPositionsCacheTTL = 5 * time.Second
 
 type ttlCacheEntry struct {
-	Body []byte
+	Body  []byte
 	Until time.Time
 }
 
@@ -232,6 +234,7 @@ func (s *Server) setupRoutes() {
 			protected.GET("/decisions/latest", s.handleLatestDecisions)
 			protected.GET("/decisions/export", s.handleDecisionsExport)
 			protected.GET("/statistics", s.handleStatistics)
+			protected.GET("/statistics/indicator-analysis", s.handleIndicatorAnalysis)
 
 			// Backtest routes
 			backtest := protected.Group("/backtest")
@@ -540,9 +543,9 @@ type SafeExchangeConfig struct {
 	ExchangeType          string `json:"exchange_type"` // "binance", "bybit", "okx", "hyperliquid", "aster", "lighter"
 	AccountName           string `json:"account_name"`  // User-defined account name
 	Name                  string `json:"name"`          // Display name
-	Type                  string `json:"type"`         // "cex" or "dex"
+	Type                  string `json:"type"`          // "cex" or "dex"
 	Enabled               bool   `json:"enabled"`
-	Testnet               bool   `json:"testnet"`       // 必须返回，前端依赖此字段显示/回填模拟盘勾选
+	Testnet               bool   `json:"testnet"`               // 必须返回，前端依赖此字段显示/回填模拟盘勾选
 	HyperliquidWalletAddr string `json:"hyperliquidWalletAddr"` // Hyperliquid wallet address (not sensitive)
 	AsterUser             string `json:"asterUser"`             // Aster username (not sensitive)
 	AsterSigner           string `json:"asterSigner"`           // Aster signer (not sensitive)
@@ -2177,10 +2180,10 @@ func (s *Server) handleAccount(c *gin.Context) {
 		"available_balance": availableBalance,
 		"total_pnl":         totalPnL,
 		"total_pnl_pct":     totalPnLPct,
-		"initial_balance":  initialBalance,
+		"initial_balance":   initialBalance,
 		"daily_pnl":         0.0,
 		"position_count":    len(positions),
-		"margin_used":      totalMarginUsed,
+		"margin_used":       totalMarginUsed,
 		"margin_used_pct":   marginUsedPct,
 	}
 	logger.Infof("✓ Returning account info [%s]: equity=%.2f, available=%.2f, pnl=%.2f (%.2f%%)",
@@ -2995,7 +2998,10 @@ func (s *Server) handleDecisionsExport(c *gin.Context) {
 			SafeBadRequest(c, "Either period or both from and to (ISO8601/YYYY-MM-DD) are required")
 			return
 		}
-		for _, pair := range []struct{ s *string; t *time.Time }{
+		for _, pair := range []struct {
+			s *string
+			t *time.Time
+		}{
 			{&fromStr, &fromTime},
 			{&toStr, &toTime},
 		} {
@@ -3075,6 +3081,438 @@ func (s *Server) handleStatistics(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, stats)
+}
+
+// handleIndicatorAnalysis performs historical indicator attribution analysis for a trader's closed positions.
+// It groups trades into winners (RealizedPnL > 0) and losers (<= 0), then computes average indicator values
+// at entry and exit timestamps for both groups.
+//
+// Query parameters:
+// - trader_id   (required, via getTraderFromQuery)
+// - timeframe   (optional, default "5m")
+// - rsi_period  (optional, default 14)
+// - ema_period  (optional, default 20)
+// - start_time  (optional, RFC3339 or YYYY-MM-DD; if omitted, uses earliest entry_time)
+// - end_time    (optional, RFC3339 or YYYY-MM-DD; if omitted, uses latest exit_time)
+// - limit       (optional, default 500; max closed positions to consider)
+func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
+	_, traderID, err := s.getTraderFromQuery(c)
+	if err != nil {
+		SafeBadRequest(c, "Invalid trader ID")
+		return
+	}
+
+	trader, err := s.traderManager.GetTrader(traderID)
+	if err != nil {
+		SafeNotFound(c, "Trader")
+		return
+	}
+
+	tf := c.DefaultQuery("timeframe", "5m")
+	normTF, err := market.NormalizeTimeframe(tf)
+	if err != nil {
+		SafeBadRequest(c, fmt.Sprintf("Invalid timeframe: %v", err))
+		return
+	}
+
+	// Log which market source is used for indicator analysis
+	cfg := config.Get()
+	source := cfg.MarketSource
+	if source == "" {
+		source = "coinank"
+	}
+	logger.Infof("📊 Indicator Analysis using MarketSource=%s timeframe=%s trader=%s", source, normTF, traderID)
+
+	rsiPeriod := 14
+	if v := c.DefaultQuery("rsi_period", "14"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
+			rsiPeriod = n
+		}
+	}
+	emaPeriod := 20
+	if v := c.DefaultQuery("ema_period", "20"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 300 {
+			emaPeriod = n
+		}
+	}
+	// MACD 参数（可选），用于分析期内的 MACD 指标
+	macdFast := 12
+	if v := c.DefaultQuery("macd_fast", "12"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
+			macdFast = n
+		}
+	}
+	macdSlow := 26
+	if v := c.DefaultQuery("macd_slow", "26"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > macdFast && n <= 200 {
+			macdSlow = n
+		}
+	}
+	macdSignal := 9
+	if v := c.DefaultQuery("macd_signal", "9"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
+			macdSignal = n
+		}
+	}
+
+	var fromFilterMs, toFilterMs int64
+	var hasFrom, hasTo bool
+	if sVal := c.Query("start_time"); sVal != "" {
+		if t, err := parseExportTime(sVal); err == nil {
+			fromFilterMs = t.UnixMilli()
+			hasFrom = true
+		} else {
+			SafeBadRequest(c, "Invalid start_time")
+			return
+		}
+	}
+	if sVal := c.Query("end_time"); sVal != "" {
+		if t, err := parseExportTime(sVal); err == nil {
+			toFilterMs = t.UnixMilli()
+			hasTo = true
+		} else {
+			SafeBadRequest(c, "Invalid end_time")
+			return
+		}
+	}
+
+	limit := 500
+	if v := c.DefaultQuery("limit", "500"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 2000 {
+			limit = n
+		}
+	}
+
+	traderStore := trader.GetStore()
+	if traderStore == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Store not available"})
+		return
+	}
+
+	positions, err := traderStore.Position().GetClosedPositions(trader.GetID(), limit)
+	if err != nil {
+		SafeInternalError(c, "Get closed positions", err)
+		return
+	}
+	if len(positions) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"trader_id":        traderID,
+			"timeframe":        normTF,
+			"rsi_period":       rsiPeriod,
+			"ema_period":       emaPeriod,
+			"from":             nil,
+			"to":               nil,
+			"trade_count":      0,
+			"indicators_all":   map[string]interface{}{},
+			"indicators_long":  map[string]interface{}{},
+			"indicators_short": map[string]interface{}{},
+		})
+		return
+	}
+
+	// Filter by time window and compute overall from/to bounds.
+	filtered := make([]*store.TraderPosition, 0, len(positions))
+	var overallFromMs, overallToMs int64
+	for _, p := range positions {
+		if p.EntryTime <= 0 || p.ExitTime <= 0 || p.Symbol == "" {
+			continue
+		}
+		if hasFrom && p.EntryTime < fromFilterMs {
+			continue
+		}
+		if hasTo && p.ExitTime > toFilterMs {
+			continue
+		}
+		filtered = append(filtered, p)
+		if overallFromMs == 0 || p.EntryTime < overallFromMs {
+			overallFromMs = p.EntryTime
+		}
+		if overallToMs == 0 || p.ExitTime > overallToMs {
+			overallToMs = p.ExitTime
+		}
+	}
+
+	if len(filtered) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"trader_id":        traderID,
+			"timeframe":        normTF,
+			"rsi_period":       rsiPeriod,
+			"ema_period":       emaPeriod,
+			"from":             nil,
+			"to":               nil,
+			"trade_count":      0,
+			"indicators_all":   map[string]interface{}{},
+			"indicators_long":  map[string]interface{}{},
+			"indicators_short": map[string]interface{}{},
+		})
+		return
+	}
+
+	// Group trades by symbol for batched K-line fetching.
+	bySymbol := make(map[string][]*store.TraderPosition)
+	for _, p := range filtered {
+		symbol := market.Normalize(p.Symbol)
+		bySymbol[symbol] = append(bySymbol[symbol], p)
+	}
+
+	tfDur, err := market.TFDuration(normTF)
+	if err != nil {
+		SafeBadRequest(c, fmt.Sprintf("Invalid timeframe: %v", err))
+		return
+	}
+
+	// Aggregation buckets per indicator (per dimension: all / long / short).
+	// Slices hold raw values for median calculation.
+	type indicatorBucket struct {
+		profitEntrySum float64
+		profitEntryCnt int
+		profitEntryVals []float64
+		profitExitSum   float64
+		profitExitCnt  int
+		profitExitVals  []float64
+		lossEntrySum    float64
+		lossEntryCnt   int
+		lossEntryVals   []float64
+		lossExitSum     float64
+		lossExitCnt    int
+		lossExitVals    []float64
+	}
+
+	indicatorNames := []string{"rsi", "emabias", "boll_pct", "atr_pct", "macd", "adx", "bias", "vol_mult"}
+	newBuckets := func() map[string]*indicatorBucket {
+		m := make(map[string]*indicatorBucket)
+		for _, n := range indicatorNames {
+			m[n] = &indicatorBucket{}
+		}
+		return m
+	}
+	indicatorsAll := newBuckets()
+	indicatorsLong := newBuckets()
+	indicatorsShort := newBuckets()
+
+	addSample := func(indicators map[string]*indicatorBucket, name string, value float64, isWin bool, isEntry bool) {
+		bucket, ok := indicators[name]
+		if !ok {
+			return
+		}
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return
+		}
+		if isWin {
+			if isEntry {
+				bucket.profitEntrySum += value
+				bucket.profitEntryCnt++
+				bucket.profitEntryVals = append(bucket.profitEntryVals, value)
+			} else {
+				bucket.profitExitSum += value
+				bucket.profitExitCnt++
+				bucket.profitExitVals = append(bucket.profitExitVals, value)
+			}
+		} else {
+			if isEntry {
+				bucket.lossEntrySum += value
+				bucket.lossEntryCnt++
+				bucket.lossEntryVals = append(bucket.lossEntryVals, value)
+			} else {
+				bucket.lossExitSum += value
+				bucket.lossExitCnt++
+				bucket.lossExitVals = append(bucket.lossExitVals, value)
+			}
+		}
+	}
+	addSampleAllSides := func(name string, value float64, isWin bool, isEntry bool, side string) {
+		addSample(indicatorsAll, name, value, isWin, isEntry)
+		sideUpper := strings.ToUpper(side)
+		if sideUpper == "LONG" {
+			addSample(indicatorsLong, name, value, isWin, isEntry)
+		} else if sideUpper == "SHORT" {
+			addSample(indicatorsShort, name, value, isWin, isEntry)
+		}
+	}
+
+	// Helper: find kline index for given timestamp (ms) using time bucket [openTime, openTime+tfDur)
+	findKlineIndex := func(klines []market.Kline, tsMs int64, tfDuration time.Duration) int {
+		if len(klines) == 0 {
+			return -1
+		}
+		tfMs := int64(tfDuration / time.Millisecond)
+		lo, hi := 0, len(klines)-1
+		for lo <= hi {
+			mid := (lo + hi) / 2
+			k := klines[mid]
+			start := k.OpenTime
+			end := k.OpenTime + tfMs
+			if tsMs < start {
+				hi = mid - 1
+			} else if tsMs >= end {
+				lo = mid + 1
+			} else {
+				return mid
+			}
+		}
+		return -1
+	}
+
+	// For each symbol, fetch a single K-line range and evaluate indicators at entry & exit times.
+	for symbol, trades := range bySymbol {
+		if len(trades) == 0 {
+			continue
+		}
+
+		var symFromMs, symToMs int64
+		for _, p := range trades {
+			if symFromMs == 0 || p.EntryTime < symFromMs {
+				symFromMs = p.EntryTime
+			}
+			if symToMs == 0 || p.ExitTime > symToMs {
+				symToMs = p.ExitTime
+			}
+		}
+
+		// Add buffer on both sides to ensure we have enough history for indicators.
+		// MACD 需要至少 macdSlow+macdSignal 根 K 线（如 26+9=35）才能算出 histogram。
+		maxLookbackBars := rsiPeriod
+		if emaPeriod > maxLookbackBars {
+			maxLookbackBars = emaPeriod
+		}
+		if macdSlow+macdSignal > maxLookbackBars {
+			maxLookbackBars = macdSlow + macdSignal
+		}
+		if maxLookbackBars < 35 {
+			maxLookbackBars = 35
+		}
+		buffer := tfDur * time.Duration(maxLookbackBars+5)
+
+		start := time.UnixMilli(symFromMs).Add(-buffer)
+		if start.Before(time.Unix(0, 0)) {
+			start = time.Unix(0, 0)
+		}
+		end := time.UnixMilli(symToMs).Add(buffer)
+
+		klines, err := market.GetKlinesRange(symbol, normTF, start, end)
+		if err != nil || len(klines) == 0 {
+			// 某个币种 K 线拉取失败时，仅跳过该币种，不让整个接口报错。
+			logger.Infof("⚠️  Failed to fetch klines for indicator analysis: symbol=%s, err=%v", symbol, err)
+			continue
+		}
+
+		for _, p := range trades {
+			isWin := p.RealizedPnL > 0
+			side := p.Side
+			if side == "" {
+				side = "LONG"
+			}
+
+			// Entry snapshot
+			if idx := findKlineIndex(klines, p.EntryTime, tfDur); idx >= 0 {
+				slice := klines[:idx+1]
+				snap := market.ComputeIndicatorSnapshot(slice, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal)
+				if snap.MACD == 0 && len(slice) < macdSlow+macdSignal {
+					logger.Infof("Indicator analysis MACD zero: symbol=%s entry sliceLen=%d (need >= %d)", symbol, len(slice), macdSlow+macdSignal)
+				}
+				addSampleAllSides("rsi", snap.RSI, isWin, true, side)
+				addSampleAllSides("emabias", snap.EMABias, isWin, true, side)
+				addSampleAllSides("boll_pct", snap.BollPct, isWin, true, side)
+				addSampleAllSides("atr_pct", snap.ATRPct, isWin, true, side)
+				addSampleAllSides("macd", snap.MACD, isWin, true, side)
+				addSampleAllSides("adx", snap.ADX, isWin, true, side)
+				addSampleAllSides("bias", snap.Bias, isWin, true, side)
+				addSampleAllSides("vol_mult", snap.VolMult, isWin, true, side)
+			}
+
+			// Exit snapshot
+			if idx := findKlineIndex(klines, p.ExitTime, tfDur); idx >= 0 {
+				slice := klines[:idx+1]
+				snap := market.ComputeIndicatorSnapshot(slice, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal)
+				addSampleAllSides("rsi", snap.RSI, isWin, false, side)
+				addSampleAllSides("emabias", snap.EMABias, isWin, false, side)
+				addSampleAllSides("boll_pct", snap.BollPct, isWin, false, side)
+				addSampleAllSides("atr_pct", snap.ATRPct, isWin, false, side)
+				addSampleAllSides("macd", snap.MACD, isWin, false, side)
+				addSampleAllSides("adx", snap.ADX, isWin, false, side)
+				addSampleAllSides("bias", snap.Bias, isWin, false, side)
+				addSampleAllSides("vol_mult", snap.VolMult, isWin, false, side)
+			}
+		}
+	}
+
+	// CalculateMedian returns the median of values (in-place sort; even length = avg of two middle).
+	calculateMedian := func(values []float64) float64 {
+		if len(values) == 0 {
+			return 0
+		}
+		cp := make([]float64, len(values))
+		copy(cp, values)
+		sort.Float64s(cp)
+		n := len(cp)
+		if n%2 == 1 {
+			return cp[n/2]
+		}
+		return (cp[n/2-1] + cp[n/2]) / 2
+	}
+
+	// Build response structure with averages and medians (per dimension: all / long / short).
+	type indicatorDimensionAverages struct {
+		ProfitEntryAvg    float64 `json:"profit_entry_avg"`
+		ProfitEntryMedian float64 `json:"profit_entry_median"`
+		ProfitExitAvg     float64 `json:"profit_exit_avg"`
+		ProfitExitMedian  float64 `json:"profit_exit_median"`
+		LossEntryAvg      float64 `json:"loss_entry_avg"`
+		LossEntryMedian   float64 `json:"loss_entry_median"`
+		LossExitAvg       float64 `json:"loss_exit_avg"`
+		LossExitMedian    float64 `json:"loss_exit_median"`
+
+		ProfitEntryCount int `json:"profit_entry_count"`
+		ProfitExitCount  int `json:"profit_exit_count"`
+		LossEntryCount   int `json:"loss_entry_count"`
+		LossExitCount    int `json:"loss_exit_count"`
+	}
+
+	buildResult := func(indicators map[string]*indicatorBucket) map[string]indicatorDimensionAverages {
+		out := make(map[string]indicatorDimensionAverages)
+		for name, b := range indicators {
+			if b == nil {
+				continue
+			}
+			res := indicatorDimensionAverages{
+				ProfitEntryCount: b.profitEntryCnt,
+				ProfitExitCount:  b.profitExitCnt,
+				LossEntryCount:   b.lossEntryCnt,
+				LossExitCount:    b.lossExitCnt,
+			}
+			if b.profitEntryCnt > 0 {
+				res.ProfitEntryAvg = b.profitEntrySum / float64(b.profitEntryCnt)
+				res.ProfitEntryMedian = calculateMedian(b.profitEntryVals)
+			}
+			if b.profitExitCnt > 0 {
+				res.ProfitExitAvg = b.profitExitSum / float64(b.profitExitCnt)
+				res.ProfitExitMedian = calculateMedian(b.profitExitVals)
+			}
+			if b.lossEntryCnt > 0 {
+				res.LossEntryAvg = b.lossEntrySum / float64(b.lossEntryCnt)
+				res.LossEntryMedian = calculateMedian(b.lossEntryVals)
+			}
+			if b.lossExitCnt > 0 {
+				res.LossExitAvg = b.lossExitSum / float64(b.lossExitCnt)
+				res.LossExitMedian = calculateMedian(b.lossExitVals)
+			}
+			out[name] = res
+		}
+		return out
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"trader_id":        traderID,
+		"timeframe":        normTF,
+		"rsi_period":       rsiPeriod,
+		"ema_period":       emaPeriod,
+		"from":             overallFromMs,
+		"to":               overallToMs,
+		"trade_count":      len(filtered),
+		"indicators_all":   buildResult(indicatorsAll),
+		"indicators_long":  buildResult(indicatorsLong),
+		"indicators_short": buildResult(indicatorsShort),
+	})
 }
 
 // handleCompetition Competition overview (compare all traders)
