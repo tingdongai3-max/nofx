@@ -71,6 +71,8 @@ export function ChartTabs({ traderId, selectedSymbol, updateKey, exchangeId }: C
   const [exportFrom, setExportFrom] = useState<string>('')
   const [exportTo, setExportTo] = useState<string>('')
   const [exportIntervals, setExportIntervals] = useState<ExportInterval[]>(['1m', '5m', '15m', '1h', '4h', '1d', '1w'])
+  const [exportIncludeIndicators, setExportIncludeIndicators] = useState(false)
+  const [exportIncludeTradeHistory, setExportIncludeTradeHistory] = useState(false)
 
   // 当交易所ID变化时，自动切换市场类型
   useEffect(() => {
@@ -170,6 +172,12 @@ export function ChartTabs({ traderId, selectedSymbol, updateKey, exchangeId }: C
     )
   }
 
+  const intervalMs: Record<string, number> = {
+    '1m': 60000, '3m': 180000, '5m': 300000, '15m': 900000, '30m': 1800000,
+    '1h': 3600000, '2h': 7200000, '4h': 14400000, '6h': 21600000, '8h': 28800000, '12h': 43200000,
+    '1d': 86400000, '3d': 259200000, '1w': 604800000,
+  }
+
   const handleExportKlines = async () => {
     if (!chartSymbol) {
       notify.error(language === 'zh' ? '请先选择交易标的' : 'Please select a symbol first')
@@ -187,6 +195,37 @@ export function ChartTabs({ traderId, selectedSymbol, updateKey, exchangeId }: C
 
     setExportingKlines(true)
     try {
+      type KlineRow = Record<string, string | number>
+      const baseKeys = ['instrument_name', 'interval', 'open_time', 'open', 'high', 'low', 'close', 'vol', 'vol_ccy', 'vol_quote', 'confirm']
+      const indicatorKeySet = new Set<string>()
+      const allRows: KlineRow[] = []
+
+      let positionsInRange: Array<{ entry_time: number; exit_time: number; symbol: string; side: string; quantity: number; entry_price: number; exit_price: number; realized_pnl: number }> = []
+      if (exportIncludeTradeHistory && traderId) {
+        const histRes = await httpClient.get<{ positions?: Array<{ symbol: string; side: string; entry_time: number; exit_time: number; quantity: number; entry_price: number; exit_price: number; realized_pnl: number }> }>(
+          `/api/positions/history?trader_id=${encodeURIComponent(traderId)}&limit=500`
+        )
+        const list = histRes?.data?.positions ?? []
+        const normSymbol = chartSymbol.replace(/[-/]/g, '').toUpperCase()
+        for (const p of list) {
+          const sym = (p.symbol || '').replace(/[-/]/g, '').toUpperCase()
+          if (sym !== normSymbol) continue
+          const entryMs = typeof p.entry_time === 'number' ? (p.entry_time < 1e12 ? p.entry_time * 1000 : p.entry_time) : 0
+          const exitMs = typeof p.exit_time === 'number' ? (p.exit_time < 1e12 ? p.exit_time * 1000 : p.exit_time) : 0
+          if (entryMs >= range.toMs + 86400000 || exitMs <= range.fromMs - 86400000) continue
+          positionsInRange.push({
+            entry_time: entryMs,
+            exit_time: exitMs,
+            symbol: p.symbol,
+            side: (p.side || '').toLowerCase(),
+            quantity: Number(p.quantity) || 0,
+            entry_price: Number(p.entry_price) || 0,
+            exit_price: Number(p.exit_price) || 0,
+            realized_pnl: Number(p.realized_pnl) || 0,
+          })
+        }
+      }
+
       for (const tf of exportIntervals) {
         const limit = 1500
         const url = `/api/klines?symbol=${encodeURIComponent(chartSymbol)}&interval=${tf}&limit=${limit}&exchange=${currentExchange}`
@@ -195,55 +234,105 @@ export function ChartTabs({ traderId, selectedSymbol, updateKey, exchangeId }: C
           throw new Error(language === 'zh' ? `获取 ${tf} K线失败` : `Failed to fetch ${tf} klines`)
         }
 
-        const klines = result.data as Array<{
-          openTime: number
-          open: number
-          high: number
-          low: number
-          close: number
-          volume: number
-          quoteVolume?: number
-        }>
-
+        const klines = result.data as Array<Record<string, unknown> & { openTime: number; open: number; high: number; low: number; close: number; volume: number; quoteVolume?: number }>
         const filtered = klines.filter((k) => k.openTime >= range.fromMs && k.openTime <= range.toMs)
-        if (filtered.length === 0) {
-          continue
+        const intervalMsVal = intervalMs[tf] ?? 60000
+
+        for (const k of filtered) {
+          const openTime = Number(k.openTime)
+          const row: KlineRow = {
+            instrument_name: chartSymbol,
+            interval: tf,
+            open_time: openTime,
+            open: Number(k.open),
+            high: Number(k.high),
+            low: Number(k.low),
+            close: Number(k.close),
+            vol: Number(k.volume),
+            vol_ccy: Number(k.volume),
+            vol_quote: Number(k.quoteVolume ?? 0),
+            confirm: 1,
+          }
+          if (exportIncludeIndicators && typeof k === 'object') {
+            for (const key of Object.keys(k)) {
+              if (['openTime', 'open', 'high', 'low', 'close', 'volume', 'quoteVolume', 'closeTime'].includes(key)) continue
+              const v = k[key]
+              if (v !== undefined && v !== null && (typeof v === 'number' || typeof v === 'string')) {
+                row[key] = v as number | string
+                indicatorKeySet.add(key)
+              }
+            }
+          }
+          if (exportIncludeTradeHistory && positionsInRange.length > 0) {
+            const candleEnd = openTime + intervalMsVal
+            let matched: typeof positionsInRange[0] | null = null
+            let action = ''
+            for (const pos of positionsInRange) {
+              if (pos.exit_time >= openTime && pos.exit_time < candleEnd) {
+                matched = pos
+                action = pos.side === 'long' ? 'PARTIAL_CLOSE' : 'PARTIAL_CLOSE'
+                break
+              }
+              if (pos.entry_time >= openTime && pos.entry_time < candleEnd && !matched) {
+                matched = pos
+                action = pos.side === 'long' ? 'BUY' : 'SELL'
+              }
+            }
+            if (matched) {
+              row.trade_action = action
+              row.trade_price = action === 'BUY' || action === 'SELL' ? matched.entry_price : matched.exit_price
+              row.trade_qty = matched.quantity
+              row.trade_pnl = matched.realized_pnl
+            } else {
+              row.trade_action = ''
+              row.trade_price = ''
+              row.trade_qty = ''
+              row.trade_pnl = ''
+            }
+          }
+          allRows.push(row)
         }
-
-        const header = 'instrument_name,open,high,low,close,vol,vol_ccy,vol_quote,open_time,confirm\n'
-        const rows = filtered
-          .map((k) =>
-            [
-              chartSymbol,
-              k.open.toFixed(4),
-              k.high.toFixed(4),
-              k.low.toFixed(4),
-              k.close.toFixed(4),
-              k.volume.toString(),
-              k.volume.toString(),
-              (k.quoteVolume ?? 0).toString(),
-              k.openTime.toString(),
-              '1',
-            ].join(',')
-          )
-          .join('\n')
-
-        const csv = header + rows + '\n'
-        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
-        const urlObj = URL.createObjectURL(blob)
-        const a = document.createElement('a')
-        const safeSymbol = chartSymbol.replace(/[:/]/g, '-')
-        const datePart = exportFrom === exportTo ? exportFrom : `${exportFrom}_to_${exportTo}`
-        a.href = urlObj
-        a.download = `${safeSymbol}-${tf}-candlesticks-${datePart}.csv`
-        document.body.appendChild(a)
-        a.click()
-        document.body.removeChild(a)
-        URL.revokeObjectURL(urlObj)
       }
 
+      const indicatorKeys = Array.from(indicatorKeySet).sort()
+      const tradeKeys = exportIncludeTradeHistory ? ['trade_action', 'trade_price', 'trade_qty', 'trade_pnl'] : []
+      const headerParts = [...baseKeys, ...indicatorKeys, ...tradeKeys]
+      const header = headerParts.join(',') + '\n'
+
+      const escapeCsv = (v: string | number): string => {
+        const s = String(v)
+        if (s.includes(',') || s.includes('"') || s.includes('\n')) return `"${s.replace(/"/g, '""')}"`
+        return s
+      }
+
+      const rows = allRows
+        .map((r) =>
+          headerParts
+            .map((h) => {
+              const val = r[h]
+              if (val === undefined || val === null) return ''
+              if (typeof val === 'number') return h === 'open' || h === 'high' || h === 'low' || h === 'close' || h === 'trade_price' ? (val as number).toFixed(4) : String(val)
+              return escapeCsv(val)
+            })
+            .join(',')
+        )
+        .join('\n')
+
+      const csv = header + rows + (rows ? '\n' : '')
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+      const urlObj = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      const safeSymbol = chartSymbol.replace(/[:/]/g, '-')
+      const datePart = exportFrom === exportTo ? exportFrom : `${exportFrom}_to_${exportTo}`
+      a.href = urlObj
+      a.download = `Merged_Market_Data_${safeSymbol}_${datePart}.csv`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(urlObj)
+
       notify.success(
-        language === 'zh' ? 'K线数据已导出（按选定周期分别生成 CSV）' : 'Kline data exported (one CSV per timeframe)'
+        language === 'zh' ? 'K线数据已合并导出（单文件）' : 'Kline data exported (merged single file)'
       )
       setExportPanelOpen(false)
     } catch (err: any) {
@@ -460,11 +549,31 @@ export function ChartTabs({ traderId, selectedSymbol, updateKey, exchangeId }: C
                       />
                     </div>
                   </div>
+                  <div className="space-y-1.5">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        className="w-3 h-3"
+                        checked={exportIncludeIndicators}
+                        onChange={(e) => setExportIncludeIndicators(e.target.checked)}
+                      />
+                      <span>{language === 'zh' ? '包含指标数据' : 'Include Indicators'}</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        className="w-3 h-3"
+                        checked={exportIncludeTradeHistory}
+                        onChange={(e) => setExportIncludeTradeHistory(e.target.checked)}
+                      />
+                      <span>{language === 'zh' ? '包含交易历史' : 'Include Trade History'}</span>
+                    </label>
+                  </div>
                   <div className="flex items-center justify-between pt-1 border-t border-white/10 mt-1">
                     <span className="text-[10px] text-nofx-text-muted">
                       {language === 'zh'
-                        ? '每个周期导出一个 CSV 文件'
-                        : 'One CSV per timeframe'}
+                        ? '多周期合并为一个 CSV 文件'
+                        : 'All timeframes merged into one CSV'}
                     </span>
                     <button
                       type="button"
