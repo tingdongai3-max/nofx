@@ -179,7 +179,10 @@ export function TraderDashboardPage({
                     rsi_period: String(indicatorRSIPeriod),
                     ema_period: String(indicatorEMAPeriod),
                 })
-                const resp = await fetch(`/api/statistics/indicator-analysis?${params.toString()}`)
+                const token = typeof localStorage !== 'undefined' ? localStorage.getItem('auth_token') : null
+                const resp = await fetch(`/api/statistics/indicator-analysis?${params.toString()}`, {
+                    headers: token ? { Authorization: `Bearer ${token}` } : {},
+                })
                 const data = (await resp.json()) as IndicatorAnalysisResult & { error?: string; code?: string; details?: string }
                 if (!resp.ok) {
                     const msg = data?.error && data?.details ? `${data.error}: ${data.details}` : data?.error || `HTTP ${resp.status}`
