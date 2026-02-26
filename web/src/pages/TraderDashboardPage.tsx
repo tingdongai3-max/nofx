@@ -1068,15 +1068,13 @@ export function TraderDashboardPage({
                                                 { key: 'bias', label: language === 'zh' ? '乖离率 (Bias)' : 'Bias', unit: '%', signed: true },
                                                 { key: 'vol_mult', label: language === 'zh' ? '成交量倍数' : 'Vol Mult', unit: 'x', volMult: true },
                                             ]
-                                            const formatNum = (val: number | undefined) =>
-                                                val === undefined || Number.isNaN(val) ? null : val.toFixed(2)
                                             const formatBiasSuffix = (val: number | undefined) =>
                                                 val == null || val === 0 ? '' : val < 0 ? (language === 'zh' ? ' (EMA下)' : ' (Below)') : (language === 'zh' ? ' (EMA上)' : ' (Above)')
                                             const hasAny = (d: IndicatorDimensionAverages) =>
                                                 (d?.profit_entry_count ?? 0) + (d?.profit_exit_count ?? 0) + (d?.loss_entry_count ?? 0) + (d?.loss_exit_count ?? 0) > 0
 
-                                            // Debug: 核对后端返回的字段名与中位数（浏览器控制台）
-                                            if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+                                            // Debug: 核对后端返回的字段名与中位数（仅开发环境，Vite 使用 import.meta.env）
+                                            if (typeof window !== 'undefined' && import.meta.env.DEV) {
                                                 console.log('Indicator Data:', indicatorAnalysis)
                                             }
 
