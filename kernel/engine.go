@@ -321,6 +321,10 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 	}
 
 	// 5. Parse AI response
+	allowStagedTP := true
+	if engine != nil && engine.config != nil && !engine.config.Indicators.EnableStagedTakeProfit {
+		allowStagedTP = false
+	}
 	decision, err := parseFullDecisionResponse(
 		aiResponse,
 		ctx.Account.TotalEquity,
@@ -328,6 +332,7 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 		riskConfig.AltcoinMaxLeverage,
 		riskConfig.BTCETHMaxPositionValueRatio,
 		riskConfig.AltcoinMaxPositionValueRatio,
+		allowStagedTP,
 	)
 
 	if decision != nil {
@@ -705,6 +710,15 @@ func IndicatorParamsFromConfig(c store.IndicatorConfig) *market.IndicatorParams 
 		if len(opts.BIASPeriods) == 0 {
 			opts.BIASPeriods = []int{6, 12, 24}
 		}
+	}
+
+	// 放量
+	if c.EnableVolMult {
+		n := c.VolMultBars
+		if n <= 0 {
+			n = 5
+		}
+		opts.VolMultBars = n
 	}
 
 	return opts
@@ -1120,18 +1134,25 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	sb.WriteString("Step 2: JSON decision array\n\n")
 	sb.WriteString("```json\n[\n")
 	if e.config.Indicators.EnableATRTrailing {
-		sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": 5000, \"atr_sl_mult\": 1.2, \"atr_tp_mult\": 2, \"atr_tp_stages\": [{\"atr_mult\": 1.2, \"close_pct\": 50}, {\"atr_mult\": 1.5, \"close_pct\": 50}], \"confidence\": 85, \"risk_usd\": 300},\n",
-			riskControl.BTCETHMaxLeverage))
+		if e.config.Indicators.EnableStagedTakeProfit {
+			sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": 5000, \"atr_sl_mult\": 1.2, \"atr_tp_mult\": 2, \"atr_tp_stages\": [{\"atr_mult\": 1.2, \"close_pct\": 50}, {\"atr_mult\": 1.5, \"close_pct\": 50}], \"confidence\": 85, \"risk_usd\": 300},\n",
+				riskControl.BTCETHMaxLeverage))
+		} else {
+			sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": 5000, \"atr_sl_mult\": 1.2, \"atr_tp_mult\": 2, \"confidence\": 85, \"risk_usd\": 300},\n",
+				riskControl.BTCETHMaxLeverage))
+		}
 	} else {
 		sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": 5000, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300},\n",
 			riskControl.BTCETHMaxLeverage))
-		sb.WriteString("  // 或使用多档静态分批止盈（不开 ATR），例如:\n")
-		sb.WriteString("  // {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": 10, \"position_size_usd\": 5000, \"stop_loss\": 97000,\n")
-		sb.WriteString("  //   \"take_profit_stages\": [\n")
-		sb.WriteString("  //     {\"price\": 91000, \"close_pct\": 30},\n")
-		sb.WriteString("  //     {\"price\": 90000, \"close_pct\": 30},\n")
-		sb.WriteString("  //     {\"price\": 89000, \"close_pct\": 40}\n")
-		sb.WriteString("  //   ], \"confidence\": 85, \"risk_usd\": 300},\n")
+		if e.config.Indicators.EnableStagedTakeProfit {
+			sb.WriteString("  // 或使用多档静态分批止盈（不开 ATR），例如:\n")
+			sb.WriteString("  // {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": 10, \"position_size_usd\": 5000, \"stop_loss\": 97000,\n")
+			sb.WriteString("  //   \"take_profit_stages\": [\n")
+			sb.WriteString("  //     {\"price\": 91000, \"close_pct\": 30},\n")
+			sb.WriteString("  //     {\"price\": 90000, \"close_pct\": 30},\n")
+			sb.WriteString("  //     {\"price\": 89000, \"close_pct\": 40}\n")
+			sb.WriteString("  //   ], \"confidence\": 85, \"risk_usd\": 300},\n")
+		}
 	}
 	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"wait\", \"confidence\": 90}\n")
 	sb.WriteString("]\n```\n")
@@ -1144,12 +1165,23 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 		sb.WriteString("- **You MUST NOT** output `close_long` or `close_short`; closing is handled by the backend watchdog / ATR engine. Any close_* actions will be discarded.\n")
 	}
 	sb.WriteString(fmt.Sprintf("- `confidence`: 0-100 (opening recommended ≥ %d)\n", riskControl.MinConfidence))
+	if !e.config.Indicators.EnableStagedTakeProfit {
+		sb.WriteString("- **Staged take profit is OFF**: Do NOT use `take_profit_stages` or `atr_tp_stages`. Use only single `take_profit` (or ATR mode: only `atr_tp_mult`) for full position close.\n")
+	}
 	if e.config.Indicators.EnableATRTrailing {
 		sb.WriteString("- **ATR trailing is ON**: Set `atr_sl_mult`, `atr_tp_mult`, and/or `atr_tp_stages` (max 3) for the watchdog to monitor and trigger. You may **also** set `stop_loss` and/or `take_profit`/`take_profit_stages` to place **exchange fixed orders** (e.g. hard stop or backup TP); ATR and exchange orders are **not mutually exclusive**.\n")
-		sb.WriteString("- Required when opening (ATR mode): leverage, position_size_usd, atr_sl_mult, atr_tp_mult and/or atr_tp_stages (max 3 entries), confidence, risk_usd. Optional: stop_loss, take_profit, or take_profit_stages for exchange orders.\n")
+		if e.config.Indicators.EnableStagedTakeProfit {
+			sb.WriteString("- Required when opening (ATR mode): leverage, position_size_usd, atr_sl_mult, atr_tp_mult and/or atr_tp_stages (max 3 entries), confidence, risk_usd. Optional: stop_loss, take_profit, or take_profit_stages for exchange orders.\n")
+		} else {
+			sb.WriteString("- Required when opening (ATR mode): leverage, position_size_usd, atr_sl_mult, atr_tp_mult (do NOT use atr_tp_stages), confidence, risk_usd. Optional: stop_loss, take_profit for exchange orders.\n")
+		}
 	} else {
 		sb.WriteString("- Required when opening: leverage, position_size_usd (use max from **This period** section; example shows 5000 as placeholder), stop_loss, **either** take_profit **or** take_profit_stages, confidence, risk_usd\n")
-		sb.WriteString("- Static multi-stage TP (分批挂单止盈，非 ATR): use `take_profit_stages` = [{\"price\": x, \"close_pct\": y}, ...], prices strictly increasing for long positions and strictly decreasing for short positions; total close_pct ≤ 100 (percent of current position size).\n")
+		if e.config.Indicators.EnableStagedTakeProfit {
+			sb.WriteString("- Static multi-stage TP (分批挂单止盈，非 ATR): use `take_profit_stages` = [{\"price\": x, \"close_pct\": y}, ...], prices strictly increasing for long positions and strictly decreasing for short positions; total close_pct ≤ 100 (percent of current position size).\n")
+		} else {
+			sb.WriteString("- Use only single `take_profit` (one price for full position close); do NOT use take_profit_stages.\n")
+		}
 	}
 	if enableAIClose {
 		sb.WriteString("- When close_long/close_short: you have **full permission** to close or reduce positions. Use optional `quantity` (base asset amount) or `quantity_pct` (0~1, e.g. 0.4 = close 40%% of current position). Omit both or 0 = close all; set `quantity` = partial close by amount, or `quantity_pct` = partial close by ratio (减仓/分批止盈).\n")
@@ -1251,6 +1283,14 @@ func (e *StrategyEngine) writeAvailableIndicators(sb *strings.Builder) {
 
 	if indicators.EnableVolume {
 		sb.WriteString("- Volume data\n")
+	}
+
+	if indicators.EnableVolMult {
+		n := indicators.VolMultBars
+		if n <= 0 {
+			n = 5
+		}
+		sb.WriteString(fmt.Sprintf("- 放量 (Vol Mult): 当前成交量/前%d根K线平均成交量\n", n))
 	}
 
 	if indicators.EnableOI {
@@ -1835,7 +1875,7 @@ func formatFloatSlice(values []float64) string {
 // AI Response Parsing
 // ============================================================================
 
-func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64) (*FullDecision, error) {
+func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64, allowStagedTakeProfit bool) (*FullDecision, error) {
 	cotTrace := extractCoTTrace(aiResponse)
 
 	decisions, err := extractDecisions(aiResponse)
@@ -1846,7 +1886,7 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 		}, fmt.Errorf("failed to extract decisions: %w", err)
 	}
 
-	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio); err != nil {
+	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio, allowStagedTakeProfit); err != nil {
 		return &FullDecision{
 			CoTTrace:  cotTrace,
 			Decisions: decisions,
@@ -2077,16 +2117,16 @@ func compactArrayOpen(s string) string {
 // Decision Validation
 // ============================================================================
 
-func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64) error {
+func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64, allowStagedTakeProfit bool) error {
 	for i := range decisions {
-		if err := validateDecision(&decisions[i], accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio); err != nil {
+		if err := validateDecision(&decisions[i], accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio, allowStagedTakeProfit); err != nil {
 			return fmt.Errorf("decision #%d validation failed: %w", i+1, err)
 		}
 	}
 	return nil
 }
 
-func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64) error {
+func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64, allowStagedTakeProfit bool) error {
 	validActions := map[string]bool{
 		"open_long":  true,
 		"open_short": true,
@@ -2144,8 +2184,16 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			}
 		}
 		useATRTrailing := d.ATRTrailingSlMult > 0 || d.ATRTrailingTpMult > 0 || len(d.ATRTrailingTpStages) > 0
+		if !allowStagedTakeProfit {
+			if len(d.TakeProfitStages) > 0 {
+				return fmt.Errorf("staged take profit is disabled; use only take_profit (single price for full position close)")
+			}
+			if len(d.ATRTrailingTpStages) > 0 {
+				return fmt.Errorf("staged ATR take profit is disabled; use only atr_tp_mult for full position close")
+			}
+		}
 		if !useATRTrailing {
-			// 静态 TP/SL 模式：必须至少提供一个止损 +（单一 TP 或分批 TP）
+			// 静态 TP/SL 模式：必须至少提供一个止损 +（单一 TP 或分批 TP，后者需允许分批止盈）
 			if d.StopLoss <= 0 {
 				return fmt.Errorf("stop loss must be greater than 0")
 			}
@@ -2157,6 +2205,9 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			}
 			if hasSingleTP && hasStages {
 				return fmt.Errorf("use either take_profit or take_profit_stages, not both")
+			}
+			if hasStages && !allowStagedTakeProfit {
+				return fmt.Errorf("staged take profit is disabled; use only take_profit for full position close")
 			}
 
 			if hasSingleTP {

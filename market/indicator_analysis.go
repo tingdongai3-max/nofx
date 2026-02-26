@@ -16,7 +16,7 @@ type IndicatorSnapshot struct {
 	BollPct float64 `json:"boll_pct"` // (Close - Lower) / (Upper - Lower), 0..1 band position
 	ATRPct  float64 `json:"atr_pct"`  // ATR / Close * 100
 	Bias    float64 `json:"bias"`
-	VolMult float64 `json:"vol_mult"` // Volume multiplier vs previous 5 bars
+	VolMult float64 `json:"vol_mult"` // 放量：当前K线成交量 / 前N根K线成交量平均值（N 可配置，默认5）
 }
 
 // ComputeIndicatorSnapshot computes a snapshot of indicators on the last kline of the slice.
@@ -26,7 +26,8 @@ type IndicatorSnapshot struct {
 // - ATR / ADX: 14
 // - BOLL: 20, 2σ
 // - Bias: (Price - MA(N)) / MA(N) * 100, where N = emaPeriod (for analysis purposes)
-func ComputeIndicatorSnapshot(klines []Kline, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal int) IndicatorSnapshot {
+// - volMultBars: 放量指标前N根K线数量，当前成交量/前N根平均成交量，默认5
+func ComputeIndicatorSnapshot(klines []Kline, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal, volMultBars int) IndicatorSnapshot {
 	if len(klines) == 0 {
 		return IndicatorSnapshot{}
 	}
@@ -45,6 +46,9 @@ func ComputeIndicatorSnapshot(klines []Kline, rsiPeriod, emaPeriod, macdFast, ma
 	}
 	if macdSignal <= 0 {
 		macdSignal = 9
+	}
+	if volMultBars <= 0 {
+		volMultBars = 5
 	}
 
 	opts := &IndicatorParams{
@@ -114,15 +118,15 @@ func ComputeIndicatorSnapshot(klines []Kline, rsiPeriod, emaPeriod, macdFast, ma
 		snap.ATRPct = atr / close * 100
 	}
 
-	// VolMult: 当前K线Volume / 前5根K线Volume的平均值
-	if len(klines) > 5 {
+	// VolMult 放量: 当前K线成交量 / 前 volMultBars 根K线成交量平均值
+	if n := volMultBars; n >= 1 && len(klines) > n {
 		sum := 0.0
-		for i := len(klines) - 6; i < len(klines)-1; i++ {
+		for i := len(klines) - 1 - n; i < len(klines)-1; i++ {
 			if i >= 0 {
 				sum += klines[i].Volume
 			}
 		}
-		avg := sum / 5.0
+		avg := sum / float64(n)
 		if avg > 0 && !math.IsNaN(avg) && !math.IsInf(avg, 0) {
 			snap.VolMult = last.Volume / avg
 		}

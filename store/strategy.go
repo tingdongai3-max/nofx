@@ -138,6 +138,8 @@ type IndicatorConfig struct {
 	EnableBIAS        bool `json:"enable_bias"`        // 乖离率 BIAS
 	EnableFibonacci   bool `json:"enable_fibonacci"`    // 斐波那契回撤位写入 AI Prompt
 	EnableVolume      bool `json:"enable_volume"`
+	EnableVolMult     bool `json:"enable_vol_mult"`     // 放量：当前成交量/前N根K线平均成交量
+	VolMultBars       int  `json:"vol_mult_bars,omitempty"` // 放量周期（前N根），默认 5
 	EnableOI          bool `json:"enable_oi"`
 	EnableFundingRate bool `json:"enable_funding_rate"`
 	EMAPeriods        []int `json:"ema_periods,omitempty"`
@@ -180,7 +182,8 @@ type IndicatorConfig struct {
 	TrailingOffsetPercent   float64 `json:"trailing_offset_percent"`       // 触发偏移量(%)，多单跌破均线-偏移%才平仓，空单突破均线+偏移%才平仓，防插针，默认 0
 
 	// ATR 移动止盈止损：开启后开仓不设交易所固定 TP/SL，由 AI 输出 ATR 倍数，机器狗按价格流监控并触发
-	EnableATRTrailing bool `json:"enable_atr_trailing"` // 是否使用 ATR 倍数移动止盈止损（AI 输出 atr_sl_mult / atr_tp_mult / atr_tp_stages）
+	EnableATRTrailing    bool `json:"enable_atr_trailing"`    // 是否使用 ATR 倍数移动止盈止损（AI 输出 atr_sl_mult / atr_tp_mult / atr_tp_stages）
+	EnableStagedTakeProfit bool `json:"enable_staged_take_profit"` // 允许分批止盈：关闭后 AI 只能使用单一 take_profit 全仓止盈，不能使用 take_profit_stages / atr_tp_stages
 }
 
 // KlineConfig K-line configuration
@@ -289,6 +292,8 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 			EnableADX:         false,
 			EnableFibonacci:   false,
 			EnableVolume:      true,
+			EnableVolMult:     false,
+			VolMultBars:       5,
 			EnableOI:          true,
 			EnableFundingRate: true,
 			EMAPeriods:        []int{20, 50},
@@ -320,6 +325,7 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 			TrailingTimeframe:       "5m",
 			TrailingOffsetPercent:   0,
 			EnableATRTrailing:       false,
+			EnableStagedTakeProfit:  true,
 			BIASPeriods:             []int{6, 12, 24},
 		},
 		RiskControl: RiskControlConfig{

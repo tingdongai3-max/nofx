@@ -34,6 +34,7 @@ type IndicatorParams struct {
 	MACDSlow     int   `json:"macd_slow,omitempty"`     // 默认 26
 	MACDSignal   int   `json:"macd_signal,omitempty"`    // 默认 9
 	BIASPeriods  []int `json:"bias_periods,omitempty"`  // 乖离率周期，默认 [6, 12, 24]
+	VolMultBars  int   `json:"vol_mult_bars,omitempty"` // 放量：前 N 根 K 线，默认 5
 }
 
 // KlineBar single kline bar with OHLCV data

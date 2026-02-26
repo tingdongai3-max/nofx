@@ -89,6 +89,8 @@ export function IndicatorEditor({
       fibonacciDesc: { zh: '阻力/支撑位写入 AI 文本', en: 'Resistance/support levels in AI prompt' },
       volume: { zh: '成交量', en: 'Volume' },
       volumeDesc: { zh: '交易量分析', en: 'Trading volume analysis' },
+      volMult: { zh: '放量', en: 'Vol Mult' },
+      volMultDesc: { zh: '当前成交量/前N根K线平均（倍数）', en: 'Current volume / avg(prev N bars)' },
       oi: { zh: '持仓量', en: 'Open Interest' },
       oiDesc: { zh: '合约未平仓量', en: 'Futures open interest' },
       fundingRate: { zh: '资金费率', en: 'Funding Rate' },
@@ -133,6 +135,8 @@ export function IndicatorEditor({
       },
       enableATRTrailing: { zh: 'ATR 移动止盈止损', en: 'ATR trailing TP/SL' },
       enableATRTrailingDesc: { zh: '开启后开仓不设固定止盈止损，由 AI 输出 ATR 倍数，机器狗按价格监控触发', en: 'When on, no fixed TP/SL on open; AI outputs ATR multipliers, watchdog triggers by price' },
+      enableStagedTakeProfit: { zh: '允许分批止盈', en: 'Allow staged take profit' },
+      enableStagedTakeProfitDesc: { zh: '关闭后 AI 只能使用单一止盈价全仓平仓，不能使用 take_profit_stages / atr_tp_stages', en: 'When off, AI may only use single take_profit for full close; no take_profit_stages or atr_tp_stages' },
 
       // NofxOS Data Provider
       nofxosTitle: { zh: 'NofxOS 量化数据源', en: 'NofxOS Data Provider' },
@@ -790,9 +794,10 @@ export function IndicatorEditor({
           <div className="grid grid-cols-3 gap-2">
             {[
               { key: 'enable_volume', label: 'volume', desc: 'volumeDesc', color: '#c084fc' },
+              { key: 'enable_vol_mult', label: 'volMult', desc: 'volMultDesc', color: '#22d3ee', periodKey: 'vol_mult_bars', defaultPeriods: '5' },
               { key: 'enable_oi', label: 'oi', desc: 'oiDesc', color: '#34d399' },
               { key: 'enable_funding_rate', label: 'fundingRate', desc: 'fundingRateDesc', color: '#fbbf24' },
-            ].map(({ key, label, desc, color }) => (
+            ].map(({ key, label, desc, color, periodKey, defaultPeriods }) => (
               <div
                 key={key}
                 className="p-2.5 rounded-lg transition-all"
@@ -814,7 +819,24 @@ export function IndicatorEditor({
                     className="w-4 h-4 rounded accent-yellow-500"
                   />
                 </div>
-                <p className="text-[10px]" style={{ color: '#5E6673' }}>{t(desc)}</p>
+                <p className="text-[10px] mb-1.5" style={{ color: '#5E6673' }}>{t(desc)}</p>
+                {periodKey && config[key as keyof IndicatorConfig] && (
+                  <input
+                    type="text"
+                    value={String((config[periodKey as keyof IndicatorConfig] as number) ?? defaultPeriods)}
+                    onChange={(e) => {
+                      if (disabled) return
+                      const n = parseInt(e.target.value.trim(), 10)
+                      if (!isNaN(n) && n >= 1 && n <= 100) {
+                        onChange({ ...config, [periodKey]: n })
+                      }
+                    }}
+                    disabled={disabled}
+                    placeholder={defaultPeriods}
+                    className="w-full px-2 py-1 rounded text-[10px] text-center"
+                    style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
+                  />
+                )}
               </div>
             ))}
           </div>
@@ -845,6 +867,20 @@ export function IndicatorEditor({
             />
           </div>
           <p className="text-[10px] mb-1.5" style={{ color: '#5E6673' }}>{t('enableATRTrailingDesc')}</p>
+          <div className="flex items-center justify-between p-2.5 rounded-lg" style={{ background: config.enable_staged_take_profit !== false ? 'rgba(34, 197, 94, 0.08)' : 'transparent', border: config.enable_staged_take_profit !== false ? '1px solid rgba(34, 197, 94, 0.3)' : '1px solid #2B3139' }}>
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 rounded-full" style={{ background: '#22c55e' }} />
+              <span className="text-xs font-medium" style={{ color: '#EAECEF' }}>{t('enableStagedTakeProfit')}</span>
+            </div>
+            <input
+              type="checkbox"
+              checked={config.enable_staged_take_profit !== false}
+              onChange={(e) => !disabled && onChange({ ...config, enable_staged_take_profit: e.target.checked })}
+              disabled={disabled}
+              className="w-4 h-4 rounded accent-green-500"
+            />
+          </div>
+          <p className="text-[10px] mb-1.5" style={{ color: '#5E6673' }}>{t('enableStagedTakeProfitDesc')}</p>
           <div className="flex items-center justify-between p-2.5 rounded-lg" style={{ background: config.enable_indicator_trailing ? 'rgba(245, 158, 11, 0.08)' : 'transparent', border: config.enable_indicator_trailing ? '1px solid rgba(245, 158, 11, 0.3)' : '1px solid #2B3139' }}>
             <div className="flex items-center gap-2">
               <div className="w-2 h-2 rounded-full" style={{ background: '#f59e0b' }} />

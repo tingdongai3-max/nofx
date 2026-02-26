@@ -2386,10 +2386,13 @@ func (at *AutoTrader) checkPositionDrawdown() {
 			continue // 处理完毕，跳过该币种后续判断
 		}
 
-		// 2. 1R 首批止盈 + 0.8R 动态追踪止损（仅当 ATR 状态存在且 EntryATR>0 时）
-		at.atrTrailingMu.Lock()
-		state := at.atrTrailingState[posKey]
-		at.atrTrailingMu.Unlock()
+		// 2. 1R 首批止盈 + 0.8R 动态追踪止损（仅当策略开启 ATR 追踪且该仓位有 ATR 状态时执行，关闭 ATR 后不再追踪）
+		var state *ATRTrailingState
+		if at.config.StrategyConfig != nil && at.config.StrategyConfig.Indicators.EnableATRTrailing {
+			at.atrTrailingMu.Lock()
+			state = at.atrTrailingState[posKey]
+			at.atrTrailingMu.Unlock()
+		}
 		if state != nil && state.EntryATR > 0 {
 			isLong := side == "long"
 			profitR := (markPrice - entryPrice) / state.EntryATR

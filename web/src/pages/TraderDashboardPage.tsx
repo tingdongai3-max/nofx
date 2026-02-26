@@ -148,6 +148,7 @@ export function TraderDashboardPage({
     const [indicatorTimeframe, setIndicatorTimeframe] = useState<string>('5m')
     const [indicatorRSIPeriod, setIndicatorRSIPeriod] = useState<number>(14)
     const [indicatorEMAPeriod, setIndicatorEMAPeriod] = useState<number>(20)
+    const [indicatorVolMultBars, setIndicatorVolMultBars] = useState<number>(5)
     const [indicatorAnalysis, setIndicatorAnalysis] = useState<IndicatorAnalysisResult | null>(null)
     const [indicatorLoading, setIndicatorLoading] = useState<boolean>(false)
     const [indicatorError, setIndicatorError] = useState<string | null>(null)
@@ -178,6 +179,7 @@ export function TraderDashboardPage({
                     timeframe: indicatorTimeframe,
                     rsi_period: String(indicatorRSIPeriod),
                     ema_period: String(indicatorEMAPeriod),
+                    vol_mult_bars: String(indicatorVolMultBars),
                 })
                 const token = typeof localStorage !== 'undefined' ? localStorage.getItem('auth_token') : null
                 const resp = await fetch(`/api/statistics/indicator-analysis?${params.toString()}`, {
@@ -206,7 +208,7 @@ export function TraderDashboardPage({
         return () => {
             aborted = true
         }
-    }, [selectedTraderId, indicatorTimeframe, indicatorRSIPeriod, indicatorEMAPeriod])
+    }, [selectedTraderId, indicatorTimeframe, indicatorRSIPeriod, indicatorEMAPeriod, indicatorVolMultBars])
 
     // Reset page when positions change
     useEffect(() => {
@@ -1008,6 +1010,28 @@ export function TraderDashboardPage({
                                         >
                                             EMA-50
                                         </button>
+                                        {/* 放量：前 N 根 K 线 */}
+                                        <button
+                                            type="button"
+                                            onClick={() => setIndicatorVolMultBars(5)}
+                                            className={`px-2 py-0.5 rounded-full text-[10px] border ${indicatorVolMultBars === 5 ? 'bg-emerald-500/20 border-emerald-500 text-emerald-400' : 'border-white/10 text-nofx-text-muted hover:border-emerald-500/50'}`}
+                                        >
+                                            {language === 'zh' ? '放量-5' : 'Vol×5'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setIndicatorVolMultBars(10)}
+                                            className={`px-2 py-0.5 rounded-full text-[10px] border ${indicatorVolMultBars === 10 ? 'bg-emerald-500/20 border-emerald-500 text-emerald-400' : 'border-white/10 text-nofx-text-muted hover:border-emerald-500/50'}`}
+                                        >
+                                            {language === 'zh' ? '放量-10' : 'Vol×10'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setIndicatorVolMultBars(20)}
+                                            className={`px-2 py-0.5 rounded-full text-[10px] border ${indicatorVolMultBars === 20 ? 'bg-emerald-500/20 border-emerald-500 text-emerald-400' : 'border-white/10 text-nofx-text-muted hover:border-emerald-500/50'}`}
+                                        >
+                                            {language === 'zh' ? '放量-20' : 'Vol×20'}
+                                        </button>
                                     </div>
                                 </div>
                             </div>
@@ -1061,6 +1085,7 @@ export function TraderDashboardPage({
                                                       : indicatorAnalysis.indicators_all
                                             const rsiPeriod = indicatorAnalysis.rsi_period ?? 14
                                             const emaPeriod = indicatorAnalysis.ema_period ?? 20
+                                            const volMultBars = indicatorAnalysis.vol_mult_bars ?? 5
                                             const config: { key: string; label: string; unit: string; signed?: boolean; volMult?: boolean }[] = [
                                                 { key: 'rsi', label: `RSI (${rsiPeriod})`, unit: '' },
                                                 { key: 'emabias', label: language === 'zh' ? `EMA 偏离 (${emaPeriod})` : `EMA Bias (${emaPeriod})`, unit: '%', signed: true },
@@ -1069,7 +1094,7 @@ export function TraderDashboardPage({
                                                 { key: 'macd', label: language === 'zh' ? 'MACD (柱)' : 'MACD (Histogram)', unit: '', signed: true },
                                                 { key: 'adx', label: 'ADX (14)', unit: '' },
                                                 { key: 'bias', label: language === 'zh' ? '乖离率 (Bias)' : 'Bias', unit: '%', signed: true },
-                                                { key: 'vol_mult', label: language === 'zh' ? '成交量倍数' : 'Vol Mult', unit: 'x', volMult: true },
+                                                { key: 'vol_mult', label: language === 'zh' ? `放量 (前${volMultBars}根)` : `Vol Mult (${volMultBars})`, unit: 'x', volMult: true },
                                             ]
                                             const formatBiasSuffix = (val: number | undefined) =>
                                                 val == null || val === 0 ? '' : val < 0 ? (language === 'zh' ? ' (EMA下)' : ' (Below)') : (language === 'zh' ? ' (EMA上)' : ' (Above)')

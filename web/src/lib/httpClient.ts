@@ -30,9 +30,10 @@ export class HttpClient {
 
   constructor() {
     // Create axios instance
+    // 120s：避免 AI 推理/策略测试等长耗时接口被前端提前断开（模型推理可能 60–120s）
     this.axiosInstance = axios.create({
       baseURL: '/',
-      timeout: 30000,
+      timeout: 500000,
       headers: {
         'Content-Type': 'application/json',
       },

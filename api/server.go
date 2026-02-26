@@ -3154,6 +3154,13 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 			macdSignal = n
 		}
 	}
+	// 放量指标：当前K线成交量 / 前N根K线成交量平均值，N 可配置
+	volMultBars := 5
+	if v := c.DefaultQuery("vol_mult_bars", "5"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 100 {
+			volMultBars = n
+		}
+	}
 
 	var fromFilterMs, toFilterMs int64
 	var hasFrom, hasTo bool
@@ -3200,6 +3207,7 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 			"timeframe":        normTF,
 			"rsi_period":       rsiPeriod,
 			"ema_period":       emaPeriod,
+			"vol_mult_bars":    volMultBars,
 			"from":             nil,
 			"to":               nil,
 			"trade_count":      0,
@@ -3238,6 +3246,7 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 			"timeframe":        normTF,
 			"rsi_period":       rsiPeriod,
 			"ema_period":       emaPeriod,
+			"vol_mult_bars":    volMultBars,
 			"from":             nil,
 			"to":               nil,
 			"trade_count":      0,
@@ -3370,13 +3379,16 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 		}
 
 		// Add buffer on both sides to ensure we have enough history for indicators.
-		// MACD 需要至少 macdSlow+macdSignal 根 K 线（如 26+9=35）才能算出 histogram。
+		// MACD 需要至少 macdSlow+macdSignal 根 K 线（如 26+9=35）才能算出 histogram；放量需要 volMultBars+1 根。
 		maxLookbackBars := rsiPeriod
 		if emaPeriod > maxLookbackBars {
 			maxLookbackBars = emaPeriod
 		}
 		if macdSlow+macdSignal > maxLookbackBars {
 			maxLookbackBars = macdSlow + macdSignal
+		}
+		if volMultBars+1 > maxLookbackBars {
+			maxLookbackBars = volMultBars + 1
 		}
 		if maxLookbackBars < 35 {
 			maxLookbackBars = 35
@@ -3406,7 +3418,7 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 			// Entry snapshot
 			if idx := findKlineIndex(klines, p.EntryTime, tfDur); idx >= 0 {
 				slice := klines[:idx+1]
-				snap := market.ComputeIndicatorSnapshot(slice, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal)
+				snap := market.ComputeIndicatorSnapshot(slice, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal, volMultBars)
 				if snap.MACD == 0 && len(slice) < macdSlow+macdSignal {
 					logger.Infof("Indicator analysis MACD zero: symbol=%s entry sliceLen=%d (need >= %d)", symbol, len(slice), macdSlow+macdSignal)
 				}
@@ -3423,7 +3435,7 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 			// Exit snapshot
 			if idx := findKlineIndex(klines, p.ExitTime, tfDur); idx >= 0 {
 				slice := klines[:idx+1]
-				snap := market.ComputeIndicatorSnapshot(slice, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal)
+				snap := market.ComputeIndicatorSnapshot(slice, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal, volMultBars)
 				addSampleAllSides("rsi", snap.RSI, isWin, false, side)
 				addSampleAllSides("emabias", snap.EMABias, isWin, false, side)
 				addSampleAllSides("boll_pct", snap.BollPct, isWin, false, side)
@@ -3506,6 +3518,7 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 		"timeframe":        normTF,
 		"rsi_period":       rsiPeriod,
 		"ema_period":       emaPeriod,
+		"vol_mult_bars":    volMultBars,
 		"from":             overallFromMs,
 		"to":               overallToMs,
 		"trade_count":      len(filtered),

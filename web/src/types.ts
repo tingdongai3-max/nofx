@@ -539,6 +539,9 @@ export interface IndicatorConfig {
   enable_bias?: boolean;
   enable_fibonacci: boolean;
   enable_volume: boolean;
+  /** 放量：当前成交量/前N根K线平均成交量 */
+  enable_vol_mult?: boolean;
+  vol_mult_bars?: number;  // 默认 5
   enable_oi: boolean;
   enable_funding_rate: boolean;
   ema_periods?: number[];
@@ -580,6 +583,8 @@ export interface IndicatorConfig {
   trailing_offset_percent?: number; // 触发偏移量(%)，防插针，默认 0
   // ATR 移动止盈止损：开启后开仓不设固定 TP/SL，由 AI 输出 ATR 倍数，机器狗监控价格触发
   enable_atr_trailing?: boolean;
+  /** 允许分批止盈：关闭后 AI 只能使用单一 take_profit 全仓止盈，不能使用 take_profit_stages / atr_tp_stages */
+  enable_staged_take_profit?: boolean;
 }
 
 export interface KlineConfig {
@@ -648,6 +653,8 @@ export interface IndicatorAnalysisResult {
   timeframe: string;
   rsi_period: number;
   ema_period: number;
+  /** 放量指标：当前成交量 / 前 N 根 K 线成交量平均值，默认 5 */
+  vol_mult_bars?: number;
   from: number | null;
   to: number | null;
   trade_count: number;

@@ -787,6 +787,20 @@ func fillDynamicIndicators(klines []Kline, opts *IndicatorParams) map[string]flo
 			out[fmt.Sprintf("bias_%d", p)] = calculateBIAS(klines, p)
 		}
 	}
+	// 放量 vol_mult: 当前K线成交量 / 前 N 根 K 线成交量平均值
+	if n := opts.VolMultBars; n >= 1 && len(klines) > n {
+		last := klines[len(klines)-1]
+		sum := 0.0
+		for i := len(klines) - 1 - n; i < len(klines)-1; i++ {
+			if i >= 0 {
+				sum += klines[i].Volume
+			}
+		}
+		avg := sum / float64(n)
+		if avg > 0 {
+			out["vol_mult"] = last.Volume / avg
+		}
+	}
 	return out
 }
 
