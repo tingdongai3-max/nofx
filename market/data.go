@@ -765,7 +765,10 @@ func fillDynamicIndicators(klines []Kline, opts *IndicatorParams) map[string]flo
 		lows[i] = k.Low
 	}
 	for _, p := range opts.ADXPeriods {
-		if len(klines) > p+1 {
+		// go-talib.Adx 对样本长度要求较高，长度太短会在内部访问越界导致 panic。
+		// 这里要求至少 2*p+2 根 K 线再计算 ADX，样本不足时直接跳过该周期。
+		minBarsADX := 2*p + 2
+		if len(klines) >= minBarsADX {
 			adx := talib.Adx(highs, lows, closes, p)
 			if len(adx) > 0 {
 				out[fmt.Sprintf("adx_%d", p)] = adx[len(adx)-1]
