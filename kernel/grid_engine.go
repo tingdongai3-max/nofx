@@ -327,7 +327,7 @@ func buildGridUserPromptZh(ctx *GridContext) string {
 func buildGridUserPromptEn(ctx *GridContext) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("## Current Time: %s\n\n", ctx.CurrentTime))
+	sb.WriteString("## Grid Trading Decision Request\n\n")
 
 	// Market data section
 	sb.WriteString("## Market Data\n")
@@ -428,6 +428,9 @@ func buildGridUserPromptEn(ctx *GridContext) string {
 	sb.WriteString(fmt.Sprintf("- Max Drawdown: %.2f%%\n", ctx.MaxDrawdown))
 	sb.WriteString(fmt.Sprintf("- Daily PnL: $%.2f\n", ctx.DailyPnL))
 	sb.WriteString("\n")
+
+	// Meta information (time) 放在末尾，避免成为提示词首行的高频变动字段
+	sb.WriteString(fmt.Sprintf("## Meta\n\nCurrent Time: %s\n\n", ctx.CurrentTime))
 
 	sb.WriteString("## Please analyze the data above and make grid trading decisions\n")
 	sb.WriteString("Output a JSON array of decisions.\n")

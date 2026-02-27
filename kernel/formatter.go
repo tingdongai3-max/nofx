@@ -17,16 +17,9 @@ import (
 
 // FormatContextForAI 将交易上下文格式化为AI可理解的文本（包含Schema）
 func FormatContextForAI(ctx *Context, lang Language) string {
-	var sb strings.Builder
-
-	// 1. 添加Schema说明（让AI理解数据格式）
-	sb.WriteString(GetSchemaPrompt(lang))
-	sb.WriteString("\n---\n\n")
-
-	// 2. 当前状态概览
-	sb.WriteString(formatContextData(ctx, lang))
-
-	return sb.String()
+	// 系统提示词中已包含完整 Schema，这里只返回上下文数据本身，
+	// 避免在 User Prompt 中重复 Schema 并污染可缓存前缀。
+	return formatContextData(ctx, lang)
 }
 
 // FormatContextDataOnly 仅格式化上下文数据，不包含Schema（用于已有Schema的场景）
@@ -38,7 +31,7 @@ func FormatContextDataOnly(ctx *Context, lang Language) string {
 func formatContextData(ctx *Context, lang Language) string {
 	var sb strings.Builder
 
-	// 1. 当前状态概览
+	// 1. 当前状态概览（不包含具体时间，避免将高度动态字段放在首行）
 	if lang == LangChinese {
 		sb.WriteString(formatHeaderZH(ctx))
 	} else {
@@ -97,6 +90,15 @@ func formatContextData(ctx *Context, lang Language) string {
 		sb.WriteString(nofxos.FormatOIRankingForAI(ctx.OIRankingData, nofxosLang))
 	}
 
+	// 8. 元信息（当前时间等）放在最后，减少对上下文缓存前缀的影响
+	if lang == LangChinese {
+		sb.WriteString(fmt.Sprintf("## 元信息\n\n时间: %s | 周期: #%d | 运行时长: %d 分钟\n\n",
+			ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes))
+	} else {
+		sb.WriteString(fmt.Sprintf("## Meta\n\nTime: %s | Period: #%d | Runtime: %d minutes\n\n",
+			ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes))
+	}
+
 	return sb.String()
 }
 
@@ -104,8 +106,8 @@ func formatContextData(ctx *Context, lang Language) string {
 
 // formatHeaderZH 格式化头部信息（中文）
 func formatHeaderZH(ctx *Context) string {
-	return fmt.Sprintf("# 📊 交易决策请求\n\n时间: %s | 周期: #%d | 运行时长: %d 分钟\n\n",
-		ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes)
+	// 仅输出静态标题，时间等元信息放到格式化函数末尾。
+	return "# 📊 交易决策请求\n\n"
 }
 
 // formatAccountZH 格式化账户信息（中文）
@@ -373,8 +375,8 @@ func getOIInterpretationZH(oiChange, priceChange string) string {
 
 // formatHeaderEN 格式化头部信息（英文）
 func formatHeaderEN(ctx *Context) string {
-	return fmt.Sprintf("# 📊 Trading Decision Request\n\nTime: %s | Period: #%d | Runtime: %d minutes\n\n",
-		ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes)
+	// 仅输出静态标题，时间等元信息放到格式化函数末尾。
+	return "# 📊 Trading Decision Request\n\n"
 }
 
 // formatAccountEN 格式化账户信息（英文）

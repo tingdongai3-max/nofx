@@ -1010,13 +1010,6 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	promptSections := e.config.PromptSections
 	enableAIClose := riskControl.EnableAIClose
 
-	// 0. Data Dictionary & Schema (ensure AI understands all fields)
-	lang := e.GetLanguage()
-	schemaPrompt := GetSchemaPrompt(lang)
-	sb.WriteString(schemaPrompt)
-	sb.WriteString("\n\n")
-	sb.WriteString("---\n\n")
-
 	// 1. Role definition (editable)
 	if promptSections.RoleDefinition != "" {
 		sb.WriteString(promptSections.RoleDefinition)
@@ -1200,6 +1193,13 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 		sb.WriteString("Note: The above personalized strategy is a supplement to the basic rules and cannot violate the basic risk control principles.\n")
 	}
 
+	// 9. Data Dictionary & Schema（放在 System 结尾，保持前缀为交易规则与风控协议，利于上下文缓存命中）
+	lang := e.GetLanguage()
+	schemaPrompt := GetSchemaPrompt(lang)
+	sb.WriteString("\n---\n\n")
+	sb.WriteString(schemaPrompt)
+	sb.WriteString("\n")
+
 	return sb.String()
 }
 
@@ -1318,28 +1318,7 @@ func (e *StrategyEngine) writeAvailableIndicators(sb *strings.Builder) {
 func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 	var sb strings.Builder
 
-	// System status
-	sb.WriteString(fmt.Sprintf("Time: %s | Period: #%d | Runtime: %d minutes\n\n",
-		ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes))
-
-	// BTC market (MACD/RSI 来自 DynamicIndicators，与策略配置一致)
-	if btcData, hasBTC := ctx.MarketDataMap["BTCUSDT"]; hasBTC {
-		macd, rsi := 0.0, 0.0
-		if btcData.DynamicIndicators != nil {
-			if v, ok := btcData.DynamicIndicators["macd"]; ok {
-				macd = v
-			}
-			if v, ok := btcData.DynamicIndicators["rsi_7"]; ok {
-				rsi = v
-			} else if v, ok := btcData.DynamicIndicators["rsi_14"]; ok {
-				rsi = v
-			}
-		}
-		sb.WriteString(fmt.Sprintf("BTC: %.2f (1h: %+.2f%%, 4h: %+.2f%%) | MACD: %.4f | RSI: %.2f\n\n",
-			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h, macd, rsi))
-	}
-
-	// Account information
+	// Account information（相对稳定的账户层数据，放在 User Prompt 开头）
 	sb.WriteString(fmt.Sprintf("Account: Equity %.2f | Balance %.2f (%.1f%%) | PnL %+.2f%% | Margin %.1f%% | Positions %d\n\n",
 		ctx.Account.TotalEquity,
 		ctx.Account.AvailableBalance,
@@ -1535,6 +1514,26 @@ func (e *StrategyEngine) formatPositionInfo(index int, pos PositionInfo, ctx *Co
 			}
 		}
 		sb.WriteString("\n")
+	}
+
+	// System status & BTC 市场快照（高度动态的数据放在 User Prompt 尾部，减少对缓存前缀的影响）
+	sb.WriteString(fmt.Sprintf("Time: %s | Period: #%d | Runtime: %d minutes\n\n",
+		ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes))
+
+	if btcData, hasBTC := ctx.MarketDataMap["BTCUSDT"]; hasBTC {
+		macd, rsi := 0.0, 0.0
+		if btcData.DynamicIndicators != nil {
+			if v, ok := btcData.DynamicIndicators["macd"]; ok {
+				macd = v
+			}
+			if v, ok := btcData.DynamicIndicators["rsi_7"]; ok {
+				rsi = v
+			} else if v, ok := btcData.DynamicIndicators["rsi_14"]; ok {
+				rsi = v
+			}
+		}
+		sb.WriteString(fmt.Sprintf("BTC Snapshot: Price %.2f | 1h %+.2f%% | 4h %+.2f%% | MACD %.4f | RSI %.2f\n",
+			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h, macd, rsi))
 	}
 
 	return sb.String()
