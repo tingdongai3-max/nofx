@@ -1730,21 +1730,47 @@ func (e *StrategyEngine) formatTimeframeSeriesData(sb *strings.Builder, data *ma
 		}
 	}
 
-	// 按策略开关输出 EMA/RSI/MACD/BOLL/ATR：未启用的指标不计算/不暴露给 AI
-	if indicators.EnableEMA && len(data.EMA20Values) > 0 {
+	// 按策略开关与用户配置的周期输出 EMA/RSI：用户配置什么，AI 获取什么（从 DynamicIndicatorSeries 按 EMAPeriods/RSIPeriods 输出）
+	if indicators.EnableEMA && len(data.DynamicIndicatorSeries) > 0 {
+		periods := indicators.EMAPeriods
+		if len(periods) == 0 {
+			periods = []int{20, 50}
+		}
+		for _, p := range periods {
+			key := fmt.Sprintf("ema_%d", p)
+			if vals, ok := data.DynamicIndicatorSeries[key]; ok && len(vals) > 0 {
+				sb.WriteString(fmt.Sprintf("EMA%d: %s\n", p, formatFloatSlice(vals)))
+			}
+		}
+	}
+	if indicators.EnableEMA && len(data.DynamicIndicatorSeries) == 0 && len(data.EMA20Values) > 0 {
 		sb.WriteString(fmt.Sprintf("EMA20: %s\n", formatFloatSlice(data.EMA20Values)))
 	}
-	if indicators.EnableEMA && len(data.EMA50Values) > 0 {
+	if indicators.EnableEMA && len(data.DynamicIndicatorSeries) == 0 && len(data.EMA50Values) > 0 {
 		sb.WriteString(fmt.Sprintf("EMA50: %s\n", formatFloatSlice(data.EMA50Values)))
 	}
 	if indicators.EnableMACD && len(data.MACDValues) > 0 {
 		sb.WriteString(fmt.Sprintf("MACD: %s\n", formatFloatSlice(data.MACDValues)))
 	}
-	if indicators.EnableRSI && len(data.RSI7Values) > 0 {
-		sb.WriteString(fmt.Sprintf("RSI7: %s\n", formatFloatSlice(data.RSI7Values)))
+	if indicators.EnableRSI && len(data.DynamicIndicatorSeries) > 0 {
+		periods := indicators.RSIPeriods
+		if len(periods) == 0 {
+			periods = []int{14}
+		}
+		for _, p := range periods {
+			key := fmt.Sprintf("rsi_%d", p)
+			if vals, ok := data.DynamicIndicatorSeries[key]; ok && len(vals) > 0 {
+				sb.WriteString(fmt.Sprintf("RSI%d: %s\n", p, formatFloatSlice(vals)))
+			}
+		}
 	}
-	if indicators.EnableRSI && len(data.RSI14Values) > 0 {
-		sb.WriteString(fmt.Sprintf("RSI14: %s\n", formatFloatSlice(data.RSI14Values)))
+	if indicators.EnableRSI && len(data.DynamicIndicatorSeries) == 0 {
+		if len(data.RSI7Values) > 0 {
+			sb.WriteString(fmt.Sprintf("RSI7: %s\n", formatFloatSlice(data.RSI7Values)))
+		}
+		if len(data.RSI14Values) > 0 {
+			sb.WriteString(fmt.Sprintf("RSI14: %s\n", formatFloatSlice(data.RSI14Values)))
+		}
 	}
 	if indicators.EnableATR && data.ATR14 > 0 {
 		sb.WriteString(fmt.Sprintf("ATR14: %.4f\n", data.ATR14))

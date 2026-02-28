@@ -368,7 +368,7 @@ func GetWithTimeframesWithExchange(symbol string, timeframes []string, primaryTi
 			primaryKlines = klines
 		}
 
-		seriesData := calculateTimeframeSeries(klines, tf, limit)
+		seriesData := calculateTimeframeSeries(klines, tf, limit, opts)
 		timeframeData[tf] = seriesData
 	}
 
@@ -409,25 +409,37 @@ func GetWithTimeframesWithExchange(symbol string, timeframes []string, primaryTi
 	}, nil
 }
 
-// calculateTimeframeSeries calculates series data for a single timeframe
-func calculateTimeframeSeries(klines []Kline, timeframe string, count int) *TimeframeSeriesData {
+// calculateTimeframeSeries calculates series data for a single timeframe.
+// opts 为 nil 时使用默认 EMAPeriods [20,50]、RSIPeriods [7,14]；用户配置什么就输出什么（按 EMAPeriods、RSIPeriods 填充 DynamicIndicatorSeries）。
+func calculateTimeframeSeries(klines []Kline, timeframe string, count int, opts *IndicatorParams) *TimeframeSeriesData {
 	if count <= 0 {
 		count = 10 // default
 	}
+	emaPeriods := []int{20, 50}
+	rsiPeriods := []int{7, 14}
+	if opts != nil {
+		if len(opts.EMAPeriods) > 0 {
+			emaPeriods = opts.EMAPeriods
+		}
+		if len(opts.RSIPeriods) > 0 {
+			rsiPeriods = opts.RSIPeriods
+		}
+	}
 
 	data := &TimeframeSeriesData{
-		Timeframe:   timeframe,
-		Klines:      make([]KlineBar, 0, count),
-		MidPrices:   make([]float64, 0, count),
-		EMA20Values: make([]float64, 0, count),
-		EMA50Values: make([]float64, 0, count),
-		MACDValues:  make([]float64, 0, count),
-		RSI7Values:  make([]float64, 0, count),
-		RSI14Values: make([]float64, 0, count),
-		Volume:      make([]float64, 0, count),
-		BOLLUpper:   make([]float64, 0, count),
-		BOLLMiddle:  make([]float64, 0, count),
-		BOLLLower:   make([]float64, 0, count),
+		Timeframe:            timeframe,
+		Klines:               make([]KlineBar, 0, count),
+		MidPrices:            make([]float64, 0, count),
+		EMA20Values:           make([]float64, 0, count),
+		EMA50Values:           make([]float64, 0, count),
+		MACDValues:           make([]float64, 0, count),
+		RSI7Values:           make([]float64, 0, count),
+		RSI14Values:          make([]float64, 0, count),
+		Volume:               make([]float64, 0, count),
+		BOLLUpper:            make([]float64, 0, count),
+		BOLLMiddle:           make([]float64, 0, count),
+		BOLLLower:            make([]float64, 0, count),
+		DynamicIndicatorSeries: make(map[string][]float64),
 	}
 
 	// Get latest N data points based on count from config
@@ -437,7 +449,6 @@ func calculateTimeframeSeries(klines []Kline, timeframe string, count int) *Time
 	}
 
 	for i := start; i < len(klines); i++ {
-		// Store full OHLCV kline data
 		data.Klines = append(data.Klines, KlineBar{
 			Time:   klines[i].OpenTime,
 			Open:   klines[i].Open,
@@ -446,40 +457,50 @@ func calculateTimeframeSeries(klines []Kline, timeframe string, count int) *Time
 			Close:  klines[i].Close,
 			Volume: klines[i].Volume,
 		})
-
-		// Keep MidPrices and Volume for backward compatibility
 		data.MidPrices = append(data.MidPrices, klines[i].Close)
 		data.Volume = append(data.Volume, klines[i].Volume)
 
-		// Calculate EMA20 for each point
+		// DynamicIndicatorSeries：按用户配置的 EMAPeriods 计算
+		for _, p := range emaPeriods {
+			if i >= p-1 {
+				v := calculateEMA(klines[:i+1], p)
+				key := fmt.Sprintf("ema_%d", p)
+				if data.DynamicIndicatorSeries[key] == nil {
+					data.DynamicIndicatorSeries[key] = make([]float64, 0, count)
+				}
+				data.DynamicIndicatorSeries[key] = append(data.DynamicIndicatorSeries[key], v)
+			}
+		}
+		// 兼容旧字段：若配置了 20/50 则写入 EMA20Values/EMA50Values
 		if i >= 19 {
-			ema20 := calculateEMA(klines[:i+1], 20)
-			data.EMA20Values = append(data.EMA20Values, ema20)
+			data.EMA20Values = append(data.EMA20Values, calculateEMA(klines[:i+1], 20))
 		}
-
-		// Calculate EMA50 for each point
 		if i >= 49 {
-			ema50 := calculateEMA(klines[:i+1], 50)
-			data.EMA50Values = append(data.EMA50Values, ema50)
+			data.EMA50Values = append(data.EMA50Values, calculateEMA(klines[:i+1], 50))
 		}
 
-		// Calculate MACD for each point
+		// DynamicIndicatorSeries：按用户配置的 RSIPeriods 计算
+		for _, p := range rsiPeriods {
+			if i >= p {
+				v := calculateRSI(klines[:i+1], p)
+				key := fmt.Sprintf("rsi_%d", p)
+				if data.DynamicIndicatorSeries[key] == nil {
+					data.DynamicIndicatorSeries[key] = make([]float64, 0, count)
+				}
+				data.DynamicIndicatorSeries[key] = append(data.DynamicIndicatorSeries[key], v)
+			}
+		}
+		if i >= 7 {
+			data.RSI7Values = append(data.RSI7Values, calculateRSI(klines[:i+1], 7))
+		}
+		if i >= 14 {
+			data.RSI14Values = append(data.RSI14Values, calculateRSI(klines[:i+1], 14))
+		}
+
 		if i >= 25 {
 			macd := calculateMACD(klines[:i+1])
 			data.MACDValues = append(data.MACDValues, macd)
 		}
-
-		// Calculate RSI for each point
-		if i >= 7 {
-			rsi7 := calculateRSI(klines[:i+1], 7)
-			data.RSI7Values = append(data.RSI7Values, rsi7)
-		}
-		if i >= 14 {
-			rsi14 := calculateRSI(klines[:i+1], 14)
-			data.RSI14Values = append(data.RSI14Values, rsi14)
-		}
-
-		// Calculate Bollinger Bands (period 20, std dev multiplier 2)
 		if i >= 19 {
 			upper, middle, lower := calculateBOLL(klines[:i+1], 20, 2.0)
 			data.BOLLUpper = append(data.BOLLUpper, upper)
@@ -488,9 +509,7 @@ func calculateTimeframeSeries(klines []Kline, timeframe string, count int) *Time
 		}
 	}
 
-	// Calculate ATR14
 	data.ATR14 = calculateATR(klines, 14)
-
 	return data
 }
 
@@ -1115,25 +1134,40 @@ func formatTimeframeData(sb *strings.Builder, data *TimeframeSeriesData) {
 		}
 	}
 
-	// Technical indicators
-	if len(data.EMA20Values) > 0 {
-		sb.WriteString(fmt.Sprintf("EMA20: %s\n", formatFloatSlice(data.EMA20Values)))
+	// Technical indicators: 优先使用 DynamicIndicatorSeries（用户配置什么输出什么），否则回退到旧字段
+	if len(data.DynamicIndicatorSeries) > 0 {
+		keys := make([]string, 0, len(data.DynamicIndicatorSeries))
+		for k := range data.DynamicIndicatorSeries {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			vals := data.DynamicIndicatorSeries[key]
+			if len(vals) > 0 {
+				// ema_20 -> EMA20, rsi_14 -> RSI14
+				parts := strings.SplitN(key, "_", 2)
+				if len(parts) == 2 {
+					upper := strings.ToUpper(parts[0])
+					sb.WriteString(fmt.Sprintf("%s%s: %s\n", upper, parts[1], formatFloatSlice(vals)))
+				}
+			}
+		}
+	} else {
+		if len(data.EMA20Values) > 0 {
+			sb.WriteString(fmt.Sprintf("EMA20: %s\n", formatFloatSlice(data.EMA20Values)))
+		}
+		if len(data.EMA50Values) > 0 {
+			sb.WriteString(fmt.Sprintf("EMA50: %s\n", formatFloatSlice(data.EMA50Values)))
+		}
+		if len(data.RSI7Values) > 0 {
+			sb.WriteString(fmt.Sprintf("RSI7: %s\n", formatFloatSlice(data.RSI7Values)))
+		}
+		if len(data.RSI14Values) > 0 {
+			sb.WriteString(fmt.Sprintf("RSI14: %s\n", formatFloatSlice(data.RSI14Values)))
+		}
 	}
-
-	if len(data.EMA50Values) > 0 {
-		sb.WriteString(fmt.Sprintf("EMA50: %s\n", formatFloatSlice(data.EMA50Values)))
-	}
-
 	if len(data.MACDValues) > 0 {
 		sb.WriteString(fmt.Sprintf("MACD: %s\n", formatFloatSlice(data.MACDValues)))
-	}
-
-	if len(data.RSI7Values) > 0 {
-		sb.WriteString(fmt.Sprintf("RSI7: %s\n", formatFloatSlice(data.RSI7Values)))
-	}
-
-	if len(data.RSI14Values) > 0 {
-		sb.WriteString(fmt.Sprintf("RSI14: %s\n", formatFloatSlice(data.RSI14Values)))
 	}
 
 	if data.ATR14 > 0 {
