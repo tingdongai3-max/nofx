@@ -892,7 +892,7 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 		pnlPct := calculatePnLPercentage(unrealizedPnl, marginUsed)
 
 		// Get position open time from exchange (preferred) or fallback to local tracking
-		posKey := symbol + "_" + side
+		posKey := symbol + "_" + strings.ToLower(side)
 		currentPositionKeys[posKey] = true
 
 		var updateTime int64
@@ -2351,7 +2351,7 @@ func (at *AutoTrader) checkPositionDrawdown() {
 		}
 
 		// Construct unique position identifier (distinguish long/short)
-		posKey := symbol + "_" + side
+		posKey := symbol + "_" + strings.ToLower(side)
 
 		// Get historical peak profit for this position
 		at.peakPnLCacheMutex.RLock()
@@ -2545,7 +2545,7 @@ func (at *AutoTrader) UpdatePeakPnL(symbol, side string, currentPnLPct float64) 
 	at.peakPnLCacheMutex.Lock()
 	defer at.peakPnLCacheMutex.Unlock()
 
-	posKey := symbol + "_" + side
+	posKey := symbol + "_" + strings.ToLower(side)
 	if peak, exists := at.peakPnLCache[posKey]; exists {
 		// Update peak (if long, take larger value; if short, currentPnLPct is negative, also compare)
 		if currentPnLPct > peak {
@@ -2562,7 +2562,7 @@ func (at *AutoTrader) ClearPeakPnLCache(symbol, side string) {
 	at.peakPnLCacheMutex.Lock()
 	defer at.peakPnLCacheMutex.Unlock()
 
-	posKey := symbol + "_" + side
+	posKey := symbol + "_" + strings.ToLower(side)
 	delete(at.peakPnLCache, posKey)
 }
 
@@ -2721,7 +2721,7 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 		var mfe, mae float64
 		if openPos, err := at.store.Position().GetOpenPositionBySymbol(at.id, symbol, side); err == nil && openPos != nil {
 			peakCache := at.GetPeakPnLCache()
-			posKey := symbol + "_" + side
+			posKey := symbol + "_" + strings.ToLower(side)
 			if peakPct, ok := peakCache[posKey]; ok && peakPct > 0 {
 				notional := openPos.EntryPrice * openPos.Quantity
 				mfe = notional * (peakPct / 100)

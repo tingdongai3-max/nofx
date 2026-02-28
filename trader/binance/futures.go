@@ -1252,29 +1252,50 @@ func (t *FuturesTrader) CheckMinNotional(symbol string, quantity float64) error 
 	return nil
 }
 
-// GetSymbolPrecision gets the quantity precision for a trading pair
-func (t *FuturesTrader) GetSymbolPrecision(symbol string) (int, error) {
+// getSymbolLotSize returns LOT_SIZE filter: minQty, maxQty, stepSize (float64), precision. err != nil or maxQty==0 means not found.
+func (t *FuturesTrader) getSymbolLotSize(symbol string) (minQty, maxQty, stepSize float64, precision int, err error) {
 	exchangeInfo, err := t.client.NewExchangeInfoService().Do(context.Background())
 	if err != nil {
-		return 0, fmt.Errorf("failed to get trading rules: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("failed to get trading rules: %w", err)
 	}
 
 	for _, s := range exchangeInfo.Symbols {
-		if s.Symbol == symbol {
-			// Get precision from LOT_SIZE filter
-			for _, filter := range s.Filters {
-				if filter["filterType"] == "LOT_SIZE" {
-					stepSize := filter["stepSize"].(string)
-					precision := calculatePrecision(stepSize)
-					logger.Infof("  %s quantity precision: %d (stepSize: %s)", symbol, precision, stepSize)
-					return precision, nil
-				}
-			}
+		if s.Symbol != symbol {
+			continue
 		}
+		for _, filter := range s.Filters {
+			if filter["filterType"] != "LOT_SIZE" {
+				continue
+			}
+			minStr, _ := filter["minQty"].(string)
+			maxStr, _ := filter["maxQty"].(string)
+			stepStr, _ := filter["stepSize"].(string)
+			minQty, _ = strconv.ParseFloat(minStr, 64)
+			maxQty, _ = strconv.ParseFloat(maxStr, 64)
+			stepSize, _ = strconv.ParseFloat(stepStr, 64)
+			if stepSize <= 0 {
+				stepSize = 0.001
+			}
+			precision = calculatePrecision(stepStr)
+			return minQty, maxQty, stepSize, precision, nil
+		}
+		break
 	}
 
-	logger.Infof("  ⚠ %s precision information not found, using default precision 3", symbol)
-	return 3, nil // Default precision is 3
+	return 0, 0, 0, 3, nil // symbol not found, caller will use defaults
+}
+
+// GetSymbolPrecision gets the quantity precision for a trading pair
+func (t *FuturesTrader) GetSymbolPrecision(symbol string) (int, error) {
+	_, _, _, precision, err := t.getSymbolLotSize(symbol)
+	if err != nil {
+		return 0, err
+	}
+	if precision == 0 && err == nil {
+		logger.Infof("  ⚠ %s precision information not found, using default precision 3", symbol)
+		return 3, nil
+	}
+	return precision, nil
 }
 
 // calculatePrecision calculates precision from stepSize
@@ -1320,16 +1341,28 @@ func trimTrailingZeros(s string) string {
 	return s
 }
 
-// FormatQuantity formats quantity to correct precision
+// FormatQuantity formats quantity to symbol's precision, caps to maxQty, and rounds down to stepSize (avoids -4005 Quantity greater than max quantity).
 func (t *FuturesTrader) FormatQuantity(symbol string, quantity float64) (string, error) {
-	precision, err := t.GetSymbolPrecision(symbol)
+	minQty, maxQty, stepSize, precision, err := t.getSymbolLotSize(symbol)
 	if err != nil {
-		// If retrieval fails, use default format
 		return fmt.Sprintf("%.3f", quantity), nil
 	}
 
+	q := quantity
+	if maxQty > 0 && q > maxQty {
+		logger.Infof("  ⚠ %s quantity %.8f exceeds exchange maxQty %.8f, capping to max", symbol, q, maxQty)
+		q = maxQty
+	}
+	if stepSize > 0 {
+		// Round down to step size to satisfy LOT_SIZE
+		q = math.Floor(q/stepSize+1e-15) * stepSize
+	}
+	if minQty > 0 && q < minQty {
+		q = 0
+	}
+
 	format := fmt.Sprintf("%%.%df", precision)
-	return fmt.Sprintf(format, quantity), nil
+	return fmt.Sprintf(format, q), nil
 }
 
 // GetSymbolPricePrecision gets the price precision for a trading pair

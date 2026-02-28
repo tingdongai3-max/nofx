@@ -144,6 +144,15 @@ func (s *PositionStore) InitTables() error {
 				}
 			}
 
+			// Ensure MFE/MAE columns exist (added later; existing DBs may not have them)
+			for _, col := range []string{"max_favorable_excursion", "max_adverse_excursion"} {
+				var count int64
+				s.db.Raw(`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'trader_positions' AND column_name = ?`, col).Scan(&count)
+				if count == 0 {
+					s.db.Exec(fmt.Sprintf(`ALTER TABLE trader_positions ADD COLUMN %s DOUBLE PRECISION DEFAULT 0`, col))
+				}
+			}
+
 			// Just ensure index exists
 			s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_exchange_pos_unique ON trader_positions(exchange_id, exchange_position_id) WHERE exchange_position_id != ''`)
 			return nil
