@@ -80,13 +80,22 @@ func getKlinesFromCoinAnk(symbol, interval, exchange string, limit int) ([]Kline
 	// Prefer live WebSocket buffer first to achieve real-time, zero-HTTP quotes.
 	ensureKlineStream(symbol, interval, exchange)
 	if live, ok := getRealtimeKlines(symbol, interval, exchange, limit); ok && len(live) > 0 {
-		return live, nil
+		// 数据新鲜度校验：若最新 K 线的收盘时间距当前超过 15 分钟，说明数据流已卡死，强制 REST 拉取并覆盖缓存
+		nowMs := time.Now().UTC().UnixMilli()
+		lastClose := live[len(live)-1].CloseTime
+		const maxStalenessMs = 15 * 60 * 1000 // 15 minutes
+		if nowMs-lastClose <= maxStalenessMs {
+			return live, nil
+		}
+		logger.Warnf("⚠️ K-line cache stale for %s %s %s: last CloseTime %d ms behind now %d, forcing REST refetch",
+			symbol, interval, exchange, nowMs-lastClose, nowMs)
 	}
 
 	// Fallback: call CoinAnk free/open HTTP API (no authentication required).
-	// This path is mainly for historical backfill or when WS hasn't produced data yet.
+	// Use UTC milliseconds only; do not apply any timezone offset (e.g. no .Add(-8*time.Hour)).
 	ctx := context.Background()
-	ts := time.Now().UnixMilli()
+	ts := time.Now().UTC().UnixMilli()
+	logger.Infof("K-line REST request: symbol=%s interval=%s exchange=%s endTime(UTC ms)=%d", symbol, interval, exchange, ts)
 	coinankKlines, err := coinank_api.Kline(ctx, symbol, coinankExchange, ts, coinank_enum.To, limit, coinankInterval)
 	if err != nil {
 		// If exchange-specific data fails, fallback to Binance
@@ -114,6 +123,8 @@ func getKlinesFromCoinAnk(symbol, interval, exchange string, limit int) ([]Kline
 			CloseTime: ck.EndTime,
 		}
 	}
+	// 强制 REST 后覆盖内存缓存，避免后续读者继续读到旧数据
+	refillKlineRing(symbol, interval, exchange, klines)
 
 	return klines, nil
 }
@@ -267,6 +278,31 @@ func GetWithExchange(symbol, exchange string, opts *IndicatorParams) (*Data, err
 		IntradaySeries:    intradayData,
 		LongerTermContext: longerTermData,
 	}, nil
+}
+
+// timeframeDurationMs 各周期一根 K 线的时长（毫秒），用于计算最后一根 K 线的收盘时间
+var timeframeDurationMs = map[string]int64{
+	"1m": 60 * 1000, "3m": 3 * 60 * 1000, "5m": 5 * 60 * 1000, "15m": 15 * 60 * 1000, "30m": 30 * 60 * 1000,
+	"1h": 3600 * 1000, "2h": 2 * 3600 * 1000, "4h": 4 * 3600 * 1000, "6h": 6 * 3600 * 1000, "8h": 8 * 3600 * 1000, "12h": 12 * 3600 * 1000,
+	"1d": 24 * 3600 * 1000, "3d": 3 * 24 * 3600 * 1000, "1w": 7 * 24 * 3600 * 1000,
+}
+
+// DataLastCloseTimeMs 返回该 Data 在指定周期下最后一根 K 线的收盘时间（UTC 毫秒）。ok 表示是否有有效数据。
+func DataLastCloseTimeMs(data *Data, timeframe string) (closeTimeMs int64, ok bool) {
+	if data == nil || data.TimeframeData == nil {
+		return 0, false
+	}
+	tf := strings.ToLower(strings.TrimSpace(timeframe))
+	tfData, ok := data.TimeframeData[tf]
+	if !ok || len(tfData.Klines) == 0 {
+		return 0, false
+	}
+	last := tfData.Klines[len(tfData.Klines)-1]
+	dur, has := timeframeDurationMs[tf]
+	if !has {
+		return 0, false
+	}
+	return last.Time + dur, true
 }
 
 // DefaultCountForTimeframe 返回未配置时各周期默认 K 线数量（小周期多、大周期少，控制 Token），供调用方构建 counts 使用

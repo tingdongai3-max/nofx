@@ -326,6 +326,31 @@ func getKeysForExchange(exchangeEnum coinank_enum.Exchange) []klineSeriesKey {
 	return keys
 }
 
+// refillKlineRing overwrites the in-memory ring with the given klines (e.g. after forced REST refetch when cache was stale).
+// Call this when data freshness check fails so that subsequent readers get fresh data.
+func refillKlineRing(symbol, interval, exchange string, klines []Kline) {
+	if len(klines) == 0 {
+		return
+	}
+	symbol = Normalize(symbol)
+	exchangeEnum := mapExchangeToEnum(exchange)
+	intervalEnum, ok := mapIntervalToEnum(interval)
+	if !ok {
+		return
+	}
+	if IsXyzDexAsset(symbol) {
+		return
+	}
+	key := klineSeriesKey{Symbol: symbol, Exchange: exchangeEnum, Interval: intervalEnum}
+	klineStreamsMu.Lock()
+	ring := klineStreams[key]
+	klineStreamsMu.Unlock()
+	if ring != nil {
+		ring.loadHistory(klines)
+		logger.Infof("✓ K-line cache refilled: %s %s %s, %d bars (stale data was replaced)", symbol, exchange, interval, len(klines))
+	}
+}
+
 // getRealtimeKlines returns a recent snapshot of Klines from the WebSocket buffer, if available.
 // count <= 0 means "all available".
 func getRealtimeKlines(symbol, interval, exchange string, count int) ([]Kline, bool) {

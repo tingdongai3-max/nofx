@@ -312,6 +312,11 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 	// 3. Build User Prompt using strategy engine (always dynamic: market data, positions)
 	userPrompt := engine.BuildUserPrompt(ctx)
 
+	// 3.5 熔断风控：若传给 AI 的最后一根 K 线收盘时间落后当前时间超过 10 分钟，中止交易，绝不让 AI 拿陈旧数据做判断
+	if err := ensureKlineDataFreshness(ctx, engine); err != nil {
+		return nil, err
+	}
+
 	// 4. Call AI API (Claude uses prompt caching for systemStatic; others get concatenated system)
 	aiCallStart := time.Now()
 	aiResponse, err := mcpClient.CallWithCacheableSystem(systemStatic, systemDynamic, userPrompt)
@@ -353,6 +358,38 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 // ============================================================================
 // Market Data Fetching
 // ============================================================================
+
+// ensureKlineDataFreshness 熔断风控：若任一击中标的的 K 线数据最后一根收盘时间落后当前超过 10 分钟，直接报错中止，不让 AI 拿陈旧数据交易。
+func ensureKlineDataFreshness(ctx *Context, engine *StrategyEngine) error {
+	if ctx == nil || engine == nil || engine.config == nil {
+		return nil
+	}
+	primaryTF := engine.config.Indicators.Klines.PrimaryTimeframe
+	if primaryTF == "" && len(engine.config.Indicators.Klines.SelectedTimeframes) > 0 {
+		primaryTF = engine.config.Indicators.Klines.SelectedTimeframes[0]
+	}
+	if primaryTF == "" {
+		primaryTF = "5m"
+	}
+	nowMs := time.Now().UTC().UnixMilli()
+	const maxStalenessMs = 10 * 60 * 1000 // 10 minutes for 5M (and other) timeframes
+
+	for symbol, data := range ctx.MarketDataMap {
+		if data == nil {
+			continue
+		}
+		lastCloseMs, ok := market.DataLastCloseTimeMs(data, primaryTF)
+		if !ok {
+			continue
+		}
+		if nowMs-lastCloseMs > maxStalenessMs {
+			logger.Infof("[ERROR] K-line data is stale, aborting trade: %s primary %s lastClose=%d now=%d lag=%d ms",
+				symbol, primaryTF, lastCloseMs, nowMs, nowMs-lastCloseMs)
+			return fmt.Errorf("[ERROR] K-line data is stale, aborting trade")
+		}
+	}
+	return nil
+}
 
 // fetchMarketDataWithStrategy fetches market data using strategy config (multiple timeframes)
 func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
@@ -1736,7 +1773,7 @@ func (e *StrategyEngine) formatTimeframeSeriesData(sb *strings.Builder, data *ma
 	if len(data.Klines) > 0 {
 		sb.WriteString("Time(UTC)      Open      High      Low       Close     Volume\n")
 		for i, k := range data.Klines {
-			t := time.Unix(k.Time/1000, 0).UTC()
+			t := time.UnixMilli(k.Time).UTC()
 			timeStr := t.Format("01-02 15:04")
 			marker := ""
 			if i == len(data.Klines)-1 {

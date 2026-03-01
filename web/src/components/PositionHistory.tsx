@@ -313,16 +313,16 @@ function PositionRow({ position }: { position: HistoricalPosition }) {
         </div>
       </td>
 
-      {/* Max Profit (MFE) */}
+      {/* Max Profit (MFE) - 严格判断 undefined/null，0 正常显示 */}
       <td className="py-3 px-4 text-right font-mono text-sm" style={{ color: 'rgba(0, 255, 173, 0.8)' }}>
-        {position.max_favorable_excursion != null && position.max_favorable_excursion > 0
-          ? `+${formatNumber(position.max_favorable_excursion)}`
+        {position.max_favorable_excursion !== undefined && position.max_favorable_excursion !== null
+          ? (position.max_favorable_excursion >= 0 ? `+${formatNumber(position.max_favorable_excursion)}` : formatNumber(position.max_favorable_excursion))
           : '–'}
       </td>
 
-      {/* Max Loss (MAE) */}
+      {/* Max Loss (MAE) - 严格判断 undefined/null，0 正常显示 */}
       <td className="py-3 px-4 text-right font-mono text-sm" style={{ color: 'rgba(255, 59, 48, 0.8)' }}>
-        {position.max_adverse_excursion != null && position.max_adverse_excursion < 0
+        {position.max_adverse_excursion !== undefined && position.max_adverse_excursion !== null
           ? formatNumber(position.max_adverse_excursion)
           : '–'}
       </td>

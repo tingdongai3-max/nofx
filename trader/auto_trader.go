@@ -142,8 +142,10 @@ type AutoTrader struct {
 	positionFirstSeenTime map[string]int64   // Position first seen time (symbol_side -> timestamp in milliseconds)
 	stopMonitorCh         chan struct{}      // Used to stop monitoring goroutine
 	monitorWg             sync.WaitGroup     // Used to wait for monitoring goroutine to finish
-	peakPnLCache          map[string]float64 // Peak profit cache (symbol -> peak P&L percentage)
-	peakPnLCacheMutex     sync.RWMutex       // Cache read-write lock
+	peakPnLCache          map[string]float64 // Peak profit (MFE) cache: symbol_side -> max P&L %
+	peakPnLCacheMutex     sync.RWMutex
+	bottomPnLCache        map[string]float64 // Bottom (MAE) cache: symbol_side -> min P&L %
+	bottomPnLCacheMutex   sync.RWMutex
 	lastBalanceSyncTime   time.Time          // Last balance sync time
 	userID                string             // User ID
 	gridState             *GridState         // Grid trading state (only used when StrategyType == "grid_trading")
@@ -380,6 +382,8 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		monitorWg:             sync.WaitGroup{},
 		peakPnLCache:          make(map[string]float64),
 		peakPnLCacheMutex:     sync.RWMutex{},
+		bottomPnLCache:       make(map[string]float64),
+		bottomPnLCacheMutex:   sync.RWMutex{},
 		lastBalanceSyncTime:   time.Now(),
 		userID:                userID,
 	}, nil
@@ -2372,6 +2376,8 @@ func (at *AutoTrader) checkPositionDrawdown() {
 			// Update peak cache
 			at.UpdatePeakPnL(symbol, side, currentPnLPct)
 		}
+		// Update bottom (MAE) cache: track max adverse excursion
+		at.UpdateBottomPnL(symbol, side, currentPnLPct)
 
 		// Calculate drawdown (magnitude of decline from peak)
 		var drawdownPct float64
@@ -2388,6 +2394,7 @@ func (at *AutoTrader) checkPositionDrawdown() {
 			} else {
 				logger.Infof("✅ 断头台强制平仓成功: %s %s", symbol, side)
 				at.ClearPeakPnLCache(symbol, side)
+				at.ClearBottomPnLCache(symbol, side)
 			}
 			continue // 处理完毕，跳过该币种后续判断
 		}
@@ -2460,6 +2467,7 @@ func (at *AutoTrader) checkPositionDrawdown() {
 							logger.Infof("❌ 追踪止损平仓失败 (%s %s): %v", symbol, side, err)
 						} else {
 							at.ClearPeakPnLCache(symbol, side)
+							at.ClearBottomPnLCache(symbol, side)
 						}
 						continue
 					}
@@ -2482,6 +2490,7 @@ func (at *AutoTrader) checkPositionDrawdown() {
 							logger.Infof("❌ 追踪止损平仓失败 (%s %s): %v", symbol, side, err)
 						} else {
 							at.ClearPeakPnLCache(symbol, side)
+							at.ClearBottomPnLCache(symbol, side)
 						}
 						continue
 					}
@@ -2499,8 +2508,8 @@ func (at *AutoTrader) checkPositionDrawdown() {
 				logger.Infof("❌ Drawdown close position failed (%s %s): %v", symbol, side, err)
 			} else {
 				logger.Infof("✅ Drawdown close position succeeded: %s %s", symbol, side)
-				// Clear cache for this position after closing
 				at.ClearPeakPnLCache(symbol, side)
+				at.ClearBottomPnLCache(symbol, side)
 			}
 		} else if currentPnLPct > 5.0 {
 			// Record situations close to close position condition (for debugging)
@@ -2570,6 +2579,42 @@ func (at *AutoTrader) ClearPeakPnLCache(symbol, side string) {
 
 	posKey := symbol + "_" + strings.ToLower(side)
 	delete(at.peakPnLCache, posKey)
+}
+
+// UpdateBottomPnL updates bottom (min PnL / MAE) cache for drawdown and persistence
+func (at *AutoTrader) UpdateBottomPnL(symbol, side string, currentPnLPct float64) {
+	at.bottomPnLCacheMutex.Lock()
+	defer at.bottomPnLCacheMutex.Unlock()
+
+	posKey := symbol + "_" + strings.ToLower(side)
+	if bottom, exists := at.bottomPnLCache[posKey]; exists {
+		if currentPnLPct < bottom {
+			at.bottomPnLCache[posKey] = currentPnLPct
+		}
+	} else {
+		at.bottomPnLCache[posKey] = currentPnLPct
+	}
+}
+
+// GetBottomPnLCache returns a copy of bottom PnL % cache (symbol_side -> min PnL %)
+func (at *AutoTrader) GetBottomPnLCache() map[string]float64 {
+	at.bottomPnLCacheMutex.RLock()
+	defer at.bottomPnLCacheMutex.RUnlock()
+
+	cache := make(map[string]float64)
+	for k, v := range at.bottomPnLCache {
+		cache[k] = v
+	}
+	return cache
+}
+
+// ClearBottomPnLCache clears bottom cache for specified position
+func (at *AutoTrader) ClearBottomPnLCache(symbol, side string) {
+	at.bottomPnLCacheMutex.Lock()
+	defer at.bottomPnLCacheMutex.Unlock()
+
+	posKey := symbol + "_" + strings.ToLower(side)
+	delete(at.bottomPnLCache, posKey)
 }
 
 // recordAndConfirmOrder polls order status for actual fill data and records position
@@ -2723,14 +2768,18 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 		}
 
 	case "close_long", "close_short":
-		// Compute MFE (Max Favorable Excursion) from peak PnL cache before closing
+		// MFE/MAE: 平仓前从内存极值缓存取出，赋给落盘对象，确保存库的是真实极值
 		var mfe, mae float64
 		if openPos, err := at.store.Position().GetOpenPositionBySymbol(at.id, symbol, side); err == nil && openPos != nil {
-			peakCache := at.GetPeakPnLCache()
+			notional := openPos.EntryPrice * openPos.Quantity
 			posKey := symbol + "_" + strings.ToLower(side)
-			if peakPct, ok := peakCache[posKey]; ok && peakPct > 0 {
-				notional := openPos.EntryPrice * openPos.Quantity
+			peakCache := at.GetPeakPnLCache()
+			if peakPct, ok := peakCache[posKey]; ok {
 				mfe = notional * (peakPct / 100)
+			}
+			bottomCache := at.GetBottomPnLCache()
+			if bottomPct, ok := bottomCache[posKey]; ok {
+				mae = notional * (bottomPct / 100)
 			}
 		}
 		posBuilder := store.NewPositionBuilder(at.store.Position())

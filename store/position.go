@@ -199,18 +199,20 @@ func (s *PositionStore) Create(pos *TraderPosition) error {
 	return s.db.Create(pos).Error
 }
 
-// ClosePosition closes position
-func (s *PositionStore) ClosePosition(id int64, exitPrice float64, exitOrderID string, realizedPnL float64, fee float64, closeReason string) error {
+// ClosePosition closes position. mfe/mae are Max Favorable / Max Adverse Excursion in USD (use 0 if not tracked).
+func (s *PositionStore) ClosePosition(id int64, exitPrice float64, exitOrderID string, realizedPnL float64, fee float64, closeReason string, mfe, mae float64) error {
 	nowMs := time.Now().UTC().UnixMilli()
 	return s.db.Model(&TraderPosition{}).Where("id = ?", id).Updates(map[string]interface{}{
-		"exit_price":   exitPrice,
-		"exit_order_id": exitOrderID,
-		"exit_time":    nowMs,
-		"realized_pnl": realizedPnL,
-		"fee":          fee,
-		"status":       "CLOSED",
-		"close_reason": closeReason,
-		"updated_at":   nowMs,
+		"exit_price":               exitPrice,
+		"exit_order_id":            exitOrderID,
+		"exit_time":                nowMs,
+		"realized_pnl":             realizedPnL,
+		"fee":                      fee,
+		"status":                   "CLOSED",
+		"close_reason":             closeReason,
+		"max_favorable_excursion":  mfe,
+		"max_adverse_excursion":    mae,
+		"updated_at":               nowMs,
 	}).Error
 }
 
@@ -1234,18 +1236,20 @@ func (s *PositionStore) CreateOpenPosition(pos *TraderPosition) error {
 	return nil
 }
 
-// ClosePositionWithAccurateData closes a position with accurate data from exchange
-// exitTimeMs is Unix milliseconds UTC
-func (s *PositionStore) ClosePositionWithAccurateData(id int64, exitPrice float64, exitOrderID string, exitTimeMs int64, realizedPnL float64, fee float64, closeReason string) error {
+// ClosePositionWithAccurateData closes a position with accurate data from exchange.
+// exitTimeMs is Unix milliseconds UTC; mfe/mae are Max Favorable / Max Adverse Excursion in USD (use 0 if not tracked).
+func (s *PositionStore) ClosePositionWithAccurateData(id int64, exitPrice float64, exitOrderID string, exitTimeMs int64, realizedPnL float64, fee float64, closeReason string, mfe, mae float64) error {
 	return s.db.Model(&TraderPosition{}).Where("id = ?", id).Updates(map[string]interface{}{
-		"exit_price":    exitPrice,
-		"exit_order_id": exitOrderID,
-		"exit_time":     exitTimeMs,
-		"realized_pnl":  realizedPnL,
-		"fee":           fee,
-		"status":        "CLOSED",
-		"close_reason":  closeReason,
-		"updated_at":    time.Now().UTC().UnixMilli(),
+		"exit_price":              exitPrice,
+		"exit_order_id":           exitOrderID,
+		"exit_time":               exitTimeMs,
+		"realized_pnl":            realizedPnL,
+		"fee":                     fee,
+		"status":                  "CLOSED",
+		"close_reason":            closeReason,
+		"max_favorable_excursion": mfe,
+		"max_adverse_excursion":   mae,
+		"updated_at":              time.Now().UTC().UnixMilli(),
 	}).Error
 }
 
