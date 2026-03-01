@@ -2839,7 +2839,7 @@ func (at *AutoTrader) checkPositionDrawdownDryRun() {
 		const MaxAllowedLossPct = -30.0
 		if currentPnLPct <= MaxAllowedLossPct {
 			logger.Infof("🚨 [Dry-Run] 断头台触发 %s %s 亏损 %.2f%%，强制平仓", symbol, side, currentPnLPct)
-			if err := at.emergencyClosePositionDryRun(symbol, side); err != nil {
+			if err := at.EmergencyClosePositionDryRun(symbol, side); err != nil {
 				logger.Infof("❌ [Dry-Run] 断头台平仓失败 (%s %s): %v", symbol, side, err)
 			} else {
 				at.ClearPeakPnLCache(symbol, side)
@@ -2851,7 +2851,7 @@ func (at *AutoTrader) checkPositionDrawdownDryRun() {
 		// 2. 回撤止盈：利润 > 5% 且回撤 >= 40%
 		if currentPnLPct > 5.0 && drawdownPct >= 40.0 {
 			logger.Infof("🚨 [Dry-Run] 回撤止盈触发: %s %s 利润 %.2f%% 回撤 %.2f%%", symbol, side, currentPnLPct, drawdownPct)
-			if err := at.emergencyClosePositionDryRun(symbol, side); err != nil {
+			if err := at.EmergencyClosePositionDryRun(symbol, side); err != nil {
 				logger.Infof("❌ [Dry-Run] 回撤平仓失败 (%s %s): %v", symbol, side, err)
 			} else {
 				at.ClearPeakPnLCache(symbol, side)
@@ -2861,8 +2861,8 @@ func (at *AutoTrader) checkPositionDrawdownDryRun() {
 	}
 }
 
-// emergencyClosePositionDryRun 模拟盘强制平仓：不调用交易所，走 Dry-Run 引擎落库并更新 VirtualEquity
-func (at *AutoTrader) emergencyClosePositionDryRun(symbol, side string) error {
+// EmergencyClosePositionDryRun 模拟盘强制平仓（供 API 调用）：不调用交易所，走 Dry-Run 引擎落库并更新 VirtualEquity
+func (at *AutoTrader) EmergencyClosePositionDryRun(symbol, side string) error {
 	decision := &kernel.Decision{Symbol: symbol, Action: ""}
 	actionRecord := &store.DecisionAction{}
 	if side == "long" {
@@ -2873,7 +2873,7 @@ func (at *AutoTrader) emergencyClosePositionDryRun(symbol, side string) error {
 	return at.executeDryRunOrder(decision, actionRecord, decision.Action, "")
 }
 
-// emergencyClosePosition emergency close position function
+// emergencyClosePosition emergency close position function (real exchange)
 func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
 	switch side {
 	case "long":

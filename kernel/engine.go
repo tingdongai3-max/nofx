@@ -33,6 +33,8 @@ var (
 	// XML tag extraction (supports any characters in reasoning chain)
 	reReasoningTag = regexp.MustCompile(`(?s)<reasoning>(.*?)</reasoning>`)
 	reDecisionTag  = regexp.MustCompile(`(?s)<decision>(.*?)</decision>`)
+	// 千分位逗号：仅匹配“数字,数字”，用于预处理时移除 reason/reasoning 等字符串内的 67,317 形式
+	reThousandSep = regexp.MustCompile(`(\d),(\d)`)
 )
 
 // ============================================================================
@@ -1313,7 +1315,8 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	if e.config.Indicators.EnableATRTrailing {
 		sb.WriteString("- When hold/wait with ATR trailing: you may update `atr_sl_mult`, `atr_tp_mult`, or `atr_tp_stages`; you may also set `stop_loss`/`take_profit`/`take_profit_stages` to update exchange fixed orders (both can coexist).\n")
 	}
-	sb.WriteString("- **IMPORTANT**: All numeric values must be calculated numbers, NOT formulas/expressions (e.g., use `27.76` not `3000 * 0.01`)\n\n")
+	sb.WriteString("- **IMPORTANT**: All numeric values must be calculated numbers, NOT formulas/expressions (e.g., use `27.76` not `3000 * 0.01`)\n")
+	sb.WriteString("- **STRICT RULE**: In the JSON object, all numbers (including those inside the \"reason\" or \"reasoning\" string) MUST NOT contain any thousand separators (e.g., use 67317 instead of 67,317). Commas are ONLY allowed as delimiters between JSON fields.\n\n")
 
 	// 8. Custom Prompt
 	if e.config.CustomPrompt != "" {
@@ -2171,22 +2174,7 @@ func extractDecisions(response string) ([]Decision, error) {
 		jsonContent := strings.TrimSpace(m[1])
 		jsonContent = compactArrayOpen(jsonContent)
 		jsonContent = fixMissingQuotes(jsonContent)
-		if err := validateJSONFormat(jsonContent); err != nil {
-			return nil, fmt.Errorf("JSON format validation failed: %w\nJSON content: %s\nFull response:\n%s", err, jsonContent, response)
-		}
-		var decisions []Decision
-		if err := json.Unmarshal([]byte(jsonContent), &decisions); err != nil {
-			if strings.Contains(err.Error(), "unexpected end of JSON input") {
-				if repaired := repairTruncatedJSON(jsonContent); repaired != jsonContent {
-					if err2 := json.Unmarshal([]byte(repaired), &decisions); err2 == nil {
-						logger.Infof("✓ Repaired truncated JSON and parsed %d decisions", len(decisions))
-						return decisions, nil
-					}
-				}
-			}
-			return nil, fmt.Errorf("JSON parsing failed: %w\nJSON content: %s", err, jsonContent)
-		}
-		return decisions, nil
+		return parseJSONDecisions(jsonContent, response)
 	}
 
 	jsonContent := strings.TrimSpace(reJSONArray.FindString(jsonPart))
@@ -2210,24 +2198,7 @@ func extractDecisions(response string) ([]Decision, error) {
 	jsonContent = compactArrayOpen(jsonContent)
 	jsonContent = fixMissingQuotes(jsonContent)
 
-	if err := validateJSONFormat(jsonContent); err != nil {
-		return nil, fmt.Errorf("JSON format validation failed: %w\nJSON content: %s\nFull response:\n%s", err, jsonContent, response)
-	}
-
-	var decisions []Decision
-	if err := json.Unmarshal([]byte(jsonContent), &decisions); err != nil {
-		if strings.Contains(err.Error(), "unexpected end of JSON input") {
-			if repaired := repairTruncatedJSON(jsonContent); repaired != jsonContent {
-				if err2 := json.Unmarshal([]byte(repaired), &decisions); err2 == nil {
-					logger.Infof("✓ Repaired truncated JSON and parsed %d decisions", len(decisions))
-					return decisions, nil
-				}
-			}
-		}
-		return nil, fmt.Errorf("JSON parsing failed: %w\nJSON content: %s", err, jsonContent)
-	}
-
-	return decisions, nil
+	return parseJSONDecisions(jsonContent, response)
 }
 
 // repairTruncatedJSON 在 AI 返回被截断的 JSON 时补全缺失的 ] }，便于解析出已完整的前若干条决策
@@ -2301,6 +2272,61 @@ func fixMissingQuotes(jsonStr string) string {
 	jsonStr = strings.ReplaceAll(jsonStr, "　", " ")
 
 	return jsonStr
+}
+
+// removeThousandSeparatorsInJSON 移除 JSON 中数字之间的千分位逗号（如 67,317 -> 67317），
+// 仅影响「数字,数字」模式，不破坏字段间的逗号分隔符。循环直到无匹配。
+func removeThousandSeparatorsInJSON(s string) string {
+	for {
+		cleaned := reThousandSep.ReplaceAllString(s, "$1$2")
+		if cleaned == s {
+			return s
+		}
+		s = cleaned
+	}
+}
+
+// parseJSONDecisions 解析 JSON 并支持千分位清洗、截断补全与 wait 降级。
+func parseJSONDecisions(jsonContent string, response string) ([]Decision, error) {
+	jsonContent = removeThousandSeparatorsInJSON(jsonContent)
+	if err := validateJSONFormat(jsonContent); err != nil {
+		return nil, fmt.Errorf("JSON format validation failed: %w\nJSON content: %s\nFull response:\n%s", err, jsonContent, response)
+	}
+	var decisions []Decision
+	err := json.Unmarshal([]byte(jsonContent), &decisions)
+	if err != nil && strings.Contains(err.Error(), "unexpected end of JSON input") {
+		if repaired := repairTruncatedJSON(jsonContent); repaired != jsonContent {
+			if err2 := json.Unmarshal([]byte(repaired), &decisions); err2 == nil {
+				logger.Infof("✓ Repaired truncated JSON and parsed %d decisions", len(decisions))
+				return decisions, nil
+			}
+		}
+	}
+	if err != nil {
+		errMsg := err.Error()
+		if syntaxErr, ok := err.(*json.SyntaxError); ok {
+			offset := int(syntaxErr.Offset)
+			start := offset - 40
+			if start < 0 {
+				start = 0
+			}
+			end := offset + 40
+			if end > len(jsonContent) {
+				end = len(jsonContent)
+			}
+			errMsg = fmt.Sprintf("%s (offset %d, snippet: ...%s<<<HERE>>>%s...)", errMsg, offset, jsonContent[start:offset], jsonContent[offset:end])
+		}
+		if strings.Contains(jsonContent, "wait") && strings.Contains(jsonContent, "action") {
+			logger.Infof("⚠️  [WaitFallback] JSON parse failed (e.g. bad chars in reason), treating as single wait decision. Parse error: %s", errMsg)
+			return []Decision{{
+				Symbol:    "ALL",
+				Action:    "wait",
+				Reasoning: "Parse fallback: response indicated wait but JSON had invalid characters; treated as wait.",
+			}}, nil
+		}
+		return nil, fmt.Errorf("JSON parsing failed: %s\nJSON content: %s", errMsg, jsonContent)
+	}
+	return decisions, nil
 }
 
 func validateJSONFormat(jsonStr string) error {

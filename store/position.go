@@ -352,15 +352,20 @@ func (s *PositionStore) DeleteAllOpenPositions(traderID string) error {
 
 // GetOpenPositions gets all open positions
 func (s *PositionStore) GetOpenPositions(traderID string) ([]*TraderPosition, error) {
+	return s.GetOpenPositionsBySource(traderID, "")
+}
+
+// GetOpenPositionsBySource gets open positions optionally filtered by source (e.g. "dry_run" for paper trading)
+func (s *PositionStore) GetOpenPositionsBySource(traderID, source string) ([]*TraderPosition, error) {
+	q := s.db.Where("trader_id = ? AND status = ?", traderID, "OPEN")
+	if source != "" {
+		q = q.Where("source = ?", source)
+	}
 	var positions []*TraderPosition
-	err := s.db.Where("trader_id = ? AND status = ?", traderID, "OPEN").
-		Order("entry_time DESC").
-		Find(&positions).Error
+	err := q.Order("entry_time DESC").Find(&positions).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to query open positions: %w", err)
 	}
-
-	// Fix EntryQuantity if it's 0
 	for _, pos := range positions {
 		if pos.EntryQuantity == 0 {
 			pos.EntryQuantity = pos.Quantity
@@ -467,6 +472,25 @@ func (s *PositionStore) GetClosedPositions(traderID string, limit int) ([]*Trade
 		return nil, fmt.Errorf("failed to query closed positions: %w", err)
 	}
 
+	for _, pos := range positions {
+		if pos.EntryQuantity == 0 {
+			pos.EntryQuantity = pos.Quantity
+		}
+	}
+	return positions, nil
+}
+
+// GetClosedPositionsBySource gets closed positions filtered by source (e.g. "dry_run")
+func (s *PositionStore) GetClosedPositionsBySource(traderID string, limit int, source string) ([]*TraderPosition, error) {
+	q := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED")
+	if source != "" {
+		q = q.Where("source = ?", source)
+	}
+	var positions []*TraderPosition
+	err := q.Order("exit_time DESC").Limit(limit).Find(&positions).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to query closed positions: %w", err)
+	}
 	for _, pos := range positions {
 		if pos.EntryQuantity == 0 {
 			pos.EntryQuantity = pos.Quantity
@@ -689,6 +713,52 @@ func (s *PositionStore) GetRecentTrades(traderID string, limit int) ([]RecentTra
 		trades = append(trades, t)
 	}
 
+	return trades, nil
+}
+
+// RecentTradeWithSource extends RecentTrade with source for [Paper] display
+type RecentTradeWithSource struct {
+	RecentTrade
+	Source string `json:"source,omitempty"`
+}
+
+// GetRecentTradesBySource gets recent closed trades filtered by source (e.g. "dry_run")
+func (s *PositionStore) GetRecentTradesBySource(traderID string, limit int, source string) ([]RecentTradeWithSource, error) {
+	q := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED")
+	if source != "" {
+		q = q.Where("source = ?", source)
+	}
+	var positions []TraderPosition
+	err := q.Order("exit_time DESC").Limit(limit).Find(&positions).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to query recent trades: %w", err)
+	}
+	var trades []RecentTradeWithSource
+	for _, pos := range positions {
+		t := RecentTradeWithSource{
+			RecentTrade: RecentTrade{
+				Symbol:      pos.Symbol,
+				Side:        strings.ToLower(pos.Side),
+				EntryPrice:  pos.EntryPrice,
+				ExitPrice:   pos.ExitPrice,
+				RealizedPnL: pos.RealizedPnL,
+				EntryTime:   pos.EntryTime / 1000,
+			},
+			Source: pos.Source,
+		}
+		if pos.ExitTime > 0 {
+			t.ExitTime = pos.ExitTime / 1000
+			t.HoldDuration = formatDurationMs(pos.ExitTime - pos.EntryTime)
+		}
+		if pos.EntryPrice > 0 {
+			if t.Side == "long" {
+				t.PnLPct = (pos.ExitPrice - pos.EntryPrice) / pos.EntryPrice * 100 * float64(pos.Leverage)
+			} else {
+				t.PnLPct = (pos.EntryPrice - pos.ExitPrice) / pos.EntryPrice * 100 * float64(pos.Leverage)
+			}
+		}
+		trades = append(trades, t)
+	}
 	return trades, nil
 }
 
@@ -1067,6 +1137,95 @@ func (s *PositionStore) GetDirectionStats(traderID string) ([]DirectionStats, er
 		stats = append(stats, *s)
 	}
 
+	return stats, nil
+}
+
+// GetSymbolStatsBySource gets per-symbol stats filtered by source (e.g. "dry_run")
+func (s *PositionStore) GetSymbolStatsBySource(traderID string, limit int, source string) ([]SymbolStats, error) {
+	q := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED")
+	if source != "" {
+		q = q.Where("source = ?", source)
+	}
+	var positions []TraderPosition
+	if err := q.Find(&positions).Error; err != nil {
+		return nil, fmt.Errorf("failed to query symbol stats: %w", err)
+	}
+	symbolMap := make(map[string]*SymbolStats)
+	symbolHoldMins := make(map[string][]float64)
+	for _, pos := range positions {
+		if _, ok := symbolMap[pos.Symbol]; !ok {
+			symbolMap[pos.Symbol] = &SymbolStats{Symbol: pos.Symbol}
+			symbolHoldMins[pos.Symbol] = []float64{}
+		}
+		st := symbolMap[pos.Symbol]
+		st.TotalTrades++
+		st.TotalPnL += pos.RealizedPnL
+		if pos.RealizedPnL > 0 {
+			st.WinTrades++
+		}
+		if pos.ExitTime > 0 {
+			holdMins := float64(pos.ExitTime-pos.EntryTime) / 60000.0
+			symbolHoldMins[pos.Symbol] = append(symbolHoldMins[pos.Symbol], holdMins)
+		}
+	}
+	var stats []SymbolStats
+	for symbol, st := range symbolMap {
+		if st.TotalTrades > 0 {
+			st.WinRate = float64(st.WinTrades) / float64(st.TotalTrades) * 100
+			st.AvgPnL = st.TotalPnL / float64(st.TotalTrades)
+		}
+		if len(symbolHoldMins[symbol]) > 0 {
+			var total float64
+			for _, m := range symbolHoldMins[symbol] {
+				total += m
+			}
+			st.AvgHoldMins = total / float64(len(symbolHoldMins[symbol]))
+		}
+		stats = append(stats, *st)
+	}
+	for i := 0; i < len(stats)-1; i++ {
+		for j := i + 1; j < len(stats); j++ {
+			if stats[j].TotalPnL > stats[i].TotalPnL {
+				stats[i], stats[j] = stats[j], stats[i]
+			}
+		}
+	}
+	if limit > 0 && len(stats) > limit {
+		stats = stats[:limit]
+	}
+	return stats, nil
+}
+
+// GetDirectionStatsBySource gets long/short stats filtered by source (e.g. "dry_run")
+func (s *PositionStore) GetDirectionStatsBySource(traderID, source string) ([]DirectionStats, error) {
+	q := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED")
+	if source != "" {
+		q = q.Where("source = ?", source)
+	}
+	var positions []TraderPosition
+	if err := q.Find(&positions).Error; err != nil {
+		return nil, fmt.Errorf("failed to query direction stats: %w", err)
+	}
+	sideStats := make(map[string]*DirectionStats)
+	for _, pos := range positions {
+		if _, ok := sideStats[pos.Side]; !ok {
+			sideStats[pos.Side] = &DirectionStats{Side: pos.Side}
+		}
+		st := sideStats[pos.Side]
+		st.TradeCount++
+		st.TotalPnL += pos.RealizedPnL
+		if pos.RealizedPnL > 0 {
+			st.WinRate++
+		}
+	}
+	var stats []DirectionStats
+	for _, st := range sideStats {
+		if st.TradeCount > 0 {
+			st.AvgPnL = st.TotalPnL / float64(st.TradeCount)
+			st.WinRate = st.WinRate / float64(st.TradeCount) * 100
+		}
+		stats = append(stats, *st)
+	}
 	return stats, nil
 }
 

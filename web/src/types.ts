@@ -819,6 +819,8 @@ export interface HistoricalPosition {
   close_reason: string;
   created_at: string;
   updated_at: string;
+  /** 模拟盘为 "dry_run"，用于显示 [Paper] 标签 */
+  source?: string;
 }
 
 // Matches Go TraderStats struct exactly

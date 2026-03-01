@@ -1293,6 +1293,28 @@ func (s *Server) handleClosePosition(c *gin.Context) {
 		return
 	}
 
+	// 模拟盘：调用内存中的 AutoTrader.EmergencyClosePositionDryRun，不请求交易所
+	if fullConfig.Trader != nil && fullConfig.Trader.IsDryRun {
+		autoTrader, getErr := s.traderManager.GetTrader(traderID)
+		if getErr != nil || autoTrader == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Paper trader not loaded, try starting the trader first"})
+			return
+		}
+		side := strings.ToLower(req.Side)
+		if closeErr := autoTrader.EmergencyClosePositionDryRun(req.Symbol, side); closeErr != nil {
+			logger.Infof("❌ Paper close failed: symbol=%s, side=%s, error=%v", req.Symbol, req.Side, closeErr)
+			SafeInternalError(c, "Close paper position", closeErr)
+			return
+		}
+		logger.Infof("✅ Paper position closed: symbol=%s, side=%s", req.Symbol, req.Side)
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Position closed successfully (Paper)",
+			"symbol":  req.Symbol,
+			"side":    req.Side,
+		})
+		return
+	}
+
 	exchangeCfg := fullConfig.Exchange
 
 	if exchangeCfg == nil || !exchangeCfg.Enabled {
@@ -2145,7 +2167,75 @@ func (s *Server) handleAccount(c *gin.Context) {
 		SafeNotFound(c, "Trader")
 		return
 	}
+	traderCfg := fullConfig.Trader
 	exchangeCfg := fullConfig.Exchange
+
+	// 模拟盘：财务看板完全本地化，用 VirtualEquity + dry_run 持仓浮盈
+	if traderCfg != nil && traderCfg.IsDryRun {
+		virtualEquity := traderCfg.VirtualEquity
+		if virtualEquity <= 0 {
+			virtualEquity = 10000
+		}
+		openPositions, errPos := s.store.Position().GetOpenPositionsBySource(traderID, "dry_run")
+		if errPos != nil {
+			SafeInternalError(c, "Get dry-run positions for account", errPos)
+			return
+		}
+		exchangeType := "binance"
+		if exchangeCfg != nil {
+			exchangeType = exchangeCfg.ExchangeType
+		}
+		totalUnrealizedProfit := 0.0
+		totalMarginUsed := 0.0
+		for _, pos := range openPositions {
+			markPrice := pos.EntryPrice
+			if data, errMarket := market.GetWithExchange(pos.Symbol, exchangeType, nil); errMarket == nil {
+				markPrice = data.CurrentPrice
+			}
+			lev := pos.Leverage
+			if lev <= 0 {
+				lev = 10
+			}
+			if pos.Side == "LONG" {
+				totalUnrealizedProfit += (markPrice - pos.EntryPrice) * pos.Quantity
+			} else {
+				totalUnrealizedProfit += (pos.EntryPrice - markPrice) * pos.Quantity
+			}
+			totalMarginUsed += (pos.Quantity * markPrice) / float64(lev)
+		}
+		totalEquity := virtualEquity + totalUnrealizedProfit
+		initialBalance := traderCfg.InitialBalance
+		if initialBalance <= 0 {
+			initialBalance = virtualEquity
+		}
+		totalPnL := totalEquity - initialBalance
+		totalPnLPct := 0.0
+		if initialBalance > 0 {
+			totalPnLPct = (totalPnL / initialBalance) * 100
+		}
+		marginUsedPct := 0.0
+		if totalEquity > 0 {
+			marginUsedPct = (totalMarginUsed / totalEquity) * 100
+		}
+		account := map[string]interface{}{
+			"total_equity":      totalEquity,
+			"wallet_balance":    virtualEquity,
+			"unrealized_profit": totalUnrealizedProfit,
+			"available_balance": virtualEquity - totalMarginUsed,
+			"total_pnl":         totalPnL,
+			"total_pnl_pct":     totalPnLPct,
+			"initial_balance":   initialBalance,
+			"daily_pnl":         0.0,
+			"position_count":    len(openPositions),
+			"margin_used":       totalMarginUsed,
+			"margin_used_pct":   marginUsedPct,
+		}
+		body, _ := json.Marshal(account)
+		accountCache.Store(cacheKey, &ttlCacheEntry{Body: body, Until: time.Now().Add(accountPositionsCacheTTL)})
+		c.Data(http.StatusOK, "application/json", body)
+		return
+	}
+
 	if exchangeCfg == nil || !exchangeCfg.Enabled {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Exchange not configured or not enabled"})
 		return
@@ -2246,9 +2336,9 @@ func (s *Server) handlePositions(c *gin.Context) {
 	traderCfg := fullConfig.Trader
 	exchangeCfg := fullConfig.Exchange
 
-	// 模拟盘：从 DB 取 OPEN 的 dry_run 持仓，用行情当前价作为 mark_price 返回，并带 source: dry_run
+	// 模拟盘：从 DB 取 source='dry_run' 且 status=OPEN 的持仓，用行情当前价作为 mark_price，本地算浮盈
 	if traderCfg != nil && traderCfg.IsDryRun {
-		openPositions, errPos := s.store.Position().GetOpenPositions(traderID)
+		openPositions, errPos := s.store.Position().GetOpenPositionsBySource(traderID, "dry_run")
 		if errPos != nil {
 			SafeInternalError(c, "Get dry-run positions", errPos)
 			return
@@ -2259,9 +2349,6 @@ func (s *Server) handlePositions(c *gin.Context) {
 		}
 		out := make([]map[string]interface{}, 0, len(openPositions))
 		for _, pos := range openPositions {
-			if pos.Source != "dry_run" {
-				continue
-			}
 			markPrice := pos.EntryPrice
 			if data, errMarket := market.GetWithExchange(pos.Symbol, exchangeType, nil); errMarket == nil {
 				markPrice = data.CurrentPrice
@@ -2389,9 +2476,36 @@ func toFloat64(vals ...interface{}) float64 {
 
 // handlePositionHistory Historical closed positions with statistics
 func (s *Server) handlePositionHistory(c *gin.Context) {
+	userID := c.GetString("user_id")
 	_, traderID, err := s.getTraderFromQuery(c)
 	if err != nil {
 		SafeBadRequest(c, "Invalid trader ID")
+		return
+	}
+
+	limitStr := c.DefaultQuery("limit", "100")
+	limit := 100
+	if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 500 {
+		limit = l
+	}
+
+	// 模拟盘：强制 source=dry_run，仅返回模拟盘已平仓记录
+	fullConfig, _ := s.store.Trader().GetFullConfig(userID, traderID)
+	if fullConfig != nil && fullConfig.Trader != nil && fullConfig.Trader.IsDryRun {
+		positions, errPos := s.store.Position().GetClosedPositionsBySource(traderID, limit, "dry_run")
+		if errPos != nil {
+			SafeInternalError(c, "Get position history", errPos)
+			return
+		}
+		stats, _ := s.store.Position().GetFullStatsBySource(traderID, "dry_run")
+		symbolStats, _ := s.store.Position().GetSymbolStatsBySource(traderID, 10, "dry_run")
+		directionStats, _ := s.store.Position().GetDirectionStatsBySource(traderID, "dry_run")
+		c.JSON(http.StatusOK, gin.H{
+			"positions":       positions,
+			"stats":           stats,
+			"symbol_stats":    symbolStats,
+			"direction_stats": directionStats,
+		})
 		return
 	}
 
@@ -2400,37 +2514,19 @@ func (s *Server) handlePositionHistory(c *gin.Context) {
 		SafeNotFound(c, "Trader")
 		return
 	}
-
-	// Get optional query parameters
-	limitStr := c.DefaultQuery("limit", "100")
-	limit := 100
-	if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 500 {
-		limit = l
-	}
-
-	// Get store
 	store := trader.GetStore()
 	if store == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Store not available"})
 		return
 	}
-
-	// Get closed positions
 	positions, err := store.Position().GetClosedPositions(trader.GetID(), limit)
 	if err != nil {
 		SafeInternalError(c, "Get position history", err)
 		return
 	}
-
-	// Get statistics
 	stats, _ := store.Position().GetFullStats(trader.GetID())
-
-	// Get symbol stats
 	symbolStats, _ := store.Position().GetSymbolStats(trader.GetID(), 10)
-
-	// Get direction stats
 	directionStats, _ := store.Position().GetDirectionStats(trader.GetID())
-
 	c.JSON(http.StatusOK, gin.H{
 		"positions":       positions,
 		"stats":           stats,
@@ -2439,11 +2535,44 @@ func (s *Server) handlePositionHistory(c *gin.Context) {
 	})
 }
 
-// handleTrades Historical trades list
+// handleTrades Historical trades list (Recent Trades)；模拟盘时仅返回 source=dry_run 并带 source 字段供前端显示 [Paper]
 func (s *Server) handleTrades(c *gin.Context) {
+	userID := c.GetString("user_id")
 	_, traderID, err := s.getTraderFromQuery(c)
 	if err != nil {
 		SafeBadRequest(c, "Invalid trader ID")
+		return
+	}
+
+	symbol := c.Query("symbol")
+	limitStr := c.DefaultQuery("limit", "100")
+	limit := 100
+	if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+		limit = l
+	}
+	if symbol != "" {
+		symbol = market.Normalize(symbol)
+	}
+
+	// 模拟盘：仅查 source=dry_run，返回带 source 的列表供前端显示 [Paper]
+	fullConfig, _ := s.store.Trader().GetFullConfig(userID, traderID)
+	if fullConfig != nil && fullConfig.Trader != nil && fullConfig.Trader.IsDryRun {
+		allTrades, errT := s.store.Position().GetRecentTradesBySource(traderID, limit, "dry_run")
+		if errT != nil {
+			SafeInternalError(c, "Get trades", errT)
+			return
+		}
+		if symbol != "" {
+			var result []interface{}
+			for _, t := range allTrades {
+				if t.Symbol == symbol {
+					result = append(result, t)
+				}
+			}
+			c.JSON(http.StatusOK, result)
+			return
+		}
+		c.JSON(http.StatusOK, allTrades)
 		return
 	}
 
@@ -2452,34 +2581,16 @@ func (s *Server) handleTrades(c *gin.Context) {
 		SafeNotFound(c, "Trader")
 		return
 	}
-
-	// Get optional query parameters
-	symbol := c.Query("symbol")
-	limitStr := c.DefaultQuery("limit", "100")
-	limit := 100
-	if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
-		limit = l
-	}
-
-	// Normalize symbol (add USDT suffix if not present)
-	if symbol != "" {
-		symbol = market.Normalize(symbol)
-	}
-
-	// Get trades from store
 	store := trader.GetStore()
 	if store == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Store not available"})
 		return
 	}
-
 	allTrades, err := store.Position().GetRecentTrades(trader.GetID(), limit)
 	if err != nil {
 		SafeInternalError(c, "Get trades", err)
 		return
 	}
-
-	// Filter by symbol if specified
 	if symbol != "" {
 		var result []interface{}
 		for _, trade := range allTrades {
@@ -2490,7 +2601,6 @@ func (s *Server) handleTrades(c *gin.Context) {
 		c.JSON(http.StatusOK, result)
 		return
 	}
-
 	c.JSON(http.StatusOK, allTrades)
 }
 

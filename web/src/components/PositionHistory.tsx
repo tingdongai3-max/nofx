@@ -264,10 +264,19 @@ function PositionRow({ position }: { position: HistoricalPosition }) {
     >
       {/* Symbol */}
       <td className="py-3 px-4">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <span className="font-mono font-semibold" style={{ color: '#EAECEF' }}>
             {(position.symbol || '').replace('USDT', '')}
           </span>
+          {position.source === 'dry_run' && (
+            <span
+              className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider"
+              style={{ background: 'rgba(245, 158, 11, 0.2)', color: '#f59e0b' }}
+              title="Paper trading"
+            >
+              Paper
+            </span>
+          )}
           <span
             className="px-2 py-0.5 rounded text-xs font-semibold uppercase"
             style={{
