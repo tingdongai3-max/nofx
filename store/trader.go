@@ -30,6 +30,8 @@ type Trader struct {
 	IsRunning           bool      `gorm:"column:is_running;default:false" json:"is_running"`
 	IsCrossMargin       bool      `gorm:"column:is_cross_margin;default:true" json:"is_cross_margin"`
 	ShowInCompetition   bool      `gorm:"column:show_in_competition;default:true" json:"show_in_competition"`
+	IsDryRun            bool      `gorm:"column:is_dry_run;default:false" json:"is_dry_run"`                   // 模拟盘：不真实下单，仅本地撮合与落库
+	VirtualEquity       float64   `gorm:"column:virtual_equity;default:0" json:"virtual_equity"`             // 模拟盘本金（USDT），IsDryRun 时 Prompt 用此值
 	CreatedAt           time.Time `gorm:"column:created_at;autoCreateTime" json:"created_at"`
 	UpdatedAt           time.Time `gorm:"column:updated_at;autoUpdateTime" json:"updated_at"`
 
@@ -110,12 +112,14 @@ func (s *TraderStore) Update(trader *Trader) error {
 		trader.ID, trader.Name, trader.AIModelID, trader.StrategyID)
 
 	updates := map[string]interface{}{
-		"name":           trader.Name,
-		"ai_model_id":    trader.AIModelID,
-		"exchange_id":    trader.ExchangeID,
-		"strategy_id":    trader.StrategyID,
-		"is_cross_margin": trader.IsCrossMargin,
+		"name":                trader.Name,
+		"ai_model_id":         trader.AIModelID,
+		"exchange_id":         trader.ExchangeID,
+		"strategy_id":         trader.StrategyID,
+		"is_cross_margin":     trader.IsCrossMargin,
 		"show_in_competition": trader.ShowInCompetition,
+		"is_dry_run":          trader.IsDryRun,
+		"virtual_equity":      trader.VirtualEquity,
 	}
 
 	// Only update these if > 0
@@ -139,6 +143,14 @@ func (s *TraderStore) UpdateInitialBalance(userID, id string, newBalance float64
 	return s.db.Model(&Trader{}).
 		Where("id = ? AND user_id = ?", id, userID).
 		Update("initial_balance", newBalance).Error
+}
+
+// UpdateVirtualEquity 更新模拟盘虚拟本金并持久化到 traders 表（复利结算）
+// 平仓后必须调用此方法将 RealizedPnL 加/减到 VirtualEquity，以便下次 buildDryRunTradingContext 时 AI 看到变动后的真实余额
+func (s *TraderStore) UpdateVirtualEquity(userID, id string, virtualEquity float64) error {
+	return s.db.Model(&Trader{}).
+		Where("id = ? AND user_id = ?", id, userID).
+		Update("virtual_equity", virtualEquity).Error
 }
 
 // UpdateCustomPrompt updates custom prompt

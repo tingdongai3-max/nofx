@@ -728,7 +728,18 @@ export function TraderDashboardPage({
                                                         }}
                                                     >
                                                         <td className="px-1 py-3 font-mono font-semibold whitespace-nowrap text-left text-nofx-text-main group-hover/row:text-white transition-colors">
-                                                            {symbol}
+                                                            <span className="inline-flex items-center gap-1.5">
+                                                                {symbol}
+                                                                {pos.source === 'dry_run' && (
+                                                                    <span
+                                                                        className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider"
+                                                                        style={{ background: 'rgba(245, 158, 11, 0.2)', color: '#f59e0b' }}
+                                                                        title={language === 'zh' ? '模拟盘持仓' : 'Paper trading'}
+                                                                    >
+                                                                        {language === 'zh' ? '模拟盘' : 'Paper'}
+                                                                    </span>
+                                                                )}
+                                                            </span>
                                                         </td>
                                                         <td className="px-1 py-3 whitespace-nowrap text-center">
                                                             <span

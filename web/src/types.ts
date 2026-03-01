@@ -40,6 +40,7 @@ export interface Position {
   unrealized_pnl_pct: number
   liquidation_price: number
   margin_used: number
+  source?: string // e.g. "dry_run" for paper trading
 }
 
 export interface DecisionAction {
@@ -104,6 +105,8 @@ export interface TraderInfo {
   use_ai500?: boolean
   use_oi_top?: boolean
   system_prompt_template?: string
+  is_dry_run?: boolean
+  virtual_equity?: number
 }
 
 export interface AIModel {
@@ -167,6 +170,8 @@ export interface CreateTraderRequest {
   scan_interval_minutes?: number
   is_cross_margin?: boolean
   show_in_competition?: boolean // 是否在竞技场显示
+  is_dry_run?: boolean // 开启模拟盘 (Dry-Run Mode)
+  virtual_equity?: number // 模拟盘虚拟本金（如 10000 USDT）
   // 以下字段为向后兼容保留，新版使用策略配置
   btc_eth_leverage?: number
   altcoin_leverage?: number
@@ -244,6 +249,8 @@ export interface TraderConfigData {
   scan_interval_minutes: number
   initial_balance: number
   is_running: boolean
+  is_dry_run?: boolean
+  virtual_equity?: number
   // 以下为旧版字段（向后兼容）
   btc_eth_leverage?: number
   altcoin_leverage?: number

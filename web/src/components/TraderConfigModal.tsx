@@ -35,6 +35,8 @@ interface FormState {
   show_in_competition: boolean
   scan_interval_minutes: number
   initial_balance?: number
+  is_dry_run: boolean
+  virtual_equity: number
 }
 
 interface TraderConfigModalProps {
@@ -65,6 +67,8 @@ export function TraderConfigModal({
     is_cross_margin: true,
     show_in_competition: true,
     scan_interval_minutes: 3,
+    is_dry_run: false,
+    virtual_equity: 10000,
   })
   const [isSaving, setIsSaving] = useState(false)
   const [strategies, setStrategies] = useState<Strategy[]>([])
@@ -103,6 +107,8 @@ export function TraderConfigModal({
       setFormData({
         ...traderData,
         strategy_id: traderData.strategy_id || '',
+        is_dry_run: traderData.is_dry_run ?? false,
+        virtual_equity: traderData.virtual_equity ?? 10000,
       })
     } else if (!isEditMode) {
       setFormData({
@@ -113,6 +119,8 @@ export function TraderConfigModal({
         is_cross_margin: true,
         show_in_competition: true,
         scan_interval_minutes: 3,
+        is_dry_run: false,
+        virtual_equity: 10000,
       })
     }
   }, [traderData, isEditMode, availableModels, availableExchanges])
@@ -167,6 +175,8 @@ export function TraderConfigModal({
         is_cross_margin: formData.is_cross_margin,
         show_in_competition: formData.show_in_competition,
         scan_interval_minutes: formData.scan_interval_minutes,
+        is_dry_run: formData.is_dry_run,
+        virtual_equity: formData.is_dry_run ? formData.virtual_equity : undefined,
       }
 
       // 只在编辑模式时包含initial_balance
@@ -441,6 +451,45 @@ export function TraderConfigModal({
                     {t('scanIntervalRecommend', language)}
                   </p>
                 </div>
+              </div>
+
+              {/* Dry-Run (Paper Trading) */}
+              <div>
+                <label className="text-sm text-[#EAECEF] block mb-2">
+                  {language === 'zh' ? '开启模拟盘 (Dry-Run Mode)' : 'Paper Trading (Dry-Run Mode)'}
+                </label>
+                <div className="flex gap-2 items-center flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => handleInputChange('is_dry_run', true)}
+                    className={`px-3 py-2 rounded text-sm ${formData.is_dry_run ? 'bg-[#F0B90B] text-black' : 'bg-[#0B0E11] text-[#848E9C] border border-[#2B3139]'}`}
+                  >
+                    {language === 'zh' ? '开启' : 'On'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleInputChange('is_dry_run', false)}
+                    className={`px-3 py-2 rounded text-sm ${!formData.is_dry_run ? 'bg-[#F0B90B] text-black' : 'bg-[#0B0E11] text-[#848E9C] border border-[#2B3139]'}`}
+                  >
+                    {language === 'zh' ? '关闭' : 'Off'}
+                  </button>
+                  {formData.is_dry_run && (
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-[#848E9C] whitespace-nowrap">{language === 'zh' ? '虚拟本金 (USDT)' : 'Virtual equity (USDT)'}</label>
+                      <input
+                        type="number"
+                        value={formData.virtual_equity}
+                        onChange={(e) => handleInputChange('virtual_equity', Math.max(100, Number(e.target.value) || 10000))}
+                        className="w-28 px-2 py-1.5 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] text-sm focus:border-[#F0B90B] focus:outline-none"
+                        min={100}
+                        step={100}
+                      />
+                    </div>
+                  )}
+                </div>
+                <p className="text-xs text-[#848E9C] mt-1">
+                  {language === 'zh' ? '开启后不向交易所发单，仅用当前价模拟成交并更新本地持仓与虚拟资金。' : 'When on, no real orders are sent; positions and virtual equity are updated locally.'}
+                </p>
               </div>
 
               {/* Competition visibility */}

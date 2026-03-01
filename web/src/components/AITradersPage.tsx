@@ -1096,11 +1096,22 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                       />
                     </div>
                     <div className="min-w-0">
-                      <div
-                        className="font-bold text-base md:text-lg truncate"
-                        style={{ color: '#EAECEF' }}
-                      >
-                        {trader.trader_name}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span
+                          className="font-bold text-base md:text-lg truncate"
+                          style={{ color: '#EAECEF' }}
+                        >
+                          {trader.trader_name}
+                        </span>
+                        {trader.is_dry_run && (
+                          <span
+                            className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider whitespace-nowrap"
+                            style={{ background: 'rgba(245, 158, 11, 0.2)', color: '#f59e0b' }}
+                            title={language === 'zh' ? '模拟盘 / Paper Trading' : 'Paper Trading'}
+                          >
+                            {language === 'zh' ? '模拟盘' : 'Paper'}
+                          </span>
+                        )}
                       </div>
                       <div
                         className="text-xs md:text-sm truncate"

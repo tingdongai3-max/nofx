@@ -509,6 +509,8 @@ type CreateTraderRequest struct {
 	SystemPromptTemplate string `json:"system_prompt_template"` // System prompt template name
 	UseAI500             bool   `json:"use_ai500"`
 	UseOITop             bool   `json:"use_oi_top"`
+	IsDryRun             bool   `json:"is_dry_run"`
+	VirtualEquity        float64 `json:"virtual_equity"`
 }
 
 type ModelConfig struct {
@@ -722,6 +724,11 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		ShowInCompetition:    showInCompetition,
 		ScanIntervalMinutes:  scanIntervalMinutes,
 		IsRunning:            false,
+		IsDryRun:             req.IsDryRun,
+		VirtualEquity:       req.VirtualEquity,
+	}
+	if traderRecord.VirtualEquity <= 0 && traderRecord.IsDryRun {
+		traderRecord.VirtualEquity = 10000
 	}
 
 	// Save to database
@@ -769,7 +776,9 @@ type UpdateTraderRequest struct {
 	TradingSymbols       string `json:"trading_symbols"`
 	CustomPrompt         string `json:"custom_prompt"`
 	OverrideBasePrompt   bool   `json:"override_base_prompt"`
-	SystemPromptTemplate string `json:"system_prompt_template"`
+	SystemPromptTemplate string  `json:"system_prompt_template"`
+	IsDryRun             bool    `json:"is_dry_run"`
+	VirtualEquity        float64 `json:"virtual_equity"`
 }
 
 // handleUpdateTrader Update trader configuration
@@ -846,6 +855,15 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		strategyID = existingTrader.StrategyID
 	}
 
+	isDryRun := req.IsDryRun
+	virtualEquity := req.VirtualEquity
+	if isDryRun && virtualEquity <= 0 {
+		virtualEquity = 10000
+	}
+	if !isDryRun {
+		virtualEquity = 0
+	}
+
 	// Update trader configuration
 	traderRecord := &store.Trader{
 		ID:                   traderID,
@@ -865,6 +883,8 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		ShowInCompetition:    showInCompetition,
 		ScanIntervalMinutes:  scanIntervalMinutes,
 		IsRunning:            existingTrader.IsRunning, // Keep original value
+		IsDryRun:             isDryRun,
+		VirtualEquity:        virtualEquity,
 	}
 
 	// Check if trader was running before update (we'll restart it after)
@@ -2024,6 +2044,8 @@ func (s *Server) handleTraderList(c *gin.Context) {
 			"initial_balance":     trader.InitialBalance,
 			"strategy_id":         trader.StrategyID,
 			"strategy_name":       strategyName,
+			"is_dry_run":          trader.IsDryRun,
+			"virtual_equity":      trader.VirtualEquity,
 		})
 	}
 
@@ -2076,6 +2098,8 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 		"use_ai500":             traderConfig.UseAI500,
 		"use_oi_top":            traderConfig.UseOITop,
 		"is_running":            isRunning,
+		"is_dry_run":            traderConfig.IsDryRun,
+		"virtual_equity":        traderConfig.VirtualEquity,
 	}
 
 	c.JSON(http.StatusOK, result)
@@ -2219,7 +2243,64 @@ func (s *Server) handlePositions(c *gin.Context) {
 		SafeNotFound(c, "Trader")
 		return
 	}
+	traderCfg := fullConfig.Trader
 	exchangeCfg := fullConfig.Exchange
+
+	// 模拟盘：从 DB 取 OPEN 的 dry_run 持仓，用行情当前价作为 mark_price 返回，并带 source: dry_run
+	if traderCfg != nil && traderCfg.IsDryRun {
+		openPositions, errPos := s.store.Position().GetOpenPositions(traderID)
+		if errPos != nil {
+			SafeInternalError(c, "Get dry-run positions", errPos)
+			return
+		}
+		exchangeType := "binance"
+		if exchangeCfg != nil {
+			exchangeType = exchangeCfg.ExchangeType
+		}
+		out := make([]map[string]interface{}, 0, len(openPositions))
+		for _, pos := range openPositions {
+			if pos.Source != "dry_run" {
+				continue
+			}
+			markPrice := pos.EntryPrice
+			if data, errMarket := market.GetWithExchange(pos.Symbol, exchangeType, nil); errMarket == nil {
+				markPrice = data.CurrentPrice
+			}
+			lev := pos.Leverage
+			if lev <= 0 {
+				lev = 10
+			}
+			var unrealizedPnl float64
+			if pos.Side == "LONG" {
+				unrealizedPnl = (markPrice - pos.EntryPrice) * pos.Quantity
+			} else {
+				unrealizedPnl = (pos.EntryPrice - markPrice) * pos.Quantity
+			}
+			unrealizedPnlPct := 0.0
+			if pos.EntryPrice > 0 && pos.Quantity > 0 {
+				unrealizedPnlPct = (unrealizedPnl / (pos.EntryPrice * pos.Quantity)) * 100
+			}
+			marginUsed := (pos.Quantity * markPrice) / float64(lev)
+			out = append(out, map[string]interface{}{
+				"symbol":             pos.Symbol,
+				"side":               strings.ToLower(pos.Side),
+				"entry_price":        pos.EntryPrice,
+				"mark_price":         markPrice,
+				"quantity":           pos.Quantity,
+				"leverage":           lev,
+				"unrealized_pnl":     unrealizedPnl,
+				"unrealized_pnl_pct": unrealizedPnlPct,
+				"liquidation_price":  0.0,
+				"margin_used":        marginUsed,
+				"source":             "dry_run",
+			})
+		}
+		body, _ := json.Marshal(out)
+		positionsCache.Store(cacheKey, &ttlCacheEntry{Body: body, Until: time.Now().Add(accountPositionsCacheTTL)})
+		c.Data(http.StatusOK, "application/json", body)
+		return
+	}
+
 	if exchangeCfg == nil || !exchangeCfg.Enabled {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Exchange not configured or not enabled"})
 		return

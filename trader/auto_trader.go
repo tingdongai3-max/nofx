@@ -100,6 +100,10 @@ type AutoTraderConfig struct {
 	// Account configuration
 	InitialBalance float64 // Initial balance (for P&L calculation, must be set manually)
 
+	// Dry-run (paper trading): no real orders; use VirtualEquity in Prompt and local ProcessTrade only
+	IsDryRun      bool    // 模拟盘开关，默认 false
+	VirtualEquity float64 // 模拟盘本金 USDT，IsDryRun 时传给 AI 的 Equity
+
 	// Risk control (only as hints, AI can make autonomous decisions)
 	MaxDailyLoss    float64       // Maximum daily loss percentage (hint)
 	MaxDrawdown     float64       // Maximum drawdown percentage (hint)
@@ -828,8 +832,162 @@ func (at *AutoTrader) runCycle() error {
 	return nil
 }
 
+// buildDryRunTradingContext 模拟盘专用：资金用 VirtualEquity，持仓从 DB 取并用当前行情算浮盈
+func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
+	totalEquity := at.config.VirtualEquity
+	if totalEquity <= 0 {
+		totalEquity = 10000
+		if at.store != nil {
+			if full, _ := at.store.Trader().GetFullConfig(at.userID, at.id); full != nil && full.Trader != nil && full.Trader.VirtualEquity > 0 {
+				totalEquity = full.Trader.VirtualEquity
+			} else {
+				_ = at.store.Trader().UpdateVirtualEquity(at.userID, at.id, totalEquity)
+			}
+		}
+		at.config.VirtualEquity = totalEquity
+	}
+
+	openPositions, err := at.store.Position().GetOpenPositions(at.id)
+	if err != nil {
+		return nil, fmt.Errorf("dry run get open positions: %w", err)
+	}
+
+	var positionInfos []kernel.PositionInfo
+	totalMarginUsed := 0.0
+	totalUnrealizedProfit := 0.0
+
+	for _, pos := range openPositions {
+		if pos.Source != "dry_run" {
+			continue
+		}
+		data, err := market.GetWithExchange(pos.Symbol, at.exchange, nil)
+		if err != nil {
+			continue
+		}
+		markPrice := data.CurrentPrice
+		leverage := pos.Leverage
+		if leverage <= 0 {
+			leverage = 10
+		}
+		marginUsed := (pos.Quantity * markPrice) / float64(leverage)
+		totalMarginUsed += marginUsed
+
+		var unrealizedPnl float64
+		if pos.Side == "LONG" {
+			unrealizedPnl = (markPrice - pos.EntryPrice) * pos.Quantity
+		} else {
+			unrealizedPnl = (pos.EntryPrice - markPrice) * pos.Quantity
+		}
+		totalUnrealizedProfit += unrealizedPnl
+		pnlPct := 0.0
+		if marginUsed > 0 {
+			pnlPct = (unrealizedPnl / marginUsed) * 100
+		}
+
+		posKey := pos.Symbol + "_" + strings.ToLower(pos.Side)
+		at.peakPnLCacheMutex.RLock()
+		peakPct := at.peakPnLCache[posKey]
+		at.peakPnLCacheMutex.RUnlock()
+
+		positionInfos = append(positionInfos, kernel.PositionInfo{
+			Symbol:           pos.Symbol,
+			Side:             strings.ToLower(pos.Side),
+			EntryPrice:       pos.EntryPrice,
+			MarkPrice:        markPrice,
+			Quantity:         pos.Quantity,
+			Leverage:         leverage,
+			UnrealizedPnL:    unrealizedPnl,
+			UnrealizedPnLPct: pnlPct,
+			PeakPnLPct:       peakPct,
+			MarginUsed:       marginUsed,
+			UpdateTime:       pos.UpdatedAt,
+		})
+	}
+
+	availableBalance := totalEquity - totalMarginUsed
+	if availableBalance < 0 {
+		availableBalance = 0
+	}
+	totalPnL := totalEquity - at.initialBalance
+	if at.initialBalance <= 0 {
+		at.initialBalance = totalEquity
+	}
+	totalPnLPct := 0.0
+	if at.initialBalance > 0 {
+		totalPnLPct = (totalPnL / at.initialBalance) * 100
+	}
+	marginUsedPct := 0.0
+	if totalEquity > 0 {
+		marginUsedPct = (totalMarginUsed / totalEquity) * 100
+	}
+
+	btcEthLeverage, altcoinLeverage := 5, 5
+	if at.strategyEngine != nil {
+		cfg := at.strategyEngine.GetConfig()
+		btcEthLeverage = cfg.RiskControl.BTCETHMaxLeverage
+		altcoinLeverage = cfg.RiskControl.AltcoinMaxLeverage
+	}
+
+	var candidateCoins []kernel.CandidateCoin
+	if at.strategyEngine != nil {
+		coins, _ := at.strategyEngine.GetCandidateCoins()
+		candidateCoins = coins
+	}
+
+	ctx := &kernel.Context{
+		CurrentTime:     time.Now().UTC().Format("2006-01-02 15:04:05 UTC"),
+		RuntimeMinutes:  int(time.Since(at.startTime).Minutes()),
+		CallCount:       at.callCount,
+		BTCETHLeverage:  btcEthLeverage,
+		AltcoinLeverage: altcoinLeverage,
+		Account: kernel.AccountInfo{
+			TotalEquity:      totalEquity,
+			AvailableBalance: availableBalance,
+			UnrealizedPnL:    totalUnrealizedProfit,
+			TotalPnL:         totalPnL,
+			TotalPnLPct:      totalPnLPct,
+			MarginUsed:       totalMarginUsed,
+			MarginUsedPct:    marginUsedPct,
+			PositionCount:    len(positionInfos),
+		},
+		Positions:      positionInfos,
+		CandidateCoins: candidateCoins,
+	}
+
+	if at.store != nil {
+		recentTrades, _ := at.store.Position().GetRecentTrades(at.id, 10)
+		for _, trade := range recentTrades {
+			entryTimeStr := ""
+			if trade.EntryTime > 0 {
+				entryTimeStr = time.Unix(trade.EntryTime, 0).UTC().Format("01-02 15:04 UTC")
+			}
+			exitTimeStr := ""
+			if trade.ExitTime > 0 {
+				exitTimeStr = time.Unix(trade.ExitTime, 0).UTC().Format("01-02 15:04 UTC")
+			}
+			ctx.RecentOrders = append(ctx.RecentOrders, kernel.RecentOrder{
+				Symbol: trade.Symbol, Side: trade.Side, EntryPrice: trade.EntryPrice, ExitPrice: trade.ExitPrice,
+				RealizedPnL: trade.RealizedPnL, PnLPct: trade.PnLPct, EntryTime: entryTimeStr, ExitTime: exitTimeStr, HoldDuration: trade.HoldDuration,
+			})
+		}
+		stats, _ := at.store.Position().GetFullStats(at.id)
+		if stats != nil {
+			ctx.TradingStats = &kernel.TradingStats{
+				TotalTrades: stats.TotalTrades, WinRate: stats.WinRate, ProfitFactor: stats.ProfitFactor,
+				SharpeRatio: stats.SharpeRatio, TotalPnL: stats.TotalPnL, AvgWin: stats.AvgWin, AvgLoss: stats.AvgLoss, MaxDrawdownPct: stats.MaxDrawdownPct,
+			}
+		}
+	}
+	return ctx, nil
+}
+
 // buildTradingContext builds trading context
 func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
+	// 模拟盘：资金与持仓均来自 VirtualEquity + 本地 DB，不查交易所
+	if at.config.IsDryRun {
+		return at.buildDryRunTradingContext()
+	}
+
 	// 1. Get account information
 	balance, err := at.trader.GetBalance()
 	if err != nil {
@@ -1124,6 +1282,11 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 
 // executeDecisionWithRecord executes AI decision and records detailed information
 func (at *AutoTrader) executeDecisionWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction) error {
+	// 模拟盘：不调用交易所，走 Dry-Run 引擎（价格撮合 + 落库 + 虚拟资金）
+	if at.config.IsDryRun {
+		return at.executeDryRunOrder(decision, actionRecord, decision.Action)
+	}
+
 	// Global guardrail: whether AI is allowed to issue manual close actions.
 	enableAIClose := at.config.StrategyConfig != nil && at.config.StrategyConfig.RiskControl.EnableAIClose
 
@@ -2330,6 +2493,12 @@ func (at *AutoTrader) startDrawdownMonitor() {
 
 // checkPositionDrawdown checks position drawdown situation
 func (at *AutoTrader) checkPositionDrawdown() {
+	// 模拟盘：从 DB 取 dry_run 持仓，用当前价算浮盈并判断 TP/SL，触发时走 Dry-Run 平仓
+	if at.config.IsDryRun {
+		at.checkPositionDrawdownDryRun()
+		return
+	}
+
 	// Get current positions
 	positions, err := at.trader.GetPositions()
 	if err != nil {
@@ -2517,6 +2686,96 @@ func (at *AutoTrader) checkPositionDrawdown() {
 				symbol, side, currentPnLPct, peakPnLPct, drawdownPct)
 		}
 	}
+}
+
+// checkPositionDrawdownDryRun 模拟盘护盘：从 DB 取 OPEN 的 dry_run 仓位，用当前价判断止盈止损并触发 Dry-Run 平仓
+func (at *AutoTrader) checkPositionDrawdownDryRun() {
+	if at.store == nil {
+		return
+	}
+	openPositions, err := at.store.Position().GetOpenPositions(at.id)
+	if err != nil {
+		logger.Infof("❌ [Dry-Run] Drawdown: get open positions failed: %v", err)
+		return
+	}
+	for _, pos := range openPositions {
+		if pos.Source != "dry_run" {
+			continue
+		}
+		symbol := pos.Symbol
+		side := strings.ToLower(pos.Side)
+		entryPrice := pos.EntryPrice
+		leverage := pos.Leverage
+		if leverage <= 0 {
+			leverage = 10
+		}
+
+		data, err := market.GetWithExchange(symbol, at.exchange, nil)
+		if err != nil {
+			continue
+		}
+		markPrice := data.CurrentPrice
+
+		var currentPnLPct float64
+		if pos.Side == "LONG" {
+			currentPnLPct = ((markPrice - entryPrice) / entryPrice) * float64(leverage) * 100
+		} else {
+			currentPnLPct = ((entryPrice - markPrice) / entryPrice) * float64(leverage) * 100
+		}
+
+		posKey := symbol + "_" + side
+		at.peakPnLCacheMutex.RLock()
+		peakPnLPct, exists := at.peakPnLCache[posKey]
+		at.peakPnLCacheMutex.RUnlock()
+		if !exists {
+			peakPnLPct = currentPnLPct
+			at.UpdatePeakPnL(symbol, side, currentPnLPct)
+		} else {
+			at.UpdatePeakPnL(symbol, side, currentPnLPct)
+		}
+		at.UpdateBottomPnL(symbol, side, currentPnLPct)
+
+		drawdownPct := 0.0
+		if peakPnLPct > 0 && currentPnLPct < peakPnLPct {
+			drawdownPct = ((peakPnLPct - currentPnLPct) / peakPnLPct) * 100
+		}
+
+		// 1. 断头台
+		const MaxAllowedLossPct = -30.0
+		if currentPnLPct <= MaxAllowedLossPct {
+			logger.Infof("🚨 [Dry-Run] 断头台触发 %s %s 亏损 %.2f%%，强制平仓", symbol, side, currentPnLPct)
+			if err := at.emergencyClosePositionDryRun(symbol, side); err != nil {
+				logger.Infof("❌ [Dry-Run] 断头台平仓失败 (%s %s): %v", symbol, side, err)
+			} else {
+				at.ClearPeakPnLCache(symbol, side)
+				at.ClearBottomPnLCache(symbol, side)
+			}
+			continue
+		}
+
+		// 2. 回撤止盈：利润 > 5% 且回撤 >= 40%
+		if currentPnLPct > 5.0 && drawdownPct >= 40.0 {
+			logger.Infof("🚨 [Dry-Run] 回撤止盈触发: %s %s 利润 %.2f%% 回撤 %.2f%%", symbol, side, currentPnLPct, drawdownPct)
+			if err := at.emergencyClosePositionDryRun(symbol, side); err != nil {
+				logger.Infof("❌ [Dry-Run] 回撤平仓失败 (%s %s): %v", symbol, side, err)
+			} else {
+				at.ClearPeakPnLCache(symbol, side)
+				at.ClearBottomPnLCache(symbol, side)
+			}
+		}
+	}
+}
+
+// emergencyClosePositionDryRun 模拟盘强制平仓：不调用交易所，走 Dry-Run 引擎落库并更新 VirtualEquity
+func (at *AutoTrader) emergencyClosePositionDryRun(symbol, side string) error {
+	decision := &kernel.Decision{Symbol: symbol, Action: ""}
+	actionRecord := &store.DecisionAction{}
+	if side == "long" {
+		decision.Action = "close_long"
+	} else {
+		decision.Action = "close_short"
+	}
+	return at.executeDryRunOrder(decision, actionRecord, decision.Action)
 }
 
 // emergencyClosePosition emergency close position function

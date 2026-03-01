@@ -363,12 +363,43 @@ func (s *PositionStore) GetOpenPositions(traderID string) ([]*TraderPosition, er
 	return positions, nil
 }
 
-// GetOpenPositionBySymbol gets open position for specified symbol and direction
-func (s *PositionStore) GetOpenPositionBySymbol(traderID, symbol, side string) (*TraderPosition, error) {
+// GetOpenPositionByID gets a single OPEN position by primary key (for close-by-ID isolation)
+func (s *PositionStore) GetOpenPositionByID(id int64) (*TraderPosition, error) {
 	var pos TraderPosition
-	err := s.db.Where("trader_id = ? AND symbol = ? AND side = ? AND status = ?", traderID, symbol, side, "OPEN").
-		Order("entry_time DESC").
-		First(&pos).Error
+	err := s.db.Where("id = ? AND status = ?", id, "OPEN").First(&pos).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if pos.EntryQuantity == 0 {
+		pos.EntryQuantity = pos.Quantity
+	}
+	return &pos, nil
+}
+
+// GetOpenPositionBySymbol gets open position for specified symbol and direction (any source)
+func (s *PositionStore) GetOpenPositionBySymbol(traderID, symbol, side string) (*TraderPosition, error) {
+	return s.getOpenPositionBySymbolImpl(traderID, symbol, side, "")
+}
+
+// GetOpenPositionBySymbolAndSource 按 trader_id + symbol + side + source 四维隔离查询 OPEN 仓位
+// 模拟盘平仓/加仓必须使用 source = "dry_run"，避免误操作实盘仓位（source 为空或 "real"/"sync"）
+func (s *PositionStore) GetOpenPositionBySymbolAndSource(traderID, symbol, side, source string) (*TraderPosition, error) {
+	if source == "" {
+		return nil, fmt.Errorf("GetOpenPositionBySymbolAndSource requires non-empty source for isolation")
+	}
+	return s.getOpenPositionBySymbolImpl(traderID, symbol, side, source)
+}
+
+func (s *PositionStore) getOpenPositionBySymbolImpl(traderID, symbol, side, source string) (*TraderPosition, error) {
+	var pos TraderPosition
+	q := s.db.Where("trader_id = ? AND symbol = ? AND side = ? AND status = ?", traderID, symbol, side, "OPEN")
+	if source != "" {
+		q = q.Where("source = ?", source)
+	}
+	err := q.Order("entry_time DESC").First(&pos).Error
 
 	if err == nil {
 		if pos.EntryQuantity == 0 {
@@ -381,9 +412,11 @@ func (s *PositionStore) GetOpenPositionBySymbol(traderID, symbol, side string) (
 		// Try without USDT suffix for backward compatibility
 		if strings.HasSuffix(symbol, "USDT") {
 			baseSymbol := strings.TrimSuffix(symbol, "USDT")
-			err = s.db.Where("trader_id = ? AND symbol = ? AND side = ? AND status = ?", traderID, baseSymbol, side, "OPEN").
-				Order("entry_time DESC").
-				First(&pos).Error
+			q2 := s.db.Where("trader_id = ? AND symbol = ? AND side = ? AND status = ?", traderID, baseSymbol, side, "OPEN")
+			if source != "" {
+				q2 = q2.Where("source = ?", source)
+			}
+			err = q2.Order("entry_time DESC").First(&pos).Error
 			if err == nil {
 				if pos.EntryQuantity == 0 {
 					pos.EntryQuantity = pos.Quantity

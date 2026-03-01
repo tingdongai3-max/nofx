@@ -107,81 +107,96 @@ func (pb *PositionBuilder) handleClose(
 	mfe, mae float64,
 	exitIndicatorsJSON string,
 ) error {
-	// Get OPEN position
 	position, err := pb.positionStore.GetOpenPositionBySymbol(traderID, symbol, side)
 	if err != nil {
 		return fmt.Errorf("failed to get open position: %w", err)
 	}
-
 	if position == nil {
-		// No open position found - just skip
-		// This can happen if trades are processed out of order or database was cleared
 		logger.Infof("  ⚠️  No matching open position for %s %s (orderID: %s), skipping", symbol, side, orderID)
 		return nil
 	}
+	return pb.handleCloseWithPosition(position, quantity, price, fee, realizedPnL, tradeTimeMs, orderID, mfe, mae, exitIndicatorsJSON, "sync")
+}
 
+// ProcessTradeCloseByPositionID 按仓位 ID 平仓，用于模拟盘等需严格隔离的场景（只关闭指定 id 的 OPEN 仓位，绝不误动同 symbol/side 的实盘）
+// closeReason 如 "dry_run" / "sync"
+func (pb *PositionBuilder) ProcessTradeCloseByPositionID(
+	positionID int64,
+	quantity, price, fee, realizedPnL float64,
+	tradeTimeMs int64,
+	orderID string,
+	mfe, mae float64,
+	exitIndicatorsJSON, closeReason string,
+) error {
+	position, err := pb.positionStore.GetOpenPositionByID(positionID)
+	if err != nil {
+		return fmt.Errorf("failed to get open position by id: %w", err)
+	}
+	if position == nil {
+		logger.Infof("  ⚠️  No OPEN position for id %d (orderID: %s), skipping", positionID, orderID)
+		return nil
+	}
+	return pb.handleCloseWithPosition(position, quantity, price, fee, realizedPnL, tradeTimeMs, orderID, mfe, mae, exitIndicatorsJSON, closeReason)
+}
+
+func (pb *PositionBuilder) handleCloseWithPosition(
+	position *TraderPosition,
+	quantity, price, fee, realizedPnL float64,
+	tradeTimeMs int64,
+	orderID string,
+	mfe, mae float64,
+	exitIndicatorsJSON, closeReason string,
+) error {
+	symbol := position.Symbol
+	side := position.Side
 	const QUANTITY_TOLERANCE = 0.0001
 
-	// Calculate realized PnL if not provided (some exchanges like Lighter don't return it)
 	if realizedPnL == 0 && position.EntryPrice > 0 {
 		if side == "LONG" {
 			realizedPnL = (price - position.EntryPrice) * quantity
 		} else {
 			realizedPnL = (position.EntryPrice - price) * quantity
 		}
-		// Round to 2 decimal places
 		realizedPnL = math.Round(realizedPnL*100) / 100
 	}
 
 	if quantity < position.Quantity-QUANTITY_TOLERANCE {
-		// Partial close: reduce quantity and update weighted average exit price
 		logger.Infof("  📉 Partial close: %s %s %.6f → %.6f (closed %.6f @ %.2f, PnL: %.2f)",
 			symbol, side, position.Quantity, position.Quantity-quantity, quantity, price, realizedPnL)
 		return pb.positionStore.ReducePositionQuantity(position.ID, quantity, price, fee, realizedPnL)
-	} else {
-		// Full close (or close with tolerance): mark as CLOSED
-		closeQty := quantity
-		if quantity > position.Quantity {
-			logger.Infof("  ⚠️  Over-close detected: %s %s trying to close %.6f but only %.6f open, closing full position",
-				symbol, side, quantity, position.Quantity)
-			closeQty = position.Quantity
-		}
-
-		// Calculate final weighted average exit price
-		// Include previously accumulated partial close prices + this final close
-		closedBefore := position.EntryQuantity - position.Quantity
-		totalClosed := closedBefore + closeQty
-		var finalExitPrice float64
-		if totalClosed > 0 {
-			finalExitPrice = (position.ExitPrice*closedBefore + price*closeQty) / totalClosed
-			// Use adaptive precision based on price magnitude (for meme coins with very small prices)
-			finalExitPrice = adaptivePriceRound(finalExitPrice, position.ExitPrice, price, position.EntryPrice)
-		} else {
-			finalExitPrice = price
-		}
-
-		// Calculate total PnL (existing + new)
-		totalPnL := position.RealizedPnL + realizedPnL
-
-		// Calculate total fee (existing + new)
-		totalFee := position.Fee + fee
-
-		logger.Infof("  ✅ Full close: %s %s %.6f @ %.2f (avg exit: %.2f, entry: %.2f, PnL: %.2f)",
-			symbol, side, closeQty, price, finalExitPrice, position.EntryPrice, totalPnL)
-
-		return pb.positionStore.ClosePositionFully(
-			position.ID,
-			finalExitPrice,
-			orderID,
-			tradeTimeMs,
-			totalPnL,
-			totalFee,
-			"sync",
-			mfe,
-			mae,
-			exitIndicatorsJSON,
-		)
 	}
+
+	closeQty := quantity
+	if quantity > position.Quantity {
+		logger.Infof("  ⚠️  Over-close detected: %s %s trying to close %.6f but only %.6f open, closing full position",
+			symbol, side, quantity, position.Quantity)
+		closeQty = position.Quantity
+	}
+	closedBefore := position.EntryQuantity - position.Quantity
+	totalClosed := closedBefore + closeQty
+	var finalExitPrice float64
+	if totalClosed > 0 {
+		finalExitPrice = (position.ExitPrice*closedBefore + price*closeQty) / totalClosed
+		finalExitPrice = adaptivePriceRound(finalExitPrice, position.ExitPrice, price, position.EntryPrice)
+	} else {
+		finalExitPrice = price
+	}
+	totalPnL := position.RealizedPnL + realizedPnL
+	totalFee := position.Fee + fee
+	logger.Infof("  ✅ Full close: %s %s %.6f @ %.2f (avg exit: %.2f, entry: %.2f, PnL: %.2f)",
+		symbol, side, closeQty, price, finalExitPrice, position.EntryPrice, totalPnL)
+	return pb.positionStore.ClosePositionFully(
+		position.ID,
+		finalExitPrice,
+		orderID,
+		tradeTimeMs,
+		totalPnL,
+		totalFee,
+		closeReason,
+		mfe,
+		mae,
+		exitIndicatorsJSON,
+	)
 }
 
 // quantitiesMatch checks if two quantities are close enough (within tolerance)
