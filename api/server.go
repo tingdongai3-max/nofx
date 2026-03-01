@@ -2369,17 +2369,18 @@ func (s *Server) handlePositions(c *gin.Context) {
 			}
 			marginUsed := (pos.Quantity * markPrice) / float64(lev)
 			out = append(out, map[string]interface{}{
-				"symbol":             pos.Symbol,
-				"side":               strings.ToLower(pos.Side),
-				"entry_price":        pos.EntryPrice,
-				"mark_price":         markPrice,
-				"quantity":           pos.Quantity,
-				"leverage":           lev,
-				"unrealized_pnl":     unrealizedPnl,
-				"unrealized_pnl_pct": unrealizedPnlPct,
-				"liquidation_price":  0.0,
-				"margin_used":        marginUsed,
-				"source":             "dry_run",
+				"symbol":                 pos.Symbol,
+				"side":                   strings.ToLower(pos.Side),
+				"entry_price":            pos.EntryPrice,
+				"mark_price":             markPrice,
+				"quantity":               pos.Quantity,
+				"leverage":               lev,
+				"unrealized_pnl":         unrealizedPnl,
+				"unrealized_pnl_pct":     unrealizedPnlPct,
+				"liquidation_price":      0.0,
+				"margin_used":            marginUsed,
+				"source":                 "dry_run",
+				"ai_reasoning_at_open":   pos.AiReasoningAtOpen,
 			})
 		}
 		body, _ := json.Marshal(out)

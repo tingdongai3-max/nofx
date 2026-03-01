@@ -1447,13 +1447,14 @@ func (e *StrategyEngine) writeAvailableIndicators(sb *strings.Builder) {
 // Prompt Building - User Prompt
 // ============================================================================
 
-// truncateReasoning 截断过长思维链，避免撑爆 prompt
+// truncateReasoning 截断过长思维链，避免撑爆 prompt。按 rune 截断，防止中文等多字节字符被切断产生乱码（如 \xe6\x9c）。
 func truncateReasoning(s string, maxLen int) string {
 	s = strings.TrimSpace(s)
-	if len(s) <= maxLen {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + "..."
+	return string(runes[:maxLen]) + "..."
 }
 
 // loadErrorPatterns 从配置文件加载「标志性错误」列表，作为 Negative Examples 注入 System Prompt。

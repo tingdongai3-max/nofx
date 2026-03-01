@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"gorm.io/gorm"
 )
 
 // PendingReasoning 实盘开仓时暂存的 AI 思维链，等 OrderSync 创建 TraderPosition 时按 Symbol+Side 匹配并填入 ai_reasoning_at_open
@@ -41,23 +39,36 @@ func (s *PositionStore) AddPendingReasoning(traderID, symbol, side, reasoning st
 	return s.db.Create(r).Error
 }
 
+// normalizeSymbolForMatch 将 -, _, / 全部去掉后 ToUpper，用于 Symbol 模糊匹配（PIPPIN-USDT-SWAP 与 PIPPINUSDT 可匹配）
+func normalizeSymbolForMatch(s string) string {
+	s = strings.ToUpper(strings.TrimSpace(s))
+	s = strings.ReplaceAll(s, "-", "")
+	s = strings.ReplaceAll(s, "_", "")
+	s = strings.ReplaceAll(s, "/", "")
+	return s
+}
+
 // TakeLatestPendingReasoning 取出并删除最近一条匹配的 pending reasoning（OrderSync 创建新仓位时调用）
+// 支持 Symbol 模糊匹配：去除 -, _, / 后再 ToUpper 对比，确保 PIPPIN-USDT-SWAP 与 PIPPINUSDT 能匹配
 // 返回 reasoning 文本；若无匹配或已取完则返回 ""，不报错
 func (s *PositionStore) TakeLatestPendingReasoning(traderID, symbol, side string) (string, error) {
 	symbol = strings.ToUpper(strings.TrimSpace(symbol))
 	side = strings.ToUpper(strings.TrimSpace(side))
-	var r PendingReasoning
-	err := s.db.Where("trader_id = ? AND symbol = ? AND side = ?", traderID, symbol, side).
+	targetNorm := normalizeSymbolForMatch(symbol)
+	var candidates []PendingReasoning
+	err := s.db.Where("trader_id = ? AND side = ?", traderID, side).
 		Order("created_at DESC").
-		First(&r).Error
+		Find(&candidates).Error
 	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			return "", nil
-		}
 		return "", err
 	}
-	if err := s.db.Delete(&r).Error; err != nil {
-		return "", fmt.Errorf("delete pending reasoning: %w", err)
+	for _, r := range candidates {
+		if normalizeSymbolForMatch(r.Symbol) == targetNorm {
+			if err := s.db.Delete(&r).Error; err != nil {
+				return "", fmt.Errorf("delete pending reasoning: %w", err)
+			}
+			return r.Reasoning, nil
+		}
 	}
-	return r.Reasoning, nil
+	return "", nil
 }

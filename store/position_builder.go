@@ -62,6 +62,9 @@ func (pb *PositionBuilder) handleOpen(
 	if existing == nil {
 		// 实盘决策记忆：OrderSync 创建新仓位时，从 pending_reasonings 取出最近一条匹配的 CoT 填入
 		aiReasoning, _ := pb.positionStore.TakeLatestPendingReasoning(traderID, symbol, side)
+		if aiReasoning == "" {
+			logger.Warnf("[WARN] No reasoning found in pending table for %s %s", symbol, side)
+		}
 		// Create new position
 		position := &TraderPosition{
 			TraderID:            traderID,

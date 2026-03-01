@@ -1831,6 +1831,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 	if at.store != nil && aiReasoning != "" {
 		if err := at.store.Position().AddPendingReasoning(at.id, decision.Symbol, "LONG", aiReasoning); err != nil {
 			logger.Infof("  ⚠ Failed to add pending reasoning: %v", err)
+		} else {
+			logger.Debugf("[Memory] Successfully cached reasoning for %s %s", decision.Symbol, "LONG")
 		}
 	}
 
@@ -1981,6 +1983,8 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 	if at.store != nil && aiReasoning != "" {
 		if err := at.store.Position().AddPendingReasoning(at.id, decision.Symbol, "SHORT", aiReasoning); err != nil {
 			logger.Infof("  ⚠ Failed to add pending reasoning: %v", err)
+		} else {
+			logger.Debugf("[Memory] Successfully cached reasoning for %s %s", decision.Symbol, "SHORT")
 		}
 	}
 
