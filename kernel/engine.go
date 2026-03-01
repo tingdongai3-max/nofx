@@ -1,6 +1,7 @@
 package kernel
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"nofx/provider/nofxos"
 	"nofx/security"
 	"nofx/store"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -104,6 +106,24 @@ type RecentOrder struct {
 	HoldDuration string  `json:"hold_duration"` // Hold duration, e.g. "2h30m"
 }
 
+// ReasoningOutcome 单笔开仓时的 AI 逻辑与结果，用于「Recent AI Reasoning History」注入与自我修正（原证复核，禁止 AI 改写）
+type ReasoningOutcome struct {
+	PositionID   int64  `json:"position_id"`   // 唯一仓位 ID，防串线
+	EntryTimeStr string `json:"entry_time_str"` // 开仓时间展示，如 "03-01 11:13"
+	Side         string `json:"side"`           // LONG / SHORT
+	Symbol       string `json:"symbol"`
+	Reasoning    string `json:"reasoning"`    // 开仓时 AI 思维链（仅来自 DB ai_reasoning_at_open）
+	ResultStr    string `json:"result_str"`    // 如 "LOSS (-0.31%)" / "PROFIT (+0.5%)"
+	CloseReason  string `json:"close_reason"`  // 系统平仓触发点：StopLoss / TakeProfit / sync 等，空表示 AI 主动平仓
+}
+
+// OpenPositionReasoning 当前持仓的开仓逻辑，提醒 AI「你正在为什么而坚持」
+type OpenPositionReasoning struct {
+	Symbol    string `json:"symbol"`
+	Side      string `json:"side"` // LONG / SHORT
+	Reasoning string `json:"reasoning"`
+}
+
 // Context trading context (complete information passed to AI)
 type Context struct {
 	CurrentTime     string                             `json:"current_time"`
@@ -114,8 +134,11 @@ type Context struct {
 	CandidateCoins  []CandidateCoin                    `json:"candidate_coins"`
 	PromptVariant   string                             `json:"prompt_variant,omitempty"`
 	TradingStats    *TradingStats                      `json:"trading_stats,omitempty"`
-	RecentOrders    []RecentOrder                      `json:"recent_orders,omitempty"`
-	MarketDataMap   map[string]*market.Data            `json:"-"`
+	RecentOrders                 []RecentOrder                      `json:"recent_orders,omitempty"`
+	RecentReasoningHistory       []ReasoningOutcome                  `json:"recent_reasoning_history,omitempty"` // 近期开仓时的 AI 逻辑与盈亏（原证），供自我审阅
+	OpenPositionReasoning        []OpenPositionReasoning             `json:"open_position_reasoning,omitempty"` // 当前持仓的开仓逻辑，防串线
+	ClosedCountSinceLastDecision int                                 `json:"closed_count_since_last_decision"`   // 自上次决策以来系统平仓数，用于 ALERT
+	MarketDataMap                map[string]*market.Data            `json:"-"`
 	MultiTFMarket   map[string]map[string]*market.Data `json:"-"`
 	OITopDataMap    map[string]*OITopData              `json:"-"`
 	QuantDataMap    map[string]*QuantData              `json:"-"`
@@ -1216,6 +1239,26 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"wait\", \"confidence\": 90}\n")
 	sb.WriteString("]\n```\n")
 	sb.WriteString("</decision>\n\n")
+
+	// 7a. 自我审阅 + 反幻觉审计：原证复核，区分「逻辑错误」与「概率亏损」
+	sb.WriteString("## Review Recent AI Reasoning History (Self-Correction & No Hallucination)\n\n")
+	sb.WriteString("Before making the current decision, you **MUST** review the **## Recent AI Reasoning History** section in the User Prompt (if present). That section contains **only raw text from the database** (ai_reasoning_at_open). Do **not** reinterpret or invent past reasoning; treat it as audit evidence.\n\n")
+	sb.WriteString("- If you find that previous **losses** were due to **repeated logic** (e.g. multiple times believing a breakout that turned out to be fake), you **MUST** either explain why **this time** the logic is different, or choose to **avoid** the same setup.\n")
+	sb.WriteString("- **When auditing history, stay neutral and distinguish:**\n")
+	sb.WriteString("  - **概率亏损 (Probability loss)**: The opening logic was consistent with the strategy (e.g. volume breakout, multi-signal confluence), but normal market volatility (wick, washout, liquidity spike) triggered stop. Mark in your chain of thought as **「符合策略的必要损耗」** — no need to change strategy parameters.\n")
+	sb.WriteString("  - **逻辑错误 (Logic error)**: The opening logic had blind spots (e.g. did not notice BTC had broken support, chased at resistance, ignored divergence). Mark as **「认知失效」** and in subsequent decisions **force avoidance** of that pattern.\n")
+	sb.WriteString("- Do **not** conflate the two: probability loss is acceptable; logic error requires correction.\n\n")
+
+	// 7b. 错误案例库：Negative Examples（从 config/error_patterns 加载，可人工维护）
+	if patterns := loadErrorPatterns(); len(patterns) > 0 {
+		sb.WriteString("## Negative Examples (Error Patterns to Avoid)\n\n")
+		sb.WriteString("The following patterns have been marked as **high-risk or typical failure modes**. Consider them as negative examples when making decisions:\n\n")
+		for _, p := range patterns {
+			sb.WriteString(fmt.Sprintf("- %s\n", p))
+		}
+		sb.WriteString("\n")
+	}
+
 	sb.WriteString("## Field Description\n\n")
 	if enableAIClose {
 		sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
@@ -1380,9 +1423,52 @@ func (e *StrategyEngine) writeAvailableIndicators(sb *strings.Builder) {
 // Prompt Building - User Prompt
 // ============================================================================
 
+// truncateReasoning 截断过长思维链，避免撑爆 prompt
+func truncateReasoning(s string, maxLen int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// loadErrorPatterns 从配置文件加载「标志性错误」列表，作为 Negative Examples 注入 System Prompt。
+// 尝试路径：config/error_patterns.yaml、config/error_patterns.txt、error_patterns.txt（每行一条，# 开头为注释）
+func loadErrorPatterns() []string {
+	for _, path := range []string{"config/error_patterns.yaml", "config/error_patterns.txt", "error_patterns.txt"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var out []string
+		sc := bufio.NewScanner(strings.NewReader(string(data)))
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			out = append(out, line)
+		}
+		if err := sc.Err(); err != nil {
+			logger.Warnf("error_patterns scan: %v", err)
+			return nil
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return nil
+}
+
 // BuildUserPrompt builds User Prompt based on strategy configuration
 func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 	var sb strings.Builder
+
+	// 未决策期间空档复盘：强制 AI 先看结果再做新动作
+	if ctx.ClosedCountSinceLastDecision > 0 {
+		sb.WriteString(fmt.Sprintf("!! ALERT: Since your last decision, %d position(s) have been closed by the system protector. Review the outcomes in **Recent AI Reasoning History** below before taking new actions.\n\n",
+			ctx.ClosedCountSinceLastDecision))
+	}
 
 	// Account information（相对稳定的账户层数据，放在 User Prompt 开头）
 	sb.WriteString(fmt.Sprintf("Account: Equity %.2f | Balance %.2f (%.1f%%) | PnL %+.2f%% | Margin %.1f%% | Positions %d\n\n",
@@ -1406,6 +1492,39 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 				order.EntryPrice, order.ExitPrice,
 				resultStr, order.RealizedPnL, order.PnLPct,
 				order.EntryTime, order.ExitTime, order.HoldDuration))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Recent AI Reasoning History：原证复核（仅来自 trader_positions.ai_reasoning_at_open，禁止 AI 自由发挥或改写）
+	if len(ctx.RecentReasoningHistory) > 0 {
+		sb.WriteString("## Recent AI Reasoning History (No Hallucination: raw from DB only)\n\n")
+		for _, r := range ctx.RecentReasoningHistory {
+			reasoning := r.Reasoning
+			if reasoning == "" {
+				reasoning = "(no reasoning recorded)"
+			}
+			reasoningTrunc := truncateReasoning(reasoning, 400)
+			if r.CloseReason != "" {
+				sb.WriteString(fmt.Sprintf("[已平仓] 品种: %s %s | 结果: %s | 开仓原始逻辑: %q | 系统平仓触发点: %s\n",
+					r.Symbol, r.Side, r.ResultStr, reasoningTrunc, r.CloseReason))
+			} else {
+				sb.WriteString(fmt.Sprintf("[%s] 决策: %s %s | 开仓原始逻辑: %q | 结果: %s\n",
+					r.EntryTimeStr, r.Side, r.Symbol, reasoningTrunc, r.ResultStr))
+			}
+		}
+		sb.WriteString("\n")
+	}
+
+	// 当前持仓的开仓逻辑（你正在为什么而坚持，防串线）
+	if len(ctx.OpenPositionReasoning) > 0 {
+		sb.WriteString("## Current Open Positions — Your Reasoning at Open\n\n")
+		for _, o := range ctx.OpenPositionReasoning {
+			reasoning := o.Reasoning
+			if reasoning == "" {
+				reasoning = "(no reasoning recorded)"
+			}
+			sb.WriteString(fmt.Sprintf("- %s %s: 开仓时逻辑: %q\n", o.Symbol, o.Side, truncateReasoning(reasoning, 300)))
 		}
 		sb.WriteString("\n")
 	}

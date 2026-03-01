@@ -810,7 +810,7 @@ func (at *AutoTrader) runCycle() error {
 			Success:    false,
 		}
 
-		if err := at.executeDecisionWithRecord(&d, &actionRecord); err != nil {
+		if err := at.executeDecisionWithRecord(&d, &actionRecord, aiDecision.CoTTrace); err != nil {
 			logger.Infof("❌ Failed to execute decision (%s %s): %v", d.Symbol, d.Action, err)
 			actionRecord.Error = err.Error()
 			record.ExecutionLog = append(record.ExecutionLog, fmt.Sprintf("❌ %s %s failed: %v", d.Symbol, d.Action, err))
@@ -955,8 +955,9 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 	}
 
 	if at.store != nil {
-		recentTrades, _ := at.store.Position().GetRecentTrades(at.id, 10)
-		for _, trade := range recentTrades {
+		tradesWithReasoning, _ := at.store.Position().GetRecentTradesWithReasoning(at.id, 10)
+		for _, tr := range tradesWithReasoning {
+			trade := tr.RecentTrade
 			entryTimeStr := ""
 			if trade.EntryTime > 0 {
 				entryTimeStr = time.Unix(trade.EntryTime, 0).UTC().Format("01-02 15:04 UTC")
@@ -968,6 +969,33 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 			ctx.RecentOrders = append(ctx.RecentOrders, kernel.RecentOrder{
 				Symbol: trade.Symbol, Side: trade.Side, EntryPrice: trade.EntryPrice, ExitPrice: trade.ExitPrice,
 				RealizedPnL: trade.RealizedPnL, PnLPct: trade.PnLPct, EntryTime: entryTimeStr, ExitTime: exitTimeStr, HoldDuration: trade.HoldDuration,
+			})
+			// 供「Recent AI Reasoning History」：开仓时的逻辑与盈亏结果（原证，防串线）
+			resultStr := "PROFIT"
+			if trade.PnLPct < 0 {
+				resultStr = "LOSS"
+			}
+			ctx.RecentReasoningHistory = append(ctx.RecentReasoningHistory, kernel.ReasoningOutcome{
+				PositionID:   tr.PositionID,
+				EntryTimeStr: entryTimeStr,
+				Side:         strings.ToUpper(trade.Side),
+				Symbol:       trade.Symbol,
+				Reasoning:    tr.AiReasoningAtOpen,
+				ResultStr:    fmt.Sprintf("%s (%+.2f%%)", resultStr, trade.PnLPct),
+				CloseReason:  tr.CloseReason,
+			})
+		}
+		// 未决策期间空档复盘：自上次 AI 决策以来被系统平仓的数量
+		if lastMs, ok := at.store.Decision().GetLatestDecisionTimeMs(at.id); ok {
+			ctx.ClosedCountSinceLastDecision, _ = at.store.Position().GetClosedCountSince(at.id, lastMs)
+		}
+		// 当前持仓的开仓逻辑（你正在为什么而坚持）
+		openPositions, _ := at.store.Position().GetOpenPositions(at.id)
+		for _, op := range openPositions {
+			ctx.OpenPositionReasoning = append(ctx.OpenPositionReasoning, kernel.OpenPositionReasoning{
+				Symbol:    op.Symbol,
+				Side:      op.Side,
+				Reasoning: op.AiReasoningAtOpen,
 			})
 		}
 		stats, _ := at.store.Position().GetFullStats(at.id)
@@ -1170,14 +1198,14 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 
 	// 7. Add recent closed trades (if store is available)
 	if at.store != nil {
-		// Get recent 10 closed trades for AI context
-		recentTrades, err := at.store.Position().GetRecentTrades(at.id, 10)
+		// Get recent 10 closed trades with AI reasoning for AI context
+		tradesWithReasoning, err := at.store.Position().GetRecentTradesWithReasoning(at.id, 10)
 		if err != nil {
 			logger.Infof("⚠️ [%s] Failed to get recent trades: %v", at.name, err)
 		} else {
-			logger.Infof("📊 [%s] Found %d recent closed trades for AI context", at.name, len(recentTrades))
-			for _, trade := range recentTrades {
-				// Convert Unix timestamps to formatted strings for AI readability
+			logger.Infof("📊 [%s] Found %d recent closed trades for AI context", at.name, len(tradesWithReasoning))
+			for _, tr := range tradesWithReasoning {
+				trade := tr.RecentTrade
 				entryTimeStr := ""
 				if trade.EntryTime > 0 {
 					entryTimeStr = time.Unix(trade.EntryTime, 0).UTC().Format("01-02 15:04 UTC")
@@ -1186,7 +1214,6 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 				if trade.ExitTime > 0 {
 					exitTimeStr = time.Unix(trade.ExitTime, 0).UTC().Format("01-02 15:04 UTC")
 				}
-
 				ctx.RecentOrders = append(ctx.RecentOrders, kernel.RecentOrder{
 					Symbol:       trade.Symbol,
 					Side:         trade.Side,
@@ -1197,6 +1224,34 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 					EntryTime:    entryTimeStr,
 					ExitTime:     exitTimeStr,
 					HoldDuration: trade.HoldDuration,
+				})
+				resultStr := "PROFIT"
+				if trade.PnLPct < 0 {
+					resultStr = "LOSS"
+				}
+				ctx.RecentReasoningHistory = append(ctx.RecentReasoningHistory, kernel.ReasoningOutcome{
+					PositionID:   tr.PositionID,
+					EntryTimeStr: entryTimeStr,
+					Side:         strings.ToUpper(trade.Side),
+					Symbol:       trade.Symbol,
+					Reasoning:    tr.AiReasoningAtOpen,
+					ResultStr:    fmt.Sprintf("%s (%+.2f%%)", resultStr, trade.PnLPct),
+					CloseReason:  tr.CloseReason,
+				})
+			}
+		}
+		// 未决策期间空档复盘：自上次 AI 决策以来被系统平仓的数量
+		if lastMs, ok := at.store.Decision().GetLatestDecisionTimeMs(at.id); ok {
+			ctx.ClosedCountSinceLastDecision, _ = at.store.Position().GetClosedCountSince(at.id, lastMs)
+		}
+		// 当前持仓的开仓逻辑（你正在为什么而坚持）
+		openPositions, errOpen := at.store.Position().GetOpenPositions(at.id)
+		if errOpen == nil {
+			for _, op := range openPositions {
+				ctx.OpenPositionReasoning = append(ctx.OpenPositionReasoning, kernel.OpenPositionReasoning{
+					Symbol:    op.Symbol,
+					Side:      op.Side,
+					Reasoning: op.AiReasoningAtOpen,
 				})
 			}
 		}
@@ -1280,11 +1335,12 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 	return ctx, nil
 }
 
-// executeDecisionWithRecord executes AI decision and records detailed information
-func (at *AutoTrader) executeDecisionWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction) error {
+// executeDecisionWithRecord executes AI decision and records detailed information.
+// aiReasoning 为本轮 AI 思维链（CoTTrace），开仓时会写入仓位记录供复盘与自我修正。
+func (at *AutoTrader) executeDecisionWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction, aiReasoning string) error {
 	// 模拟盘：不调用交易所，走 Dry-Run 引擎（价格撮合 + 落库 + 虚拟资金）
 	if at.config.IsDryRun {
-		return at.executeDryRunOrder(decision, actionRecord, decision.Action)
+		return at.executeDryRunOrder(decision, actionRecord, decision.Action, aiReasoning)
 	}
 
 	// Global guardrail: whether AI is allowed to issue manual close actions.
@@ -1292,9 +1348,9 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *kernel.Decision, actio
 
 	switch decision.Action {
 	case "open_long":
-		return at.executeOpenLongWithRecord(decision, actionRecord)
+		return at.executeOpenLongWithRecord(decision, actionRecord, aiReasoning)
 	case "open_short":
-		return at.executeOpenShortWithRecord(decision, actionRecord)
+		return at.executeOpenShortWithRecord(decision, actionRecord, aiReasoning)
 	case "close_long":
 		if !enableAIClose {
 			logger.Infof("  ⛔ [RISK CONTROL] AI close_long blocked by config (enable_ai_close=false); ignoring action")
@@ -1634,8 +1690,8 @@ func (at *AutoTrader) ExecuteDecision(d *kernel.Decision) error {
 		Reasoning:  d.Reasoning,
 	}
 
-	// Execute the decision
-	err := at.executeDecisionWithRecord(d, actionRecord)
+	// Execute the decision（外部决策无本轮 CoT，传空）
+	err := at.executeDecisionWithRecord(d, actionRecord, "")
 	if err != nil {
 		logger.Errorf("[%s] External decision execution failed: %v", at.name, err)
 		return err
@@ -1646,7 +1702,8 @@ func (at *AutoTrader) ExecuteDecision(d *kernel.Decision) error {
 }
 
 // executeOpenLongWithRecord executes open long position and records detailed information
-func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction) error {
+// aiReasoning 为本轮 CoT，实盘会写入 pending_reasonings 供 OrderSync 创建仓位时填充 ai_reasoning_at_open
+func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction, aiReasoning string) error {
 	logger.Infof("  📈 Open long: %s", decision.Symbol)
 
 	// ⚠️ Get current positions for multiple checks
@@ -1747,6 +1804,13 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 	// Record order to database and poll for confirmation
 	at.recordAndConfirmOrder(order, decision.Symbol, "open_long", quantity, marketData.CurrentPrice, decision.Leverage, 0)
 
+	// 实盘决策记忆：将本轮 CoT 写入 pending_reasonings，OrderSync 创建 TraderPosition 时会自动填入 ai_reasoning_at_open
+	if at.store != nil && aiReasoning != "" {
+		if err := at.store.Position().AddPendingReasoning(at.id, decision.Symbol, "LONG", aiReasoning); err != nil {
+			logger.Infof("  ⚠ Failed to add pending reasoning: %v", err)
+		}
+	}
+
 	// Record position opening time
 	posKey := decision.Symbol + "_long"
 	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
@@ -1788,7 +1852,8 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 }
 
 // executeOpenShortWithRecord executes open short position and records detailed information
-func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction) error {
+// aiReasoning 为本轮 CoT，实盘会写入 pending_reasonings 供 OrderSync 创建仓位时填充 ai_reasoning_at_open
+func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction, aiReasoning string) error {
 	logger.Infof("  📉 Open short: %s", decision.Symbol)
 
 	// ⚠️ Get current positions for multiple checks
@@ -1888,6 +1953,13 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 
 	// Record order to database and poll for confirmation
 	at.recordAndConfirmOrder(order, decision.Symbol, "open_short", quantity, marketData.CurrentPrice, decision.Leverage, 0)
+
+	// 实盘决策记忆：将本轮 CoT 写入 pending_reasonings，OrderSync 创建 TraderPosition 时会自动填入 ai_reasoning_at_open
+	if at.store != nil && aiReasoning != "" {
+		if err := at.store.Position().AddPendingReasoning(at.id, decision.Symbol, "SHORT", aiReasoning); err != nil {
+			logger.Infof("  ⚠ Failed to add pending reasoning: %v", err)
+		}
+	}
 
 	// Record position opening time
 	posKey := decision.Symbol + "_short"
@@ -2775,7 +2847,7 @@ func (at *AutoTrader) emergencyClosePositionDryRun(symbol, side string) error {
 	} else {
 		decision.Action = "close_short"
 	}
-	return at.executeDryRunOrder(decision, actionRecord, decision.Action)
+	return at.executeDryRunOrder(decision, actionRecord, decision.Action, "")
 }
 
 // emergencyClosePosition emergency close position function

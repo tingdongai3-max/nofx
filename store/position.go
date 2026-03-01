@@ -103,6 +103,7 @@ type TraderPosition struct {
 	Status             string  `gorm:"column:status;default:OPEN;index:idx_positions_status" json:"status"`
 	CloseReason        string  `gorm:"column:close_reason;default:''" json:"close_reason"`
 	Source             string  `gorm:"column:source;default:system" json:"source"`
+	AiReasoningAtOpen  string  `gorm:"column:ai_reasoning_at_open;type:text" json:"ai_reasoning_at_open"` // 开仓时 AI 思维链，用于复盘与自我修正
 	CreatedAt          int64   `gorm:"column:created_at" json:"created_at"`   // Unix milliseconds UTC
 	UpdatedAt          int64   `gorm:"column:updated_at" json:"updated_at"`   // Unix milliseconds UTC
 }
@@ -166,12 +167,17 @@ func (s *PositionStore) InitTables() error {
 
 			// Just ensure index exists
 			s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_exchange_pos_unique ON trader_positions(exchange_id, exchange_position_id) WHERE exchange_position_id != ''`)
+			// 实盘 PendingReasoning：确保表存在
+			_ = s.db.AutoMigrate(&PendingReasoning{})
 			return nil
 		}
 	}
 
 	if err := s.db.AutoMigrate(&TraderPosition{}); err != nil {
 		return fmt.Errorf("failed to migrate trader_positions table: %w", err)
+	}
+	if err := s.db.AutoMigrate(&PendingReasoning{}); err != nil {
+		return fmt.Errorf("failed to migrate pending_reasonings table: %w", err)
 	}
 
 	// Create unique partial index for exchange position deduplication
@@ -633,6 +639,66 @@ func (s *PositionStore) GetRecentTrades(traderID string, limit int) ([]RecentTra
 	}
 
 	return trades, nil
+}
+
+// RecentTradeWithReasoning extends RecentTrade with AI reasoning at open and close metadata (原证复核 + 防串线)
+type RecentTradeWithReasoning struct {
+	RecentTrade
+	PositionID       int64  `json:"position_id"`        // 唯一仓位 ID，防串线
+	AiReasoningAtOpen string `json:"ai_reasoning_at_open"` // 开仓时原始思维链（仅来自 DB，禁止 AI 改写）
+	CloseReason      string `json:"close_reason"`       // 系统平仓触发点：StopLoss / TakeProfit / sync 等
+}
+
+// GetRecentTradesWithReasoning returns recent closed trades including AI reasoning at open for复盘
+func (s *PositionStore) GetRecentTradesWithReasoning(traderID string, limit int) ([]RecentTradeWithReasoning, error) {
+	var positions []TraderPosition
+	err := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED").
+		Order("exit_time DESC").
+		Limit(limit).
+		Find(&positions).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to query recent trades: %w", err)
+	}
+
+	var trades []RecentTradeWithReasoning
+	for _, pos := range positions {
+		t := RecentTradeWithReasoning{
+			RecentTrade: RecentTrade{
+				Symbol:      pos.Symbol,
+				Side:        strings.ToLower(pos.Side),
+				EntryPrice:  pos.EntryPrice,
+				ExitPrice:   pos.ExitPrice,
+				RealizedPnL: pos.RealizedPnL,
+				EntryTime:   pos.EntryTime / 1000,
+			},
+			PositionID:        pos.ID,
+			AiReasoningAtOpen: pos.AiReasoningAtOpen,
+			CloseReason:       pos.CloseReason,
+		}
+		if pos.ExitTime > 0 {
+			t.ExitTime = pos.ExitTime / 1000
+			durationMs := pos.ExitTime - pos.EntryTime
+			t.HoldDuration = formatDurationMs(durationMs)
+		}
+		if pos.EntryPrice > 0 {
+			if t.Side == "long" {
+				t.PnLPct = (pos.ExitPrice - pos.EntryPrice) / pos.EntryPrice * 100 * float64(pos.Leverage)
+			} else {
+				t.PnLPct = (pos.EntryPrice - pos.ExitPrice) / pos.EntryPrice * 100 * float64(pos.Leverage)
+			}
+		}
+		trades = append(trades, t)
+	}
+	return trades, nil
+}
+
+// GetClosedCountSince 返回自某时刻（Unix 毫秒）以来被平仓的仓位数量（用于「未决策期间空档复盘」ALERT）
+func (s *PositionStore) GetClosedCountSince(traderID string, sinceTimeMs int64) (int, error) {
+	var count int64
+	err := s.db.Model(&TraderPosition{}).
+		Where("trader_id = ? AND status = ? AND exit_time > ?", traderID, "CLOSED", sinceTimeMs).
+		Count(&count).Error
+	return int(count), err
 }
 
 // formatDuration formats a duration

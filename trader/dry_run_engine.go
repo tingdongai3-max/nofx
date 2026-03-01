@@ -16,12 +16,13 @@ const (
 )
 
 // executeDryRunOrder 模拟盘统一入口：不调用交易所，用当前价+滑点撮合，直接落库并更新虚拟资金
-func (at *AutoTrader) executeDryRunOrder(decision *kernel.Decision, actionRecord *store.DecisionAction, action string) error {
+// aiReasoning 为本轮 AI 思维链，用于开仓时写入 TraderPosition.ai_reasoning_at_open，供复盘与自我修正
+func (at *AutoTrader) executeDryRunOrder(decision *kernel.Decision, actionRecord *store.DecisionAction, action string, aiReasoning string) error {
 	switch action {
 	case "open_long":
-		return at.executeDryRunOpenLong(decision, actionRecord)
+		return at.executeDryRunOpenLong(decision, actionRecord, aiReasoning)
 	case "open_short":
-		return at.executeDryRunOpenShort(decision, actionRecord)
+		return at.executeDryRunOpenShort(decision, actionRecord, aiReasoning)
 	case "close_long":
 		return at.executeDryRunCloseLong(decision, actionRecord)
 	case "close_short":
@@ -50,7 +51,7 @@ func (at *AutoTrader) getDryRunPrice(symbol string, isLong bool) (float64, error
 	return price, nil
 }
 
-func (at *AutoTrader) executeDryRunOpenLong(decision *kernel.Decision, actionRecord *store.DecisionAction) error {
+func (at *AutoTrader) executeDryRunOpenLong(decision *kernel.Decision, actionRecord *store.DecisionAction, aiReasoning string) error {
 	logger.Infof("  📈 [Dry-Run] Open long: %s", decision.Symbol)
 
 	price, err := at.getDryRunPrice(decision.Symbol, true)
@@ -102,6 +103,7 @@ func (at *AutoTrader) executeDryRunOpenLong(decision *kernel.Decision, actionRec
 		CreatedAt:           nowMs,
 		UpdatedAt:           nowMs,
 	}
+	pos.AiReasoningAtOpen = aiReasoning
 	if err := at.store.Position().CreateOpenPosition(pos); err != nil {
 		return err
 	}
@@ -109,7 +111,7 @@ func (at *AutoTrader) executeDryRunOpenLong(decision *kernel.Decision, actionRec
 	return nil
 }
 
-func (at *AutoTrader) executeDryRunOpenShort(decision *kernel.Decision, actionRecord *store.DecisionAction) error {
+func (at *AutoTrader) executeDryRunOpenShort(decision *kernel.Decision, actionRecord *store.DecisionAction, aiReasoning string) error {
 	logger.Infof("  📉 [Dry-Run] Open short: %s", decision.Symbol)
 
 	price, err := at.getDryRunPrice(decision.Symbol, false)
@@ -160,6 +162,7 @@ func (at *AutoTrader) executeDryRunOpenShort(decision *kernel.Decision, actionRe
 		CreatedAt:           nowMs,
 		UpdatedAt:           nowMs,
 	}
+	pos.AiReasoningAtOpen = aiReasoning
 	if err := at.store.Position().CreateOpenPosition(pos); err != nil {
 		return err
 	}

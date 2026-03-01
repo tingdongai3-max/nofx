@@ -60,6 +60,8 @@ func (pb *PositionBuilder) handleOpen(
 
 	nowMs := time.Now().UTC().UnixMilli()
 	if existing == nil {
+		// 实盘决策记忆：OrderSync 创建新仓位时，从 pending_reasonings 取出最近一条匹配的 CoT 填入
+		aiReasoning, _ := pb.positionStore.TakeLatestPendingReasoning(traderID, symbol, side)
 		// Create new position
 		position := &TraderPosition{
 			TraderID:            traderID,
@@ -79,6 +81,7 @@ func (pb *PositionBuilder) handleOpen(
 			Fee:                 fee,
 			CreatedAt:           nowMs,
 			UpdatedAt:           nowMs,
+			AiReasoningAtOpen:   aiReasoning,
 		}
 		return pb.positionStore.CreateOpenPosition(position)
 	}

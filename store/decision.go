@@ -181,6 +181,16 @@ func (s *DecisionStore) LogDecision(record *DecisionRecord) error {
 	return nil
 }
 
+// GetLatestDecisionTimeMs 返回该 Trader 最近一次决策的时间戳（Unix 毫秒），用于「未决策期间空档复盘」
+func (s *DecisionStore) GetLatestDecisionTimeMs(traderID string) (int64, bool) {
+	var dbRecord DecisionRecordDB
+	err := s.db.Where("trader_id = ?", traderID).Order("timestamp DESC").Limit(1).First(&dbRecord).Error
+	if err != nil || dbRecord.Timestamp.IsZero() {
+		return 0, false
+	}
+	return dbRecord.Timestamp.UTC().UnixMilli(), true
+}
+
 // GetLatestRecords gets the latest N records for specified trader (sorted by time in ascending order: old to new)
 func (s *DecisionStore) GetLatestRecords(traderID string, n int) ([]*DecisionRecord, error) {
 	var dbRecords []*DecisionRecordDB
