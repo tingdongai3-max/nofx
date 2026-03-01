@@ -105,6 +105,7 @@ func TestHyperliquidPositionBuilding(t *testing.T) {
 			0.1, 3500, 0.5, 0,
 			time.Now().UnixMilli(), "order-1",
 			0, 0,
+			"", "",
 		)
 		if err != nil {
 			t.Fatalf("Failed to process open long: %v", err)
@@ -129,6 +130,7 @@ func TestHyperliquidPositionBuilding(t *testing.T) {
 			0.1, 3600, 0.5, 10.0, // PnL = (3600-3500)*0.1 = 10
 			time.Now().UnixMilli(), "order-2",
 			0, 0,
+			"", "",
 		)
 		if err != nil {
 			t.Fatalf("Failed to process close long: %v", err)
@@ -156,6 +158,7 @@ func TestHyperliquidPositionBuilding(t *testing.T) {
 			0.05, 3500, 0.25, 0,
 			time.Now().UnixMilli(), "order-3",
 			0, 0,
+			"", "",
 		)
 		if err != nil {
 			t.Fatalf("Failed to process open short: %v", err)
@@ -181,6 +184,7 @@ func TestHyperliquidPositionBuilding(t *testing.T) {
 			0.05, 3400, 0.25, 5.0, // PnL = (3500-3400)*0.05 = 5
 			time.Now().UnixMilli(), "order-4",
 			0, 0,
+			"", "",
 		)
 		if err != nil {
 			t.Fatalf("Failed to process close short: %v", err)
@@ -211,6 +215,7 @@ func TestHyperliquidPositionBuilding(t *testing.T) {
 			0.1, 3500, 0.5, 0,
 			time.Now().UnixMilli(), "order-5",
 			0, 0,
+			"", "",
 		)
 		if err != nil {
 			t.Fatalf("Failed to process first open: %v", err)
@@ -223,6 +228,7 @@ func TestHyperliquidPositionBuilding(t *testing.T) {
 			0.1, 3600, 0.5, 0,
 			time.Now().UnixMilli(), "order-6",
 			0, 0,
+			"", "",
 		)
 		if err != nil {
 			t.Fatalf("Failed to process add position: %v", err)
@@ -251,6 +257,7 @@ func TestHyperliquidPositionBuilding(t *testing.T) {
 			0.2, 3700, 1.0, 30.0,
 			time.Now().UnixMilli(), "order-7",
 			0, 0,
+			"", "",
 		)
 		if err != nil {
 			t.Fatalf("Failed to process close: %v", err)
@@ -278,6 +285,7 @@ func TestHyperliquidPositionBuilding(t *testing.T) {
 			1.0, 3500, 2.0, 0,
 			time.Now().UnixMilli(), "order-8",
 			0, 0,
+			"", "",
 		)
 		if err != nil {
 			t.Fatalf("Failed to process open: %v", err)
@@ -290,6 +298,7 @@ func TestHyperliquidPositionBuilding(t *testing.T) {
 			0.3, 3600, 0.6, 30.0,
 			time.Now().UnixMilli(), "order-9",
 			0, 0,
+			"", "",
 		)
 		if err != nil {
 			t.Fatalf("Failed to process partial close: %v", err)
@@ -363,6 +372,7 @@ func TestHyperliquidBugScenario(t *testing.T) {
 			time.Now().Add(time.Duration(i)*time.Second).UnixMilli(),
 			"",
 			0, 0,
+			"", "",
 		)
 		if err != nil {
 			t.Fatalf("Failed to process trade %d: %v", i, err)

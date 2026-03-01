@@ -832,4 +832,46 @@ export const api = {
     if (!result.success) throw new Error('获取历史仓位失败')
     return result.data!
   },
+
+  // Screener 量化雷达：多条件筛选（纯内存，无 K 线拉取）
+  async screenerFilter(filters: ScreenerFilterCondition[]): Promise<ScreenerFilterResponse> {
+    const res = await fetch(`${API_BASE}/screener/filter`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ filters }),
+    })
+    return handleJSONResponse<ScreenerFilterResponse>(res)
+  },
+}
+
+export interface ScreenerFilterCondition {
+  timeframe: string
+  indicator: string
+  operator: string
+  value: number
+  value2?: number
+}
+
+export interface IndicatorSnapshot {
+  close?: number
+  rsi?: number
+  adx?: number
+  bias?: number
+  vol_mult?: number
+  emabias?: number
+  boll_pct?: number
+  atr_pct?: number
+  macd?: number
+}
+
+export interface CoinQuantState {
+  symbol: string
+  price: number
+  by_tf: Record<string, IndicatorSnapshot>
+  updated_at: number
+}
+
+export interface ScreenerFilterResponse {
+  symbols: CoinQuantState[]
+  count: number
 }

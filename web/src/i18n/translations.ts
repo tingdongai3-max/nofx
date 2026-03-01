@@ -583,6 +583,8 @@ export const translations = {
     applyApiKey: 'Apply API Key',
     kimiApiNote:
       'Kimi requires API Key from international site (moonshot.ai), China region keys are not compatible',
+    minimaxApiNote:
+      'MiniMax Coding Plan uses Anthropic Messages API. Base URL must end with /v1: https://api.minimaxi.com/anthropic/v1 (China) or https://api.minimax.io/anthropic/v1 (International). Get API Key from 接口密钥 → Create Coding Plan Key.',
     leaveBlankForDefaultModel: 'Leave blank to use default model',
     customModelName: 'Model Name (Optional)',
     customModelNamePlaceholder: 'e.g.: deepseek-chat, qwen3-max, gpt-4o',
@@ -1809,6 +1811,8 @@ export const translations = {
     applyApiKey: '申请 API Key',
     kimiApiNote:
       'Kimi 需要从国际站申请 API Key (moonshot.ai)，中国区 Key 不通用',
+    minimaxApiNote:
+      'MiniMax Coding Plan 走 Anthropic Messages 协议。Base URL 必须以 /v1 结尾：https://api.minimaxi.com/anthropic/v1（国内）或 https://api.minimax.io/anthropic/v1（国际）。API Key 前往 接口密钥 → 创建 Coding Plan Key。',
     leaveBlankForDefaultModel: '留空使用默认模型名称',
     customModelName: 'Model Name (可选)',
     customModelNamePlaceholder: '例如: deepseek-chat, qwen3-max, gpt-4o',

@@ -1,6 +1,7 @@
 package binance
 
 import (
+	"context"
 	"fmt"
 	"nofx/logger"
 	"nofx/market"
@@ -279,17 +280,32 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 			logger.Infof("  ⚠️ Failed to sync fill for trade %s: %v", trade.TradeID, err)
 		}
 
-		// Create/update position record using PositionBuilder
+		// 1. 先快速落盘核心交易数据（indicators 暂存为空，绝不阻塞）
 		if err := posBuilder.ProcessTrade(
 			traderID, exchangeID, exchangeType,
 			symbol, positionSide, orderAction,
 			trade.Quantity, trade.Price, trade.Fee, trade.RealizedPnL,
 			tradeTimeMs, trade.TradeID,
 			0, 0, // MFE/MAE not tracked in sync
+			"", "", // 快照异步回写，不阻塞核心链路
 		); err != nil {
 			logger.Infof("  ⚠️ Failed to sync position for trade %s: %v", trade.TradeID, err)
 		} else {
 			logger.Infof("  📍 Position updated for trade: %s (action: %s, qty: %.6f)", trade.TradeID, orderAction, trade.Quantity)
+
+			// 2. 异步回写指标快照（锦上添花，失败不影响仓位同步）
+			posStore := st.Position()
+			if orderAction == "open_long" || orderAction == "open_short" {
+				pos, _ := posStore.GetOpenPositionByExchangePositionID(exchangeID, fmt.Sprintf("sync_%s_%s_%d", symbol, positionSide, tradeTimeMs))
+				if pos != nil {
+					go backfillEntryIndicators(posStore, pos.ID, symbol, tradeTimeMs)
+				}
+			} else if orderAction == "close_long" || orderAction == "close_short" {
+				pos, err := posStore.GetClosedPositionByExitOrderID(exchangeID, trade.TradeID)
+				if err == nil && pos != nil {
+					go backfillExitIndicators(posStore, pos.ID, symbol, tradeTimeMs)
+				}
+			}
 		}
 
 		syncedCount++
@@ -314,6 +330,68 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 
 	logger.Infof("✅ Binance order sync completed: %d new trades synced, %d skipped (already exist)", syncedCount, skippedCount)
 	return nil
+}
+
+// indicatorSnapshotParams 固化的胜率优化参数（后端写死，不依赖前端）
+const (
+	indicatorSnapshotTF      = "5m"
+	indicatorSnapshotRSI     = 7
+	indicatorSnapshotEMA     = 20
+	indicatorSnapshotMACDFast = 12
+	indicatorSnapshotMACDSlow = 26
+	indicatorSnapshotMACDSig  = 9
+	indicatorSnapshotVolMult = 5
+	indicatorSnapshotTimeout = 10 * time.Second
+)
+
+// backfillEntryIndicators 异步拉取 K 线并回写 entry_indicators（锦上添花，失败不影响核心）
+func backfillEntryIndicators(posStore *store.PositionStore, posID int64, symbol string, tsMs int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), indicatorSnapshotTimeout)
+	defer cancel()
+	done := make(chan string, 1)
+	go func() {
+		jsonStr := market.FetchAndSnapshotIndicators(
+			symbol, tsMs, indicatorSnapshotTF,
+			indicatorSnapshotRSI, indicatorSnapshotEMA,
+			indicatorSnapshotMACDFast, indicatorSnapshotMACDSlow, indicatorSnapshotMACDSig,
+			indicatorSnapshotVolMult,
+		)
+		done <- jsonStr
+	}()
+	var jsonStr string
+	select {
+	case jsonStr = <-done:
+	case <-ctx.Done():
+		return
+	}
+	if jsonStr != "" {
+		_ = posStore.UpdateEntryIndicators(posID, jsonStr)
+	}
+}
+
+// backfillExitIndicators 异步拉取 K 线并回写 exit_indicators（锦上添花，失败不影响核心）
+func backfillExitIndicators(posStore *store.PositionStore, posID int64, symbol string, tsMs int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), indicatorSnapshotTimeout)
+	defer cancel()
+	done := make(chan string, 1)
+	go func() {
+		jsonStr := market.FetchAndSnapshotIndicators(
+			symbol, tsMs, indicatorSnapshotTF,
+			indicatorSnapshotRSI, indicatorSnapshotEMA,
+			indicatorSnapshotMACDFast, indicatorSnapshotMACDSlow, indicatorSnapshotMACDSig,
+			indicatorSnapshotVolMult,
+		)
+		done <- jsonStr
+	}()
+	var jsonStr string
+	select {
+	case jsonStr = <-done:
+	case <-ctx.Done():
+		return
+	}
+	if jsonStr != "" {
+		_ = posStore.UpdateExitIndicators(posID, jsonStr)
+	}
 }
 
 // getPositionSymbols returns list of symbols that have active positions

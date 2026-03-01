@@ -97,6 +97,8 @@ type TraderPosition struct {
 	Fee                float64 `gorm:"column:fee;default:0" json:"fee"`
 	MaxFavorableExcursion  float64 `gorm:"column:max_favorable_excursion;default:0" json:"max_favorable_excursion"` // MFE 最大浮盈 (USD)
 	MaxAdverseExcursion    float64 `gorm:"column:max_adverse_excursion;default:0" json:"max_adverse_excursion"`     // MAE 最大浮亏 (USD)
+	EntryIndicatorsJSON    string  `gorm:"column:entry_indicators;type:text" json:"-"`                              // 入场时指标快照 JSON
+	ExitIndicatorsJSON     string  `gorm:"column:exit_indicators;type:text" json:"-"`                               // 出场时指标快照 JSON
 	Leverage           int     `gorm:"column:leverage;default:1" json:"leverage"`
 	Status             string  `gorm:"column:status;default:OPEN;index:idx_positions_status" json:"status"`
 	CloseReason        string  `gorm:"column:close_reason;default:''" json:"close_reason"`
@@ -150,6 +152,15 @@ func (s *PositionStore) InitTables() error {
 				s.db.Raw(`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'trader_positions' AND column_name = ?`, col).Scan(&count)
 				if count == 0 {
 					s.db.Exec(fmt.Sprintf(`ALTER TABLE trader_positions ADD COLUMN %s DOUBLE PRECISION DEFAULT 0`, col))
+				}
+			}
+
+			// Ensure indicator snapshot columns exist (Pre-computed for 指标分析 秒开)
+			for _, col := range []string{"entry_indicators", "exit_indicators"} {
+				var count int64
+				s.db.Raw(`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'trader_positions' AND column_name = ?`, col).Scan(&count)
+				if count == 0 {
+					s.db.Exec(fmt.Sprintf(`ALTER TABLE trader_positions ADD COLUMN %s TEXT DEFAULT ''`, col))
 				}
 			}
 
@@ -295,7 +306,8 @@ func (s *PositionStore) UpdatePositionExchangeInfo(id int64, exchangeID, exchang
 
 // ClosePositionFully marks position as fully closed
 // exitTimeMs is Unix milliseconds UTC; mfe/mae are Max Favorable / Max Adverse Excursion in USD
-func (s *PositionStore) ClosePositionFully(id int64, exitPrice float64, exitOrderID string, exitTimeMs int64, totalRealizedPnL float64, totalFee float64, closeReason string, mfe, mae float64) error {
+// exitIndicatorsJSON is optional; pre-computed indicator snapshot for 指标分析 秒开 (empty string allowed)
+func (s *PositionStore) ClosePositionFully(id int64, exitPrice float64, exitOrderID string, exitTimeMs int64, totalRealizedPnL float64, totalFee float64, closeReason string, mfe, mae float64, exitIndicatorsJSON string) error {
 	var pos TraderPosition
 	if err := s.db.First(&pos, id).Error; err != nil {
 		return fmt.Errorf("failed to get position: %w", err)
@@ -319,6 +331,9 @@ func (s *PositionStore) ClosePositionFully(id int64, exitPrice float64, exitOrde
 	}
 	upd["max_favorable_excursion"] = mfe
 	upd["max_adverse_excursion"] = mae
+	if exitIndicatorsJSON != "" {
+		upd["exit_indicators"] = exitIndicatorsJSON
+	}
 	return s.db.Model(&TraderPosition{}).Where("id = ?", id).Updates(upd).Error
 }
 
@@ -377,6 +392,27 @@ func (s *PositionStore) GetOpenPositionBySymbol(traderID, symbol, side string) (
 		return nil, nil
 	}
 	return nil, err
+}
+
+// UpdateEntryIndicators updates entry_indicators column by position ID (for async backfill).
+func (s *PositionStore) UpdateEntryIndicators(id int64, jsonStr string) error {
+	return s.db.Model(&TraderPosition{}).Where("id = ?", id).Update("entry_indicators", jsonStr).Error
+}
+
+// UpdateExitIndicators updates exit_indicators column by position ID (for async backfill).
+func (s *PositionStore) UpdateExitIndicators(id int64, jsonStr string) error {
+	return s.db.Model(&TraderPosition{}).Where("id = ?", id).Update("exit_indicators", jsonStr).Error
+}
+
+// GetClosedPositionByExitOrderID returns the closed position with given exit_order_id (for async indicator backfill).
+func (s *PositionStore) GetClosedPositionByExitOrderID(exchangeID, exitOrderID string) (*TraderPosition, error) {
+	var pos TraderPosition
+	err := s.db.Where("exchange_id = ? AND exit_order_id = ? AND status = ?", exchangeID, exitOrderID, "CLOSED").
+		First(&pos).Error
+	if err != nil {
+		return nil, err
+	}
+	return &pos, nil
 }
 
 // GetClosedPositions gets closed positions

@@ -1,8 +1,10 @@
 package market
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"time"
 )
 
 // IndicatorSnapshot aggregates key indicator values at a specific timestamp.
@@ -133,4 +135,78 @@ func ComputeIndicatorSnapshot(klines []Kline, rsiPeriod, emaPeriod, macdFast, ma
 	}
 
 	return snap
+}
+
+// FetchAndSnapshotIndicators fetches klines around tsMs, computes IndicatorSnapshot, returns JSON string.
+// Used by OrderSync async backfill for 指标分析 秒开.
+// On error returns empty string (graceful degradation). rsiPeriod/emaPeriod/macdFast/macdSlow/macdSignal/volMultBars use defaults if <=0.
+// 固化参数：RSI 7, EMA 20, BOLL 20（胜率优化），后端写死不依赖前端。
+func FetchAndSnapshotIndicators(symbol string, tsMs int64, timeframe string, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal, volMultBars int) string {
+	if rsiPeriod <= 0 {
+		rsiPeriod = 7
+	}
+	if emaPeriod <= 0 {
+		emaPeriod = 20
+	}
+	if macdFast <= 0 {
+		macdFast = 12
+	}
+	if macdSlow <= 0 {
+		macdSlow = 26
+	}
+	if macdSignal <= 0 {
+		macdSignal = 9
+	}
+	if volMultBars <= 0 {
+		volMultBars = 5
+	}
+	if timeframe == "" {
+		timeframe = "5m"
+	}
+
+	maxLookbackBars := rsiPeriod
+	if emaPeriod > maxLookbackBars {
+		maxLookbackBars = emaPeriod
+	}
+	if macdSlow+macdSignal > maxLookbackBars {
+		maxLookbackBars = macdSlow + macdSignal
+	}
+	if volMultBars+1 > maxLookbackBars {
+		maxLookbackBars = volMultBars + 1
+	}
+	if maxLookbackBars < 35 {
+		maxLookbackBars = 35
+	}
+
+	tfDur, err := TFDuration(timeframe)
+	if err != nil {
+		return ""
+	}
+	buffer := tfDur * time.Duration(maxLookbackBars+5)
+	start := time.UnixMilli(tsMs).Add(-buffer)
+	end := time.UnixMilli(tsMs).Add(buffer)
+	klines, err := GetKlinesRange(symbol, timeframe, start, end)
+	if err != nil || len(klines) == 0 {
+		return ""
+	}
+
+	tfMs := int64(tfDur / time.Millisecond)
+	var slice []Kline
+	for i := len(klines) - 1; i >= 0; i-- {
+		k := klines[i]
+		if tsMs >= k.OpenTime && tsMs < k.OpenTime+tfMs {
+			slice = klines[:i+1]
+			break
+		}
+	}
+	if len(slice) == 0 {
+		return ""
+	}
+
+	snap := ComputeIndicatorSnapshot(slice, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal, volMultBars)
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }

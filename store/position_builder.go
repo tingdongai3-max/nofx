@@ -26,28 +26,31 @@ func NewPositionBuilder(positionStore *PositionStore) *PositionBuilder {
 
 // ProcessTrade processes a single trade and updates position accordingly
 // tradeTimeMs is Unix milliseconds UTC; mfe/mae are Max Favorable / Max Adverse Excursion in USD (optional, use 0 if not tracked)
+// entryIndicatorsJSON/exitIndicatorsJSON are optional; pre-computed indicator snapshots for 指标分析 秒开 (empty string allowed)
 func (pb *PositionBuilder) ProcessTrade(
 	traderID, exchangeID, exchangeType, symbol, side, action string,
 	quantity, price, fee, realizedPnL float64,
 	tradeTimeMs int64,
 	orderID string,
 	mfe, mae float64,
+	entryIndicatorsJSON, exitIndicatorsJSON string,
 ) error {
 	if strings.HasPrefix(action, "open_") {
-		return pb.handleOpen(traderID, exchangeID, exchangeType, symbol, side, quantity, price, fee, tradeTimeMs, orderID)
+		return pb.handleOpen(traderID, exchangeID, exchangeType, symbol, side, quantity, price, fee, tradeTimeMs, orderID, entryIndicatorsJSON)
 	} else if strings.HasPrefix(action, "close_") {
-		return pb.handleClose(traderID, exchangeID, exchangeType, symbol, side, quantity, price, fee, realizedPnL, tradeTimeMs, orderID, mfe, mae)
+		return pb.handleClose(traderID, exchangeID, exchangeType, symbol, side, quantity, price, fee, realizedPnL, tradeTimeMs, orderID, mfe, mae, exitIndicatorsJSON)
 	}
 	return nil
 }
 
 // handleOpen handles opening positions (create new or average into existing)
-// tradeTimeMs is Unix milliseconds UTC
+// tradeTimeMs is Unix milliseconds UTC; entryIndicatorsJSON optional for Pre-computed 指标分析
 func (pb *PositionBuilder) handleOpen(
 	traderID, exchangeID, exchangeType, symbol, side string,
 	quantity, price, fee float64,
 	tradeTimeMs int64,
 	orderID string,
+	entryIndicatorsJSON string,
 ) error {
 	// Get existing OPEN position for (symbol, side)
 	existing, err := pb.positionStore.GetOpenPositionBySymbol(traderID, symbol, side)
@@ -59,22 +62,23 @@ func (pb *PositionBuilder) handleOpen(
 	if existing == nil {
 		// Create new position
 		position := &TraderPosition{
-			TraderID:           traderID,
-			ExchangeID:         exchangeID,
-			ExchangeType:       exchangeType,
-			ExchangePositionID: fmt.Sprintf("sync_%s_%s_%d", symbol, side, tradeTimeMs),
-			Symbol:             symbol,
-			Side:               side,
-			Quantity:           quantity,
-			EntryPrice:         price,
-			EntryOrderID:       orderID,
-			EntryTime:          tradeTimeMs,
-			Leverage:           1,
-			Status:             "OPEN",
-			Source:             "sync",
-			Fee:                fee,
-			CreatedAt:          nowMs,
-			UpdatedAt:          nowMs,
+			TraderID:            traderID,
+			ExchangeID:          exchangeID,
+			ExchangeType:        exchangeType,
+			ExchangePositionID:  fmt.Sprintf("sync_%s_%s_%d", symbol, side, tradeTimeMs),
+			Symbol:              symbol,
+			Side:                side,
+			Quantity:            quantity,
+			EntryPrice:          price,
+			EntryOrderID:        orderID,
+			EntryTime:           tradeTimeMs,
+			EntryIndicatorsJSON: entryIndicatorsJSON,
+			Leverage:            1,
+			Status:              "OPEN",
+			Source:              "sync",
+			Fee:                 fee,
+			CreatedAt:           nowMs,
+			UpdatedAt:           nowMs,
 		}
 		return pb.positionStore.CreateOpenPosition(position)
 	}
@@ -94,13 +98,14 @@ func (pb *PositionBuilder) handleOpen(
 }
 
 // handleClose handles closing positions (partial or full)
-// tradeTimeMs is Unix milliseconds UTC; mfe/mae in USD
+// tradeTimeMs is Unix milliseconds UTC; mfe/mae in USD; exitIndicatorsJSON optional for Pre-computed 指标分析
 func (pb *PositionBuilder) handleClose(
 	traderID, exchangeID, exchangeType, symbol, side string,
 	quantity, price, fee, realizedPnL float64,
 	tradeTimeMs int64,
 	orderID string,
 	mfe, mae float64,
+	exitIndicatorsJSON string,
 ) error {
 	// Get OPEN position
 	position, err := pb.positionStore.GetOpenPositionBySymbol(traderID, symbol, side)
@@ -174,6 +179,7 @@ func (pb *PositionBuilder) handleClose(
 			"sync",
 			mfe,
 			mae,
+			exitIndicatorsJSON,
 		)
 	}
 }

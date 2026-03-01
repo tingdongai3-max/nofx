@@ -13,6 +13,7 @@ const MODEL_COLORS: Record<string, string> = {
   gemini: '#4285F4',
   grok: '#000000',
   openai: '#10A37F',
+  minimax: '#00D4AA',
 }
 
 // 获取AI模型图标的函数

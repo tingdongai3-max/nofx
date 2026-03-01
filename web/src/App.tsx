@@ -15,6 +15,7 @@ import { StrategyStudioPage } from './pages/StrategyStudioPage'
 import { DebateArenaPage } from './pages/DebateArenaPage'
 import { StrategyMarketPage } from './pages/StrategyMarketPage'
 import { DataPage } from './pages/DataPage'
+import { QuantDashboardPage } from './pages/QuantDashboardPage'
 import { LoginRequiredOverlay } from './components/LoginRequiredOverlay'
 import HeaderBar from './components/HeaderBar'
 import { LanguageProvider, useLanguage } from './contexts/LanguageContext'
@@ -43,6 +44,7 @@ type Page =
   | 'strategy'
   | 'strategy-market'
   | 'data'
+  | 'screener'
   | 'debate'
   | 'faq'
   | 'login'
@@ -71,6 +73,7 @@ function App() {
     if (path === '/strategy' || hash === 'strategy') return 'strategy'
     if (path === '/strategy-market' || hash === 'strategy-market') return 'strategy-market'
     if (path === '/data' || hash === 'data') return 'data'
+    if (path === '/screener' || hash === 'screener') return 'screener'
     if (path === '/debate' || hash === 'debate') return 'debate'
     if (path === '/dashboard' || hash === 'trader' || hash === 'details')
       return 'trader'
@@ -92,6 +95,7 @@ function App() {
       'competition': '/competition',
       'strategy-market': '/strategy-market',
       'data': '/data',
+      'screener': '/screener',
       'traders': '/traders',
       'trader': '/dashboard',
       'backtest': '/backtest',
@@ -158,6 +162,8 @@ function App() {
         setCurrentPage('strategy-market')
       } else if (path === '/data' || hash === 'data') {
         setCurrentPage('data')
+      } else if (path === '/screener' || hash === 'screener') {
+        setCurrentPage('screener')
       } else if (path === '/debate' || hash === 'debate') {
         setCurrentPage('debate')
       } else if (
@@ -384,6 +390,7 @@ function App() {
     const dataPageNavigate = (page: Page) => {
       const pathMap: Record<string, string> = {
         'data': '/data',
+        'screener': '/screener',
         'competition': '/competition',
         'strategy-market': '/strategy-market',
         'traders': '/traders',
@@ -464,6 +471,8 @@ function App() {
               <CompetitionPage />
             ) : currentPage === 'data' ? (
               <DataPage />
+            ) : currentPage === 'screener' ? (
+              <QuantDashboardPage />
             ) : currentPage === 'strategy-market' ? (
               <StrategyMarketPage />
             ) : currentPage === 'traders' ? (

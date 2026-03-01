@@ -113,12 +113,14 @@ func (r *klineRing) snapshot(count int) []Kline {
 }
 
 var (
-	klineStreamsMu sync.Mutex
-	klineStreams   = make(map[klineSeriesKey]*klineRing)
+	klineStreamsMu       sync.Mutex
+	klineStreams         = make(map[klineSeriesKey]*klineRing)
+	klineMultiplexActive = make(map[coinank_enum.Exchange]chan struct{}) // exchange -> done chan
+	klineMultiplexMu     sync.Mutex
 )
 
 // ensureKlineStream ensures there is a running WebSocket stream for the given symbol/exchange/interval.
-// It is idempotent and safe to call from hot paths.
+// 多路复用：同一 exchange 共用一个 WS 连接，批量订阅，避免 120 个独立连接。
 func ensureKlineStream(symbol, interval, exchange string) {
 	// Normalize inputs for key.
 	symbol = Normalize(symbol)
@@ -165,100 +167,104 @@ func ensureKlineStream(symbol, interval, exchange string) {
 		logger.Warnf("⚠️ K-line REST pre-warm failed (%s %s %s): %v, WS will fill from live only", key.Symbol, key.Exchange, key.Interval, err)
 	}
 
-	go runKlineStream(key, ring, symbol, interval, exchange)
+	startKlineMultiplex(key.Exchange, exchange)
 }
 
-// runKlineStream maintains a dedicated CoinAnk kline WebSocket subscription for a single series,
-// with automatic reconnection and heartbeat watchdog.
-// symbolStr, intervalStr, exchangeStr 为可读字符串，用于广播 KlineUpdateEvent（数据流驱动）。
-func runKlineStream(key klineSeriesKey, ring *klineRing, symbolStr, intervalStr, exchangeStr string) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// startKlineMultiplex 确保该 exchange 的多路复用连接已启动（单连接批量订阅）
+func startKlineMultiplex(exchangeEnum coinank_enum.Exchange, exchangeStr string) {
+	klineMultiplexMu.Lock()
+	if _, running := klineMultiplexActive[exchangeEnum]; running {
+		klineMultiplexMu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	klineMultiplexActive[exchangeEnum] = done
+	klineMultiplexMu.Unlock()
+	go runKlineMultiplex(exchangeEnum, exchangeStr, done)
+}
 
+// runKlineMultiplex 单连接多路复用：同一 exchange 下所有 (symbol,interval) 共用一个 WS，批量订阅
+// 断线重连时 REST 全量同步，避免 ScreenerCache/Kline 脏数据
+func runKlineMultiplex(exchangeEnum coinank_enum.Exchange, exchangeStr string, done chan struct{}) {
+	defer func() {
+		klineMultiplexMu.Lock()
+		delete(klineMultiplexActive, exchangeEnum)
+		klineMultiplexMu.Unlock()
+		close(done)
+	}()
+
+	ctx := context.Background()
 	const (
 		initialBackoff   = 1 * time.Second
 		maxBackoff       = 30 * time.Second
-		heartbeatTimeout = 60 * time.Second
+		restPreFetchBars = 200
 	)
-
 	backoff := initialBackoff
 
 	for {
-		if ctx.Err() != nil {
+		keys := getKeysForExchange(exchangeEnum)
+		if len(keys) == 0 {
 			return
 		}
 
 		ws, err := coinank_api.WsConn(ctx, true, false)
 		if err != nil {
-			logger.Warnf("⚠️ CoinAnk kline WS connect failed (%s %s %s): %v, retrying in %s",
-				key.Symbol, key.Exchange, key.Interval, err, backoff)
-			select {
-			case <-time.After(backoff):
-				if backoff < maxBackoff {
-					backoff *= 2
-					if backoff > maxBackoff {
-						backoff = maxBackoff
-					}
+			logger.Warnf("⚠️ CoinAnk kline multiplex connect failed (%s): %v, retry in %s", exchangeEnum, err, backoff)
+			time.Sleep(backoff)
+			if backoff < maxBackoff {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
 				}
-				continue
-			case <-ctx.Done():
-				return
 			}
+			continue
 		}
-
-		// Subscribe to specific kline stream.
-		if err := ws.Subscribe(key.Symbol, key.Exchange, key.Interval); err != nil {
-			logger.Warnf("⚠️ CoinAnk kline WS subscribe failed (%s %s %s): %v",
-				key.Symbol, key.Exchange, key.Interval, err)
-			_ = ws.Close()
-			select {
-			case <-time.After(backoff):
-				if backoff < maxBackoff {
-					backoff *= 2
-					if backoff > maxBackoff {
-						backoff = maxBackoff
-					}
-				}
-				continue
-			case <-ctx.Done():
-				return
-			}
-		}
-
-		logger.Infof("✓ CoinAnk kline WS subscribed: %s %s %s", key.Symbol, key.Exchange, key.Interval)
 		backoff = initialBackoff
 
-		lastMsgAt := time.Now()
+		// 批量订阅（多路复用：一个连接 N 个 topic）
+		batch := make([]struct {
+			Symbol   string
+			Exchange coinank_enum.Exchange
+			Interval coinank_enum.Interval
+		}, 0, len(keys))
+		for _, k := range keys {
+			batch = append(batch, struct {
+				Symbol   string
+				Exchange coinank_enum.Exchange
+				Interval coinank_enum.Interval
+			}{k.Symbol, k.Exchange, k.Interval})
+		}
+		if err := ws.SubscribeBatch(batch); err != nil {
+			logger.Warnf("⚠️ CoinAnk kline multiplex subscribe failed (%s): %v", exchangeEnum, err)
+			_ = ws.Close()
+			time.Sleep(backoff)
+			continue
+		}
+		logger.Infof("✓ CoinAnk kline multiplex subscribed: %s, %d streams", exchangeEnum, len(keys))
 
-		// Heartbeat watchdog.
-		heartbeatDone := make(chan struct{})
-		go func(closeFn func() error) {
-			ticker := time.NewTicker(heartbeatTimeout / 2)
-			defer ticker.Stop()
-			defer close(heartbeatDone)
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					if time.Since(lastMsgAt) > heartbeatTimeout {
-						logger.Warnf("⚠️ CoinAnk kline WS heartbeat timeout for %s %s %s, closing connection",
-							key.Symbol, key.Exchange, key.Interval)
-						_ = closeFn()
-						return
-					}
-				}
-			}
-		}(ws.Close)
-
-		// Consume kline channel (数据流：有推送才处理，不轮询)
+		// Consume kline channel
 		for msg := range ws.KlineCh {
-			lastMsgAt = time.Now()
 			if msg == nil || !msg.Success {
 				continue
 			}
 			k := msg.Data
-			// Convert CoinAnk KlineResult to market.Kline.
+			// 从 args 解析 symbol+interval（格式 kline@SYMBOL@exchange@interval）
+			parts := strings.Split(msg.Args, "@")
+			if len(parts) < 4 {
+				continue
+			}
+			sym, intervalStr := parts[1], parts[3]
+			intervalEnum, ok := mapIntervalToEnum(intervalStr)
+			if !ok {
+				continue
+			}
+			key := klineSeriesKey{Symbol: sym, Exchange: exchangeEnum, Interval: intervalEnum}
+			klineStreamsMu.Lock()
+			ring := klineStreams[key]
+			klineStreamsMu.Unlock()
+			if ring == nil {
+				continue
+			}
 			kline := Kline{
 				OpenTime:  k.StartTime,
 				Open:      k.Open,
@@ -269,30 +275,55 @@ func runKlineStream(key klineSeriesKey, ring *klineRing, symbolStr, intervalStr,
 				CloseTime: k.EndTime,
 			}
 			ring.append(kline)
-			// 广播：有 K 线更新，供 ATR 机器狗等按数据流触发（避免 5s 轮询与封禁）
 			select {
-			case klineUpdateCh <- KlineUpdateEvent{Symbol: symbolStr, Exchange: exchangeStr, Interval: intervalStr}:
+			case klineUpdateCh <- KlineUpdateEvent{Symbol: sym, Exchange: exchangeStr, Interval: intervalStr}:
 			default:
-				// 通道满时非阻塞丢弃，避免阻塞 WS 消费
+			}
+		}
+		_ = ws.Close()
+
+		// 断线重连前：REST 全量同步，避免丢包导致脏数据
+		logger.Infof("✓ CoinAnk kline multiplex reconnecting, REST sync for %d streams", len(keys))
+		for _, key := range keys {
+			klineStreamsMu.Lock()
+			ring := klineStreams[key]
+			klineStreamsMu.Unlock()
+			if ring == nil {
+				continue
+			}
+			ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+			ts := time.Now().UnixMilli()
+			coinankKlines, err := coinank_api.Kline(ctx2, key.Symbol, key.Exchange, ts, coinank_enum.To, restPreFetchBars, key.Interval)
+			cancel2()
+			if err == nil && len(coinankKlines) > 0 {
+				klines := make([]Kline, len(coinankKlines))
+				for i, k := range coinankKlines {
+					klines[i] = coinankResultToKline(k)
+				}
+				ring.loadHistory(klines)
 			}
 		}
 
-		<-heartbeatDone
-
-		// Reconnect after a delay.
-		select {
-		case <-time.After(backoff):
-			if backoff < maxBackoff {
-				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
+		time.Sleep(backoff)
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
 			}
-			continue
-		case <-ctx.Done():
-			return
 		}
 	}
+}
+
+func getKeysForExchange(exchangeEnum coinank_enum.Exchange) []klineSeriesKey {
+	klineStreamsMu.Lock()
+	defer klineStreamsMu.Unlock()
+	var keys []klineSeriesKey
+	for k := range klineStreams {
+		if k.Exchange == exchangeEnum {
+			keys = append(keys, k)
+		}
+	}
+	return keys
 }
 
 // getRealtimeKlines returns a recent snapshot of Klines from the WebSocket buffer, if available.

@@ -236,6 +236,9 @@ func (s *Server) setupRoutes() {
 			protected.GET("/statistics", s.handleStatistics)
 			protected.GET("/statistics/indicator-analysis", s.handleIndicatorAnalysis)
 
+			// Screener 量化雷达（纯内存，禁止在接口内拉 K 线）
+			protected.POST("/screener/filter", s.handleScreenerFilter)
+
 			// Backtest routes
 			backtest := protected.Group("/backtest")
 			s.registerBacktestRoutes(backtest)
@@ -1579,6 +1582,7 @@ func (s *Server) handleGetModelConfigs(c *gin.Context) {
 			{ID: "gemini", Name: "Gemini AI", Provider: "gemini", Enabled: false},
 			{ID: "grok", Name: "Grok AI", Provider: "grok", Enabled: false},
 			{ID: "kimi", Name: "Kimi AI", Provider: "kimi", Enabled: false},
+			{ID: "minimax", Name: "MiniMax AI", Provider: "minimax", Enabled: false},
 		}
 		c.JSON(http.StatusOK, defaultModels)
 		return
@@ -3257,20 +3261,8 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 		return
 	}
 
-	// Group trades by symbol for batched K-line fetching.
-	bySymbol := make(map[string][]*store.TraderPosition)
-	for _, p := range filtered {
-		symbol := market.Normalize(p.Symbol)
-		bySymbol[symbol] = append(bySymbol[symbol], p)
-	}
-
-	tfDur, err := market.TFDuration(normTF)
-	if err != nil {
-		SafeBadRequest(c, fmt.Sprintf("Invalid timeframe: %v", err))
-		return
-	}
-
-	// Aggregation buckets per indicator (per dimension: all / long / short).
+	// Pre-computed path: read EntryIndicatorsJSON/ExitIndicatorsJSON from DB (秒开，no GetKlinesRange)
+	// Legacy positions with empty JSON are skipped (graceful degradation).
 	// Slices hold raw values for median calculation.
 	type indicatorBucket struct {
 		profitEntrySum float64
@@ -3339,89 +3331,18 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 		}
 	}
 
-	// Helper: find kline index for given timestamp (ms) using time bucket [openTime, openTime+tfDur)
-	findKlineIndex := func(klines []market.Kline, tsMs int64, tfDuration time.Duration) int {
-		if len(klines) == 0 {
-			return -1
-		}
-		tfMs := int64(tfDuration / time.Millisecond)
-		lo, hi := 0, len(klines)-1
-		for lo <= hi {
-			mid := (lo + hi) / 2
-			k := klines[mid]
-			start := k.OpenTime
-			end := k.OpenTime + tfMs
-			if tsMs < start {
-				hi = mid - 1
-			} else if tsMs >= end {
-				lo = mid + 1
-			} else {
-				return mid
-			}
-		}
-		return -1
-	}
-
-	// For each symbol, fetch a single K-line range and evaluate indicators at entry & exit times.
-	for symbol, trades := range bySymbol {
-		if len(trades) == 0 {
-			continue
+	// Iterate positions: parse pre-computed EntryIndicatorsJSON/ExitIndicatorsJSON (no network)
+	for _, p := range filtered {
+		isWin := p.RealizedPnL > 0
+		side := p.Side
+		if side == "" {
+			side = "LONG"
 		}
 
-		var symFromMs, symToMs int64
-		for _, p := range trades {
-			if symFromMs == 0 || p.EntryTime < symFromMs {
-				symFromMs = p.EntryTime
-			}
-			if symToMs == 0 || p.ExitTime > symToMs {
-				symToMs = p.ExitTime
-			}
-		}
-
-		// Add buffer on both sides to ensure we have enough history for indicators.
-		// MACD 需要至少 macdSlow+macdSignal 根 K 线（如 26+9=35）才能算出 histogram；放量需要 volMultBars+1 根。
-		maxLookbackBars := rsiPeriod
-		if emaPeriod > maxLookbackBars {
-			maxLookbackBars = emaPeriod
-		}
-		if macdSlow+macdSignal > maxLookbackBars {
-			maxLookbackBars = macdSlow + macdSignal
-		}
-		if volMultBars+1 > maxLookbackBars {
-			maxLookbackBars = volMultBars + 1
-		}
-		if maxLookbackBars < 35 {
-			maxLookbackBars = 35
-		}
-		buffer := tfDur * time.Duration(maxLookbackBars+5)
-
-		start := time.UnixMilli(symFromMs).Add(-buffer)
-		if start.Before(time.Unix(0, 0)) {
-			start = time.Unix(0, 0)
-		}
-		end := time.UnixMilli(symToMs).Add(buffer)
-
-		klines, err := market.GetKlinesRange(symbol, normTF, start, end)
-		if err != nil || len(klines) == 0 {
-			// 某个币种 K 线拉取失败时，仅跳过该币种，不让整个接口报错。
-			logger.Infof("⚠️  Failed to fetch klines for indicator analysis: symbol=%s, err=%v", symbol, err)
-			continue
-		}
-
-		for _, p := range trades {
-			isWin := p.RealizedPnL > 0
-			side := p.Side
-			if side == "" {
-				side = "LONG"
-			}
-
-			// Entry snapshot
-			if idx := findKlineIndex(klines, p.EntryTime, tfDur); idx >= 0 {
-				slice := klines[:idx+1]
-				snap := market.ComputeIndicatorSnapshot(slice, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal, volMultBars)
-				if snap.MACD == 0 && len(slice) < macdSlow+macdSignal {
-					logger.Infof("Indicator analysis MACD zero: symbol=%s entry sliceLen=%d (need >= %d)", symbol, len(slice), macdSlow+macdSignal)
-				}
+		// Entry snapshot from DB (skip legacy positions with empty JSON)
+		if p.EntryIndicatorsJSON != "" {
+			var snap market.IndicatorSnapshot
+			if json.Unmarshal([]byte(p.EntryIndicatorsJSON), &snap) == nil {
 				addSampleAllSides("rsi", snap.RSI, isWin, true, side)
 				addSampleAllSides("emabias", snap.EMABias, isWin, true, side)
 				addSampleAllSides("boll_pct", snap.BollPct, isWin, true, side)
@@ -3431,11 +3352,12 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 				addSampleAllSides("bias", snap.Bias, isWin, true, side)
 				addSampleAllSides("vol_mult", snap.VolMult, isWin, true, side)
 			}
+		}
 
-			// Exit snapshot
-			if idx := findKlineIndex(klines, p.ExitTime, tfDur); idx >= 0 {
-				slice := klines[:idx+1]
-				snap := market.ComputeIndicatorSnapshot(slice, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal, volMultBars)
+		// Exit snapshot from DB
+		if p.ExitIndicatorsJSON != "" {
+			var snap market.IndicatorSnapshot
+			if json.Unmarshal([]byte(p.ExitIndicatorsJSON), &snap) == nil {
 				addSampleAllSides("rsi", snap.RSI, isWin, false, side)
 				addSampleAllSides("emabias", snap.EMABias, isWin, false, side)
 				addSampleAllSides("boll_pct", snap.BollPct, isWin, false, side)
@@ -3518,6 +3440,9 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 		"timeframe":        normTF,
 		"rsi_period":       rsiPeriod,
 		"ema_period":       emaPeriod,
+		"macd_fast":        macdFast,
+		"macd_slow":        macdSlow,
+		"macd_signal":      macdSignal,
 		"vol_mult_bars":    volMultBars,
 		"from":             overallFromMs,
 		"to":               overallToMs,
@@ -4067,6 +3992,7 @@ func (s *Server) handleGetSupportedModels(c *gin.Context) {
 		{"id": "gemini", "name": "Google Gemini", "provider": "gemini", "defaultModel": "gemini-3-pro-preview"},
 		{"id": "grok", "name": "Grok (xAI)", "provider": "grok", "defaultModel": "grok-3-latest"},
 		{"id": "kimi", "name": "Kimi (Moonshot)", "provider": "kimi", "defaultModel": "moonshot-v1-auto"},
+		{"id": "minimax", "name": "MiniMax", "provider": "minimax", "defaultModel": "MiniMax-M2.5"},
 	}
 
 	c.JSON(http.StatusOK, supportedModels)

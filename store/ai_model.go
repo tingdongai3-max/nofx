@@ -11,6 +11,11 @@ import (
 	"gorm.io/gorm"
 )
 
+// Provider constants for AI model configuration
+const (
+	ProviderMiniMax = "minimax"
+)
+
 // AIModelStore AI model storage
 type AIModelStore struct {
 	db *gorm.DB

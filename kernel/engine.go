@@ -426,6 +426,29 @@ func (e *StrategyEngine) GetCandidateCoins() ([]CandidateCoin, error) {
 
 	coinSource := e.config.CoinSource
 
+	// 量化优选：从 Screener 内存缓存按条件筛选，作为候选池喂给 AI
+	if coinSource.EnableQuantFilter && len(coinSource.QuantFilterConditions) > 0 {
+		conditions := make([]market.QuantFilterCondition, 0, len(coinSource.QuantFilterConditions))
+		for _, c := range coinSource.QuantFilterConditions {
+			conditions = append(conditions, market.QuantFilterCondition{
+				Timeframe: c.Timeframe,
+				Indicator: c.Indicator,
+				Operator:  c.Operator,
+				Value:     c.Value,
+				Value2:    c.Value2,
+			})
+		}
+		symbols := market.FilterSymbolsByConditions(conditions)
+		for _, sym := range symbols {
+			sym = market.Normalize(sym)
+			candidates = append(candidates, CandidateCoin{
+				Symbol:  sym,
+				Sources: []string{"quant_screener"},
+			})
+		}
+		return e.filterExcludedCoins(candidates), nil
+	}
+
 	switch coinSource.SourceType {
 	case "static":
 		for _, symbol := range coinSource.StaticCoins {

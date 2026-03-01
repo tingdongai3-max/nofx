@@ -14,6 +14,7 @@ type Page =
   | 'strategy'
   | 'strategy-market'
   | 'data'
+  | 'screener'
   | 'debate'
   | 'faq'
   | 'login'
@@ -100,6 +101,7 @@ export default function HeaderBar({
               // Define all navigation tabs
               const navTabs: { page: Page; path: string; label: string; requiresAuth: boolean }[] = [
                 { page: 'data', path: '/data', label: language === 'zh' ? '数据' : 'Data', requiresAuth: false },
+                { page: 'screener', path: '/screener', label: language === 'zh' ? '量化雷达' : 'Screener', requiresAuth: true },
                 { page: 'strategy-market', path: '/strategy-market', label: language === 'zh' ? '策略市场' : 'Market', requiresAuth: true },
                 { page: 'traders', path: '/traders', label: t('configNav', language), requiresAuth: true },
                 { page: 'trader', path: '/dashboard', label: t('dashboardNav', language), requiresAuth: true },
@@ -330,6 +332,7 @@ export default function HeaderBar({
                 {(() => {
                   const navTabs: { page: Page; path: string; label: string; requiresAuth: boolean }[] = [
                     { page: 'data', path: '/data', label: language === 'zh' ? '数据' : 'Data', requiresAuth: false },
+                    { page: 'screener', path: '/screener', label: language === 'zh' ? '量化雷达' : 'Screener', requiresAuth: true },
                     { page: 'strategy-market', path: '/strategy-market', label: language === 'zh' ? '策略市场' : 'Market', requiresAuth: true },
                     { page: 'traders', path: '/traders', label: t('configNav', language), requiresAuth: true },
                     { page: 'trader', path: '/dashboard', label: t('dashboardNav', language), requiresAuth: true },

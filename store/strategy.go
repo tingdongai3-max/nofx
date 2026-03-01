@@ -119,7 +119,20 @@ type CoinSourceConfig struct {
 	UseOILow bool `json:"use_oi_low"`
 	// OI Low maximum count
 	OILowLimit int `json:"oi_low_limit,omitempty"`
+	// 量化优选：为 true 时从 Screener 内存缓存按条件筛选候选池，再喂给 AI
+	EnableQuantFilter bool `json:"enable_quant_filter"`
+	// 量化优选条件（与 POST /api/screener/filter 同结构）
+	QuantFilterConditions []QuantFilterCondition `json:"quant_filter_conditions,omitempty"`
 	// Note: API URLs are now built automatically using NofxOSAPIKey from IndicatorConfig
+}
+
+// QuantFilterCondition 单条量化过滤条件（策略配置与 API 共用）
+type QuantFilterCondition struct {
+	Timeframe string  `json:"timeframe"`
+	Indicator string  `json:"indicator"`
+	Operator  string  `json:"operator"`
+	Value     float64 `json:"value"`
+	Value2    float64 `json:"value2,omitempty"`
 }
 
 // IndicatorConfig indicator configuration

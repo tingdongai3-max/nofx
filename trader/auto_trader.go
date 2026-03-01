@@ -207,6 +207,12 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		mcpClient.SetAPIKey(config.CustomAPIKey, config.CustomAPIURL, config.CustomModelName)
 		logger.Infof("🤖 [%s] Using OpenAI", config.Name)
 
+	case "minimax":
+		// MiniMax Coding Plan 走 Anthropic Messages 协议，复用 Claude Client
+		mcpClient = mcp.NewClaudeClient()
+		mcpClient.SetAPIKey(config.CustomAPIKey, config.CustomAPIURL, config.CustomModelName)
+		logger.Infof("🤖 [%s] Using MiniMax (Anthropic-compatible)", config.Name)
+
 	case "qwen":
 		mcpClient = mcp.NewQwenClient()
 		apiKey := config.QwenKey
@@ -2734,6 +2740,7 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 			quantity, price, fee, 0, // realizedPnL will be calculated
 			time.Now().UTC().UnixMilli(), orderID,
 			mfe, mae,
+			"", "", // entry/exit indicators not available in auto_trader path
 		); err != nil {
 			logger.Infof("  ⚠️ Failed to process close position: %v", err)
 		} else {

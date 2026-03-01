@@ -71,6 +71,14 @@ func configureMCPClient(cfg BacktestConfig, base mcp.AIClient) (mcp.AIClient, er
 		oaiC := mcp.NewOpenAIClientWithOptions()
 		oaiC.(*mcp.OpenAIClient).SetAPIKey(cfg.AICfg.APIKey, cfg.AICfg.BaseURL, cfg.AICfg.Model)
 		return oaiC, nil
+	case "minimax":
+		// MiniMax Coding Plan 走 Anthropic Messages 协议，复用 Claude Client
+		if cfg.AICfg.APIKey == "" {
+			return nil, fmt.Errorf("minimax provider requires api key")
+		}
+		claudeC := mcp.NewClaudeClientWithOptions()
+		claudeC.(*mcp.ClaudeClient).SetAPIKey(cfg.AICfg.APIKey, cfg.AICfg.BaseURL, cfg.AICfg.Model)
+		return claudeC, nil
 	case "custom":
 		if cfg.AICfg.BaseURL == "" || cfg.AICfg.APIKey == "" || cfg.AICfg.Model == "" {
 			return nil, fmt.Errorf("custom provider requires base_url, api key and model")

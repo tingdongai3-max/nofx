@@ -20,7 +20,7 @@ const (
 	wsKeepaliveInterval      = 30 * time.Minute // Extend listenKey every 30 min (valid 60 min)
 	wsReconnectDelay         = 5 * time.Second
 	wsWriteWait              = 10 * time.Second
-	wsPongWait               = 60 * time.Second
+	wsPongWait               = 90 * time.Second // 延长 ReadDeadline 避免 i/o timeout 误判
 	wsPingPeriod             = (wsPongWait * 9) / 10
 	wsEofFallbackThreshold   = 5               // WS-API 连续 EOF 5 次后降级为 REST 轮询
 	wsRestFallbackInterval   = 10 * time.Second
@@ -143,6 +143,13 @@ func (t *FuturesTrader) stopUserDataStreamViaWS(conn *websocket.Conn) {
 	}
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	_ = conn.WriteJSON(req)
+}
+
+// keepaliveListenKeyViaREST 通过 REST PUT /fapi/v1/listenKey 续期 listenKey（ws-api 失败时的备用）
+func (t *FuturesTrader) keepaliveListenKeyViaREST(listenKey string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return t.client.NewKeepaliveUserStreamService().ListenKey(listenKey).Do(ctx)
 }
 
 // keepaliveListenKeyViaWS 通过连接 A 的 userDataStream.ping 续期 listenKey
@@ -289,12 +296,17 @@ func (t *FuturesTrader) runUserDataStream() {
 					return
 				case <-ticker.C:
 					if err := t.keepaliveListenKeyViaWS(apiConn); err != nil {
-						// 连接 A 断开或 ping 失败：必须重连 A 并重新 start 获取新 key；获取新 key 后强制断开并重建连接 B
-						logger.Warnf("[WS] userDataStream.ping failed: %v, reconnecting API line", err)
+						// ws-api 失败时尝试 REST PUT /fapi/v1/listenKey 续期
+						if restErr := t.keepaliveListenKeyViaREST(listenKey); restErr == nil {
+							logger.Infof("[WS] ListenKey keepalive OK via REST (30 min)")
+							continue
+						}
+						// 两者均失败：重连 A 并重新 start 获取新 key
+						logger.Warnf("[WS] userDataStream.ping and REST keepalive failed: %v, reconnecting API line", err)
 						apiConn.Close()
 						streamConnMu.Lock()
 						if streamConn != nil {
-							streamConn.Close() // 强制断开连接 B，重建时使用新 key
+							streamConn.Close()
 						}
 						streamConnMu.Unlock()
 						cancel()

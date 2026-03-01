@@ -60,6 +60,7 @@ const AI_PROVIDER_CONFIG: Record<string, {
   defaultModel: string
   apiUrl: string
   apiName: string
+  defaultBaseUrl?: string
 }> = {
   deepseek: {
     defaultModel: 'deepseek-chat',
@@ -95,6 +96,12 @@ const AI_PROVIDER_CONFIG: Record<string, {
     defaultModel: 'moonshot-v1-auto',
     apiUrl: 'https://platform.moonshot.ai/console/api-keys',
     apiName: 'Moonshot',
+  },
+  minimax: {
+    defaultModel: 'MiniMax-M2.5',
+    apiUrl: 'https://platform.minimax.io/',
+    apiName: 'MiniMax',
+    defaultBaseUrl: 'https://api.minimaxi.com/anthropic/v1', // 必须含 /v1，Claude 客户端会追加 /messages
   },
 }
 
@@ -1515,6 +1522,11 @@ function ModelConfigModal({
       setApiKey(selectedModel.apiKey || '')
       setBaseUrl(selectedModel.customApiUrl || '')
       setModelName(selectedModel.customModelName || '')
+    } else if (selectedModel?.provider === 'minimax') {
+      // MiniMax Coding Plan 默认 Base URL（Anthropic Messages 协议，需含 /v1）
+      const defaultUrl = AI_PROVIDER_CONFIG.minimax?.defaultBaseUrl || 'https://api.minimaxi.com/anthropic/v1'
+      setBaseUrl((prev) => (prev === '' ? defaultUrl : prev))
+      setModelName((prev) => (prev === '' ? (AI_PROVIDER_CONFIG.minimax?.defaultModel || 'MiniMax-M2.5') : prev))
     }
   }, [editingModelId, selectedModel])
 
@@ -1657,6 +1669,18 @@ function ModelConfigModal({
                 </div>
               )}
 
+              {/* MiniMax API Key Note */}
+              {selectedModel.provider === 'minimax' && (
+                <div className="p-4 rounded-xl" style={{ background: 'rgba(0, 212, 170, 0.1)', border: '1px solid rgba(0, 212, 170, 0.3)' }}>
+                  <div className="flex items-start gap-2">
+                    <span style={{ fontSize: '16px' }}>ℹ️</span>
+                    <div className="text-sm" style={{ color: '#00D4AA' }}>
+                      {t('minimaxApiNote', language)}
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* API Key */}
               <div className="space-y-2">
                 <label className="flex items-center gap-2 text-sm font-semibold" style={{ color: '#EAECEF' }}>
@@ -1688,7 +1712,7 @@ function ModelConfigModal({
                   type="url"
                   value={baseUrl}
                   onChange={(e) => setBaseUrl(e.target.value)}
-                  placeholder={t('customBaseURLPlaceholder', language)}
+                  placeholder={AI_PROVIDER_CONFIG[selectedModel.provider]?.defaultBaseUrl || t('customBaseURLPlaceholder', language)}
                   className="w-full px-4 py-3 rounded-xl"
                   style={{ background: '#0B0E11', border: '1px solid #2B3139', color: '#EAECEF' }}
                 />

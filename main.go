@@ -9,6 +9,7 @@ import (
 	"nofx/experience"
 	"nofx/logger"
 	"nofx/manager"
+	"nofx/market"
 	"nofx/mcp"
 	"nofx/store"
 	"os"
@@ -138,6 +139,9 @@ func main() {
 			logger.Fatalf("❌ Failed to start API server: %v", err)
 		}
 	}()
+
+	// 实时量化筛查引擎（WebSocket K 线流 + 内存状态机）
+	market.RunScreenerEngine()
 
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
