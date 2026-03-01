@@ -586,6 +586,57 @@ func (s *PositionStore) GetFullStats(traderID string) (*TraderStats, error) {
 	return stats, nil
 }
 
+// GetFullStatsBySource 按 source 过滤的统计（模拟盘仅统计 source='dry_run' 的已平仓订单）
+func (s *PositionStore) GetFullStatsBySource(traderID, source string) (*TraderStats, error) {
+	stats := &TraderStats{}
+	var positions []TraderPosition
+	q := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED")
+	if source != "" {
+		q = q.Where("source = ?", source)
+	}
+	err := q.Order("exit_time ASC").Find(&positions).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to query position statistics: %w", err)
+	}
+	if len(positions) == 0 {
+		return stats, nil
+	}
+	var pnls []float64
+	var totalWin, totalLoss float64
+	for _, pos := range positions {
+		stats.TotalTrades++
+		stats.TotalPnL += pos.RealizedPnL
+		stats.TotalFee += pos.Fee
+		pnls = append(pnls, pos.RealizedPnL)
+		if pos.RealizedPnL > 0 {
+			stats.WinTrades++
+			totalWin += pos.RealizedPnL
+		} else if pos.RealizedPnL < 0 {
+			stats.LossTrades++
+			totalLoss += -pos.RealizedPnL
+		}
+	}
+	if stats.TotalTrades > 0 {
+		stats.WinRate = float64(stats.WinTrades) / float64(stats.TotalTrades) * 100
+	}
+	if totalLoss > 0 {
+		stats.ProfitFactor = totalWin / totalLoss
+	}
+	if stats.WinTrades > 0 {
+		stats.AvgWin = totalWin / float64(stats.WinTrades)
+	}
+	if stats.LossTrades > 0 {
+		stats.AvgLoss = totalLoss / float64(stats.LossTrades)
+	}
+	if len(pnls) > 1 {
+		stats.SharpeRatio = calculateSharpeRatioFromPnls(pnls)
+	}
+	if len(pnls) > 0 {
+		stats.MaxDrawdownPct = calculateMaxDrawdownFromPnls(pnls)
+	}
+	return stats, nil
+}
+
 // RecentTrade recent trade record
 type RecentTrade struct {
 	Symbol       string  `json:"symbol"`
@@ -692,12 +743,62 @@ func (s *PositionStore) GetRecentTradesWithReasoning(traderID string, limit int)
 	return trades, nil
 }
 
+// GetRecentTradesWithReasoningBySource 按 source 过滤的近期平仓+开仓逻辑（模拟盘用 source=\"dry_run\"）
+func (s *PositionStore) GetRecentTradesWithReasoningBySource(traderID string, limit int, source string) ([]RecentTradeWithReasoning, error) {
+	q := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED")
+	if source != "" {
+		q = q.Where("source = ?", source)
+	}
+	var positions []TraderPosition
+	err := q.Order("exit_time DESC").Limit(limit).Find(&positions).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to query recent trades: %w", err)
+	}
+	var trades []RecentTradeWithReasoning
+	for _, pos := range positions {
+		t := RecentTradeWithReasoning{
+			RecentTrade: RecentTrade{
+				Symbol:      pos.Symbol,
+				Side:        strings.ToLower(pos.Side),
+				EntryPrice:  pos.EntryPrice,
+				ExitPrice:   pos.ExitPrice,
+				RealizedPnL: pos.RealizedPnL,
+				EntryTime:   pos.EntryTime / 1000,
+			},
+			PositionID:        pos.ID,
+			AiReasoningAtOpen: pos.AiReasoningAtOpen,
+			CloseReason:       pos.CloseReason,
+		}
+		if pos.ExitTime > 0 {
+			t.ExitTime = pos.ExitTime / 1000
+			t.HoldDuration = formatDurationMs(pos.ExitTime - pos.EntryTime)
+		}
+		if pos.EntryPrice > 0 {
+			if t.Side == "long" {
+				t.PnLPct = (pos.ExitPrice - pos.EntryPrice) / pos.EntryPrice * 100 * float64(pos.Leverage)
+			} else {
+				t.PnLPct = (pos.EntryPrice - pos.ExitPrice) / pos.EntryPrice * 100 * float64(pos.Leverage)
+			}
+		}
+		trades = append(trades, t)
+	}
+	return trades, nil
+}
+
 // GetClosedCountSince 返回自某时刻（Unix 毫秒）以来被平仓的仓位数量（用于「未决策期间空档复盘」ALERT）
 func (s *PositionStore) GetClosedCountSince(traderID string, sinceTimeMs int64) (int, error) {
+	return s.GetClosedCountSinceBySource(traderID, sinceTimeMs, "")
+}
+
+// GetClosedCountSinceBySource 按 source 过滤（模拟盘用 source=\"dry_run\"）
+func (s *PositionStore) GetClosedCountSinceBySource(traderID string, sinceTimeMs int64, source string) (int, error) {
+	q := s.db.Model(&TraderPosition{}).
+		Where("trader_id = ? AND status = ? AND exit_time > ?", traderID, "CLOSED", sinceTimeMs)
+	if source != "" {
+		q = q.Where("source = ?", source)
+	}
 	var count int64
-	err := s.db.Model(&TraderPosition{}).
-		Where("trader_id = ? AND status = ? AND exit_time > ?", traderID, "CLOSED", sinceTimeMs).
-		Count(&count).Error
+	err := q.Count(&count).Error
 	return int(count), err
 }
 

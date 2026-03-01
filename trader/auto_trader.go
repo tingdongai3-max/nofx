@@ -654,8 +654,14 @@ func (at *AutoTrader) runCycle() error {
 		logger.Info("📅 Daily P&L reset")
 	}
 
-	// 4. Collect trading context
-	ctx, err := at.buildTradingContext()
+	// 4. Collect trading context（模拟盘必须走虚拟本金与 dry_run 数据，禁止混用实盘余额）
+	var ctx *kernel.Context
+	var err error
+	if at.config.IsDryRun {
+		ctx, err = at.buildDryRunTradingContext()
+	} else {
+		ctx, err = at.buildTradingContext()
+	}
 	if err != nil {
 		record.Success = false
 		record.ErrorMessage = fmt.Sprintf("Failed to build trading context: %v", err)
@@ -832,7 +838,7 @@ func (at *AutoTrader) runCycle() error {
 	return nil
 }
 
-// buildDryRunTradingContext 模拟盘专用：资金用 VirtualEquity，持仓从 DB 取并用当前行情算浮盈
+// buildDryRunTradingContext 模拟盘专用：资金用 VirtualEquity，持仓从 DB 取并用当前行情算浮盈（绝不调用交易所 GetBalance）
 func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 	totalEquity := at.config.VirtualEquity
 	if totalEquity <= 0 {
@@ -846,6 +852,7 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 		}
 		at.config.VirtualEquity = totalEquity
 	}
+	logger.Infof("[DryRun] Using virtual equity: %.2f", totalEquity)
 
 	openPositions, err := at.store.Position().GetOpenPositions(at.id)
 	if err != nil {
@@ -955,7 +962,7 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 	}
 
 	if at.store != nil {
-		tradesWithReasoning, _ := at.store.Position().GetRecentTradesWithReasoning(at.id, 10)
+		tradesWithReasoning, _ := at.store.Position().GetRecentTradesWithReasoningBySource(at.id, 10, "dry_run")
 		for _, tr := range tradesWithReasoning {
 			trade := tr.RecentTrade
 			entryTimeStr := ""
@@ -985,20 +992,23 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 				CloseReason:  tr.CloseReason,
 			})
 		}
-		// 未决策期间空档复盘：自上次 AI 决策以来被系统平仓的数量
+		// 未决策期间空档复盘：自上次 AI 决策以来被系统平仓的数量（仅 dry_run）
 		if lastMs, ok := at.store.Decision().GetLatestDecisionTimeMs(at.id); ok {
-			ctx.ClosedCountSinceLastDecision, _ = at.store.Position().GetClosedCountSince(at.id, lastMs)
+			ctx.ClosedCountSinceLastDecision, _ = at.store.Position().GetClosedCountSinceBySource(at.id, lastMs, "dry_run")
 		}
-		// 当前持仓的开仓逻辑（你正在为什么而坚持）
-		openPositions, _ := at.store.Position().GetOpenPositions(at.id)
+		// 当前持仓的开仓逻辑（仅 dry_run 仓位，防与实盘混线）
 		for _, op := range openPositions {
+			if op.Source != "dry_run" {
+				continue
+			}
 			ctx.OpenPositionReasoning = append(ctx.OpenPositionReasoning, kernel.OpenPositionReasoning{
 				Symbol:    op.Symbol,
 				Side:      op.Side,
 				Reasoning: op.AiReasoningAtOpen,
 			})
 		}
-		stats, _ := at.store.Position().GetFullStats(at.id)
+		// 统计信息仅来自 source='dry_run' 的已平仓订单
+		stats, _ := at.store.Position().GetFullStatsBySource(at.id, "dry_run")
 		if stats != nil {
 			ctx.TradingStats = &kernel.TradingStats{
 				TotalTrades: stats.TotalTrades, WinRate: stats.WinRate, ProfitFactor: stats.ProfitFactor,
@@ -1009,14 +1019,9 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 	return ctx, nil
 }
 
-// buildTradingContext builds trading context
+// buildTradingContext builds trading context（仅实盘：从交易所拉取余额与持仓，模拟盘勿调用）
 func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
-	// 模拟盘：资金与持仓均来自 VirtualEquity + 本地 DB，不查交易所
-	if at.config.IsDryRun {
-		return at.buildDryRunTradingContext()
-	}
-
-	// 1. Get account information
+	// 1. Get account information (exchange API)
 	balance, err := at.trader.GetBalance()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get account balance: %w", err)
