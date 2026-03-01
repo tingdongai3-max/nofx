@@ -1249,6 +1249,27 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	sb.WriteString("  - **逻辑错误 (Logic error)**: The opening logic had blind spots (e.g. did not notice BTC had broken support, chased at resistance, ignored divergence). Mark as **「认知失效」** and in subsequent decisions **force avoidance** of that pattern.\n")
 	sb.WriteString("- Do **not** conflate the two: probability loss is acceptable; logic error requires correction.\n\n")
 
+	// 7a2. 存在未平仓位时：强制「三要素」对照分析（开仓预期 vs 当前现实 vs 坚持/纠偏）
+	sb.WriteString("## Mandatory Three-Element Check (When You Have Open Positions)\n\n")
+	sb.WriteString("If **## Current Open Positions — Your Reasoning at Open** is present, you **MUST** include the following in your chain of thought for each open position (or state \"no open positions\"):\n\n")
+	sb.WriteString("- **当初预期 (Expectation)**: What move did you expect at open? (Quote or paraphrase from the opening reasoning above.)\n")
+	sb.WriteString("- **当前现实 (Reality)**: Does current price, volume, and market environment (e.g. BTC trend) still support that expectation?\n")
+	sb.WriteString("- **逻辑修正 (Pivot or Persevere)**: If reality contradicts expectation, is it **normal probability drawdown** (hold) or **logic invalidated** (close or reduce)?\n\n")
+
+	// 7a3. 平仓幻觉拦截：输出 close 时必须明确「逻辑失效」而非「情绪波动」
+	if enableAIClose {
+		sb.WriteString("## Close Decision — No Hallucination Rule\n\n")
+		sb.WriteString("When you output **close_long** or **close_short**, you **MUST** state in your <reasoning> in one sentence:\n")
+		sb.WriteString("**\"I decide to close because [specific condition from the original opening logic] has been invalidated, not due to fear of short-term price fluctuation.\"**\n")
+		sb.WriteString("If you cannot point to a concrete condition from the opening thesis that is no longer true, do not close; use hold/wait instead.\n\n")
+	}
+
+	// 7a4. 系统平仓后的认知同步：若 Recent AI Reasoning History 中有「系统平仓」记录，必须在 CoT 中回应
+	sb.WriteString("## System-Closed Positions — Mandatory Acknowledgment\n\n")
+	sb.WriteString("If **## Recent AI Reasoning History** shows any line with **系统平仓触发点** (e.g. StopLoss, TakeProfit, drawdown protection), you **MUST** write in your current chain of thought, for each such position:\n")
+	sb.WriteString("**\"My [SYMBOL] [LONG/SHORT] position was closed by system risk control. I [agree / do not agree] with this action, because ...\"**\n")
+	sb.WriteString("This ensures cognitive sync after automatic exits and avoids ignoring system protector outcomes.\n\n")
+
 	// 7b. 错误案例库：Negative Examples（从 config/error_patterns 加载，可人工维护）
 	if patterns := loadErrorPatterns(); len(patterns) > 0 {
 		sb.WriteString("## Negative Examples (Error Patterns to Avoid)\n\n")
@@ -1479,6 +1500,20 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 		ctx.Account.MarginUsedPct,
 		ctx.Account.PositionCount))
 
+	// 开仓逻辑优先：紧接 Account 之后、Candidate Coins 之前，强制与当前市场事实对标
+	if len(ctx.OpenPositionReasoning) > 0 {
+		sb.WriteString("**CRITICAL: You MUST evaluate if the initial THESIS for each open position still holds true under current market data.**\n\n")
+		sb.WriteString("## Current Open Positions — Your Reasoning at Open\n\n")
+		for _, o := range ctx.OpenPositionReasoning {
+			reasoning := o.Reasoning
+			if reasoning == "" {
+				reasoning = "(no reasoning recorded)"
+			}
+			sb.WriteString(fmt.Sprintf("- %s %s: 开仓时逻辑: %q\n", o.Symbol, o.Side, truncateReasoning(reasoning, 300)))
+		}
+		sb.WriteString("\n")
+	}
+
 	// Recently completed orders (placed before positions to ensure visibility)
 	if len(ctx.RecentOrders) > 0 {
 		sb.WriteString("## Recent Completed Trades\n")
@@ -1512,19 +1547,6 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 				sb.WriteString(fmt.Sprintf("[%s] 决策: %s %s | 开仓原始逻辑: %q | 结果: %s\n",
 					r.EntryTimeStr, r.Side, r.Symbol, reasoningTrunc, r.ResultStr))
 			}
-		}
-		sb.WriteString("\n")
-	}
-
-	// 当前持仓的开仓逻辑（你正在为什么而坚持，防串线）
-	if len(ctx.OpenPositionReasoning) > 0 {
-		sb.WriteString("## Current Open Positions — Your Reasoning at Open\n\n")
-		for _, o := range ctx.OpenPositionReasoning {
-			reasoning := o.Reasoning
-			if reasoning == "" {
-				reasoning = "(no reasoning recorded)"
-			}
-			sb.WriteString(fmt.Sprintf("- %s %s: 开仓时逻辑: %q\n", o.Symbol, o.Side, truncateReasoning(reasoning, 300)))
 		}
 		sb.WriteString("\n")
 	}
