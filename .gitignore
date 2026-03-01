@@ -124,3 +124,7 @@ dmypy.json
 # Pyre type checker
 .pyre/
 PR_DESCRIPTION.md
+
+# 回测运行时产物（缓存与锁，不提交）
+backtests/*/ai_cache.json
+backtests/*/lock
