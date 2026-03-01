@@ -7,6 +7,15 @@ import (
 	"time"
 )
 
+// timeframeMsFromString returns period in ms for a timeframe string (e.g. "5m" -> 300000). 0 if unknown.
+func timeframeMsFromString(tf string) int64 {
+	dur, err := TFDuration(tf)
+	if err != nil {
+		return 0
+	}
+	return dur.Milliseconds()
+}
+
 // IndicatorSnapshot aggregates key indicator values at a specific timestamp.
 // Price-based indicators are normalized to relative/percentage form for cross-symbol comparison.
 type IndicatorSnapshot struct {
@@ -29,7 +38,9 @@ type IndicatorSnapshot struct {
 // - BOLL: 20, 2σ
 // - Bias: (Price - MA(N)) / MA(N) * 100, where N = emaPeriod (for analysis purposes)
 // - volMultBars: 放量指标前N根K线数量，当前成交量/前N根平均成交量，默认5
-func ComputeIndicatorSnapshot(klines []Kline, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal, volMultBars int) IndicatorSnapshot {
+// nowMs: 当前时间 UTC 毫秒，用于未闭合 K 线 VolMult 智能动能继承；0 则用简单算法。
+// timeframeMs: 单根 K 线周期毫秒（如 5m=300000），与 nowMs 同时非 0 时启用智能 VolMult。
+func ComputeIndicatorSnapshot(klines []Kline, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal, volMultBars int, nowMs, timeframeMs int64) IndicatorSnapshot {
 	if len(klines) == 0 {
 		return IndicatorSnapshot{}
 	}
@@ -120,17 +131,48 @@ func ComputeIndicatorSnapshot(klines []Kline, rsiPeriod, emaPeriod, macdFast, ma
 		snap.ATRPct = atr / close * 100
 	}
 
-	// VolMult 放量: 当前K线成交量 / 前 volMultBars 根K线成交量平均值
+	// VolMult 放量：智能动能继承法，避免周期初期的“极度缩量(0.001)”误判
 	if n := volMultBars; n >= 1 && len(klines) > n {
-		sum := 0.0
-		for i := len(klines) - 1 - n; i < len(klines)-1; i++ {
-			if i >= 0 {
-				sum += klines[i].Volume
-			}
+		// 前 n 根已闭合 K 线的平均成交量（不包含最后一根“当前未闭合”）
+		start := len(klines) - 1 - n
+		if start < 0 {
+			start = 0
 		}
-		avg := sum / float64(n)
-		if avg > 0 && !math.IsNaN(avg) && !math.IsInf(avg, 0) {
-			snap.VolMult = last.Volume / avg
+		sum := 0.0
+		for i := start; i < len(klines)-1; i++ {
+			sum += klines[i].Volume
+		}
+		closedCount := len(klines) - 1 - start
+		if closedCount <= 0 {
+			closedCount = 1
+		}
+		avgVol := sum / float64(closedCount)
+		if avgVol <= 0 || math.IsNaN(avgVol) || math.IsInf(avgVol, 0) {
+			// 保持 snap.VolMult 默认 0
+		} else if nowMs > 0 && timeframeMs > 0 && len(klines) >= 2 {
+			// 智能动能继承：需要至少 2 根（上一根已闭合 + 当前未闭合）
+			lastClosedVol := klines[len(klines)-2].Volume
+			lastClosedVolMult := lastClosedVol / avgVol
+			currentRawVolMult := last.Volume / avgVol
+
+			elapsedMs := nowMs - last.OpenTime
+			isYoung := elapsedMs < (timeframeMs / 2) // 当前 K 线是否未走过半（如 5m 的前 2.5 分钟）
+
+			var finalVolMult float64
+			if currentRawVolMult > 1.0 {
+				// 场景1：当前实际量已突破均量，爆发极强，直接采信
+				finalVolMult = currentRawVolMult
+			} else if isYoung {
+				// 场景2：当前 K 线还很年轻，累计量少易造成 0.001 误判，继承上一根已确认动能
+				finalVolMult = lastClosedVolMult
+			} else {
+				// 场景3：当前 K 线已过半但量没起来，确认为缩量
+				finalVolMult = currentRawVolMult
+			}
+			snap.VolMult = finalVolMult
+		} else {
+			// 未传 nowMs/timeframeMs 时沿用原逻辑
+			snap.VolMult = last.Volume / avgVol
 		}
 	}
 
@@ -203,7 +245,7 @@ func FetchAndSnapshotIndicators(symbol string, tsMs int64, timeframe string, rsi
 		return ""
 	}
 
-	snap := ComputeIndicatorSnapshot(slice, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal, volMultBars)
+	snap := ComputeIndicatorSnapshot(slice, rsiPeriod, emaPeriod, macdFast, macdSlow, macdSignal, volMultBars, tsMs, tfMs)
 	raw, err := json.Marshal(snap)
 	if err != nil {
 		return ""

@@ -159,7 +159,9 @@ func (c *ScreenerCache) updateFromKlines(symbol, interval string, klines []Kline
 	if len(klines) == 0 {
 		return
 	}
-	snap := ComputeIndicatorSnapshot(klines, ScreenerRSIPeriod, ScreenerBiasPeriod, 12, 26, 9, ScreenerVolMultBars)
+	nowMs := time.Now().UTC().UnixMilli()
+	tfMs := timeframeMsFromString(interval)
+	snap := ComputeIndicatorSnapshot(klines, ScreenerRSIPeriod, ScreenerBiasPeriod, 12, 26, 9, ScreenerVolMultBars, nowMs, tfMs)
 	state := c.getOrCreate(symbol)
 	state.mu.Lock()
 	state.ByTF[interval] = snap
