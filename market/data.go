@@ -83,7 +83,7 @@ func getKlinesFromCoinAnk(symbol, interval, exchange string, limit int) ([]Kline
 		// 数据新鲜度校验：若最新 K 线的收盘时间距当前超过 15 分钟，说明数据流已卡死，强制 REST 拉取并覆盖缓存
 		nowMs := time.Now().UTC().UnixMilli()
 		lastClose := live[len(live)-1].CloseTime
-		const maxStalenessMs = 15 * 60 * 1000 // 15 minutes
+		const maxStalenessMs = 3 * 60 * 1000 // 3 minutes：WS 推送严重卡死则立即弃缓存走 REST
 		if nowMs-lastClose <= maxStalenessMs {
 			return live, nil
 		}

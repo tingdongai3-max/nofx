@@ -359,7 +359,9 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 // Market Data Fetching
 // ============================================================================
 
-// ensureKlineDataFreshness 熔断风控：若任一击中标的的 K 线数据最后一根收盘时间落后当前超过 10 分钟，直接报错中止，不让 AI 拿陈旧数据交易。
+// ensureKlineDataFreshness 熔断风控：若任一击中标的的 K 线最后一根收盘时间落后当前超过 2 分钟，报错中止。
+// 校验公式：CloseTime = 最后一根 OpenTime + 周期；若 now - CloseTime > 2min 则熔断。
+// 防负数：当前未闭合的 K 线时 now < CloseTime，差值为负，直接放行不熔断。
 func ensureKlineDataFreshness(ctx *Context, engine *StrategyEngine) error {
 	if ctx == nil || engine == nil || engine.config == nil {
 		return nil
@@ -372,7 +374,7 @@ func ensureKlineDataFreshness(ctx *Context, engine *StrategyEngine) error {
 		primaryTF = "5m"
 	}
 	nowMs := time.Now().UTC().UnixMilli()
-	const maxStalenessMs = 10 * 60 * 1000 // 10 minutes for 5M (and other) timeframes
+	const maxStalenessMs = 2 * 60 * 1000 // 2 minutes
 
 	for symbol, data := range ctx.MarketDataMap {
 		if data == nil {
@@ -382,9 +384,13 @@ func ensureKlineDataFreshness(ctx *Context, engine *StrategyEngine) error {
 		if !ok {
 			continue
 		}
-		if nowMs-lastCloseMs > maxStalenessMs {
+		lagMs := nowMs - lastCloseMs
+		if lagMs <= 0 {
+			continue // 负数或零：当前未闭合的 K 线，数据非常新鲜，放行
+		}
+		if lagMs > maxStalenessMs {
 			logger.Infof("[ERROR] K-line data is stale, aborting trade: %s primary %s lastClose=%d now=%d lag=%d ms",
-				symbol, primaryTF, lastCloseMs, nowMs, nowMs-lastCloseMs)
+				symbol, primaryTF, lastCloseMs, nowMs, lagMs)
 			return fmt.Errorf("[ERROR] K-line data is stale, aborting trade")
 		}
 	}
