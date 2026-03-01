@@ -162,6 +162,17 @@ type AutoTrader struct {
 	isExecuting           atomic.Bool       // 引擎互斥锁：防止多个 AI 决策线程重叠
 }
 
+// resolveInitialBalanceForConfig 确定 PnL 分母（初始本金）：模拟盘必须用 VirtualEquity，禁止用实盘余额
+func resolveInitialBalanceForConfig(config AutoTraderConfig) float64 {
+	if config.IsDryRun {
+		if config.VirtualEquity > 0 {
+			return config.VirtualEquity
+		}
+		return 10000
+	}
+	return config.InitialBalance
+}
+
 // NewAutoTrader creates an automatic trader
 // st parameter is used to store decision records to database
 func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*AutoTrader, error) {
@@ -316,8 +327,8 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		return nil, fmt.Errorf("unsupported trading platform: %s", config.Exchange)
 	}
 
-	// Validate initial balance configuration, auto-fetch from exchange if 0
-	if config.InitialBalance <= 0 {
+	// Validate initial balance configuration (实盘：为 0 时从交易所拉取；模拟盘不拉取，使用 VirtualEquity)
+	if !config.IsDryRun && config.InitialBalance <= 0 {
 		logger.Infof("📊 [%s] Initial balance not set, attempting to fetch current balance from exchange...", config.Name)
 		account, err := trader.GetBalance()
 		if err != nil {
@@ -375,7 +386,7 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		store:                 st,
 		strategyEngine:        strategyEngine,
 		cycleNumber:           cycleNumber,
-		initialBalance:        config.InitialBalance,
+		initialBalance:        resolveInitialBalanceForConfig(config),
 		lastResetTime:         time.Now(),
 		startTime:             time.Now(),
 		callCount:             0,
@@ -915,13 +926,16 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 	if availableBalance < 0 {
 		availableBalance = 0
 	}
-	totalPnL := totalEquity - at.initialBalance
-	if at.initialBalance <= 0 {
+	// PnL 分母必须为初始虚拟本金（TotalPnL / InitialVirtualEquity），禁止用实盘余额
+	initialVirtualEquity := at.initialBalance
+	if initialVirtualEquity <= 0 {
+		initialVirtualEquity = totalEquity
 		at.initialBalance = totalEquity
 	}
+	totalPnL := totalEquity - initialVirtualEquity
 	totalPnLPct := 0.0
-	if at.initialBalance > 0 {
-		totalPnLPct = (totalPnL / at.initialBalance) * 100
+	if initialVirtualEquity > 0 {
+		totalPnLPct = (totalPnL / initialVirtualEquity) * 100
 	}
 	marginUsedPct := 0.0
 	if totalEquity > 0 {
@@ -1013,6 +1027,10 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 			ctx.TradingStats = &kernel.TradingStats{
 				TotalTrades: stats.TotalTrades, WinRate: stats.WinRate, ProfitFactor: stats.ProfitFactor,
 				SharpeRatio: stats.SharpeRatio, TotalPnL: stats.TotalPnL, AvgWin: stats.AvgWin, AvgLoss: stats.AvgLoss, MaxDrawdownPct: stats.MaxDrawdownPct,
+			}
+			// 无已平仓单时 PnL% 强制为 0，禁止用余额差值推算
+			if stats.TotalTrades == 0 {
+				ctx.Account.TotalPnLPct = 0
 			}
 		}
 	}

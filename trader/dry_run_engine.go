@@ -15,6 +15,11 @@ const (
 	dryRunFeePct      = 0.0005 // 0.05% 每边手续费（开仓+平仓各 0.05%）
 )
 
+// silentDryRunActions 静默动作：不落库、不报错，直接返回成功
+var silentDryRunActions = map[string]bool{
+	"wait": true, "hold": true, "none": true, "": true,
+}
+
 // executeDryRunOrder 模拟盘统一入口：不调用交易所，用当前价+滑点撮合，直接落库并更新虚拟资金
 // aiReasoning 为本轮 AI 思维链，用于开仓时写入 TraderPosition.ai_reasoning_at_open，供复盘与自我修正
 func (at *AutoTrader) executeDryRunOrder(decision *kernel.Decision, actionRecord *store.DecisionAction, action string, aiReasoning string) error {
@@ -28,6 +33,9 @@ func (at *AutoTrader) executeDryRunOrder(decision *kernel.Decision, actionRecord
 	case "close_short":
 		return at.executeDryRunCloseShort(decision, actionRecord)
 	default:
+		if silentDryRunActions[strings.ToLower(strings.TrimSpace(action))] {
+			return nil
+		}
 		return fmt.Errorf("dry run unsupported action: %s", action)
 	}
 }
