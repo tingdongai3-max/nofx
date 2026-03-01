@@ -3,7 +3,9 @@ package market
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"math/rand"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +23,12 @@ const (
 	binanceStreamsPerConn   = 100   // 单连接约 200–1024，取 100 稳妥
 	wsPingInterval          = 3 * time.Minute
 	wsReadDeadline          = 10 * time.Minute
+
+	okxWSURL            = "wss://ws.okx.com:8443/ws/v5/public"
+	okxArgsPerConn      = 200   // OKX 单次订阅 args 数量限制
+	okxPingInterval     = 20 * time.Second
+	okxReadDeadline     = 2 * time.Minute
+	okxRESTBaseURL      = "https://www.okx.com"
 )
 
 // klineSeriesKey 唯一标识一条 K 线流 (symbol + exchange + interval)
@@ -120,9 +128,187 @@ var (
 	klineStreams         = make(map[klineSeriesKey]*klineRing)
 	binanceMultiplexDone chan struct{}
 	binanceMultiplexOnce sync.Once
+	okxMultiplexDone     chan struct{}
+	okxMultiplexOnce     sync.Once
 )
 
-// ensureKlineStream 为 (symbol, interval, exchange) 注册 ring 并触发多路复用（仅 Binance 走 WS）
+// symbolToOkxInstId 将 BTCUSDT 转为 OKX 合约 instId：BTC-USDT-SWAP
+func symbolToOkxInstId(symbol string) string {
+	symbol = Normalize(symbol)
+	if strings.HasSuffix(symbol, "USDT") {
+		base := strings.TrimSuffix(symbol, "USDT")
+		return base + "-USDT-SWAP"
+	}
+	return symbol + "-SWAP"
+}
+
+// intervalToOkxChannel 将 5m/1h 转为 OKX channel：candle5m, candle1H
+func intervalToOkxChannel(interval string) string {
+	interval = strings.TrimSpace(strings.ToLower(interval))
+	switch interval {
+	case "1m":
+		return "candle1m"
+	case "3m":
+		return "candle3m"
+	case "5m":
+		return "candle5m"
+	case "15m":
+		return "candle15m"
+	case "30m":
+		return "candle30m"
+	case "1h":
+		return "candle1H"
+	case "2h":
+		return "candle2H"
+	case "4h":
+		return "candle4H"
+	case "6h":
+		return "candle6H"
+	case "8h":
+		return "candle8H"
+	case "12h":
+		return "candle12H"
+	case "1d":
+		return "candle1D"
+	case "3d":
+		return "candle3D"
+	case "1w":
+		return "candle1W"
+	default:
+		return "candle5m"
+	}
+}
+
+// intervalToOkxBar REST 参数 bar：1m, 5m, 1H, 1D 等
+func intervalToOkxBar(interval string) string {
+	interval = strings.TrimSpace(strings.ToLower(interval))
+	switch interval {
+	case "1h":
+		return "1H"
+	case "2h":
+		return "2H"
+	case "4h":
+		return "4H"
+	case "6h":
+		return "6H"
+	case "8h":
+		return "8H"
+	case "12h":
+		return "12H"
+	case "1d":
+		return "1D"
+	case "3d":
+		return "3D"
+	case "1w":
+		return "1W"
+	default:
+		return interval
+	}
+}
+
+// fetchOkxKlinesREST 使用 OKX 官方 REST 拉取 K 线预热（无需鉴权）
+func fetchOkxKlinesREST(symbol, interval string, limit int) ([]Kline, error) {
+	instId := symbolToOkxInstId(symbol)
+	bar := intervalToOkxBar(interval)
+	url := okxRESTBaseURL + "/api/v5/market/candles?instId=" + instId + "&bar=" + bar + "&limit=" + strconv.Itoa(limit)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var okxResp struct {
+		Code string        `json:"code"`
+		Data []interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &okxResp); err != nil {
+		return nil, err
+	}
+	if okxResp.Code != "0" || len(okxResp.Data) == 0 {
+		return nil, nil
+	}
+	// OKX 返回 [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]，按时间升序；我们需倒序为 oldest-first
+	klines := make([]Kline, 0, len(okxResp.Data))
+	for i := len(okxResp.Data) - 1; i >= 0; i-- {
+		arr, _ := okxResp.Data[i].([]interface{})
+		if len(arr) < 6 {
+			continue
+		}
+		tsMs, _ := strconv.ParseInt(fmtStr(arr[0]), 10, 64)
+		o, _ := strconv.ParseFloat(fmtStr(arr[1]), 64)
+		h, _ := strconv.ParseFloat(fmtStr(arr[2]), 64)
+		l, _ := strconv.ParseFloat(fmtStr(arr[3]), 64)
+		c, _ := strconv.ParseFloat(fmtStr(arr[4]), 64)
+		vol, _ := strconv.ParseFloat(fmtStr(arr[5]), 64)
+		barMs := intervalToBarMs(interval)
+		klines = append(klines, Kline{
+			OpenTime:  tsMs,
+			CloseTime: tsMs + barMs - 1,
+			Open:      o,
+			High:      h,
+			Low:       l,
+			Close:     c,
+			Volume:    vol,
+		})
+	}
+	return klines, nil
+}
+
+func fmtStr(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	if f, ok := v.(float64); ok {
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	return ""
+}
+
+func intervalToBarMs(interval string) int64 {
+	interval = strings.TrimSpace(strings.ToLower(interval))
+	switch interval {
+	case "1m":
+		return 60 * 1000
+	case "3m":
+		return 3 * 60 * 1000
+	case "5m":
+		return 5 * 60 * 1000
+	case "15m":
+		return 15 * 60 * 1000
+	case "30m":
+		return 30 * 60 * 1000
+	case "1h":
+		return 3600 * 1000
+	case "2h":
+		return 2 * 3600 * 1000
+	case "4h":
+		return 4 * 3600 * 1000
+	case "6h":
+		return 6 * 3600 * 1000
+	case "8h":
+		return 8 * 3600 * 1000
+	case "12h":
+		return 12 * 3600 * 1000
+	case "1d":
+		return 24 * 3600 * 1000
+	case "3d":
+		return 3 * 24 * 3600 * 1000
+	case "1w":
+		return 7 * 24 * 3600 * 1000
+	default:
+		return 5 * 60 * 1000
+	}
+}
+
+// ensureKlineStream 为 (symbol, interval, exchange) 注册 ring 并触发多路复用（Binance/OKX 直连 WS，其余 CoinAnk REST）
 func ensureKlineStream(symbol, interval, exchange string) {
 	symbol = Normalize(symbol)
 	exchangeEnum := mapExchangeToEnum(exchange)
@@ -161,6 +347,15 @@ func ensureKlineStream(symbol, interval, exchange string) {
 		} else if err != nil {
 			logger.Warnf("⚠️ Binance K-line pre-warm failed (%s %s): %v", symbol, interval, err)
 		}
+	} else if exchangeEnum == coinank_enum.Okex {
+		klines, err := fetchOkxKlinesREST(symbol, interval, restPreFetchBars)
+		if err == nil && len(klines) > 0 {
+			ring.loadHistory(klines)
+			logger.Infof("✓ K-line REST pre-warm (OKX): %s %s, %d bars", symbol, interval, len(klines))
+		} else if err != nil {
+			logger.Warnf("⚠️ OKX K-line pre-warm failed (%s %s): %v", symbol, interval, err)
+		}
+		startOkxMultiplex()
 	} else {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		ts := time.Now().UTC().UnixMilli()
@@ -180,6 +375,247 @@ func ensureKlineStream(symbol, interval, exchange string) {
 
 	if exchangeEnum == coinank_enum.Binance {
 		startBinanceMultiplex()
+	}
+}
+
+// startOkxMultiplex 启动 OKX 单连接多路复用（按需只起一次）
+func startOkxMultiplex() {
+	okxMultiplexOnce.Do(func() {
+		okxMultiplexDone = make(chan struct{})
+		go runOkxMultiplex(okxMultiplexDone)
+	})
+}
+
+// runOkxMultiplex 多路复用：将所有 OKX 流按 okxArgsPerConn 个一组拆成多连接
+func runOkxMultiplex(done chan struct{}) {
+	defer close(done)
+	const (
+		initialBackoff = 1 * time.Second
+		maxBackoff     = 30 * time.Second
+	)
+	backoff := initialBackoff
+
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+
+		keys := getKeysForExchange(coinank_enum.Okex)
+		if len(keys) == 0 {
+			return
+		}
+
+		var args []okxArg
+		for _, k := range keys {
+			args = append(args, okxArg{
+				Channel: intervalToOkxChannel(string(k.Interval)),
+				InstID:  symbolToOkxInstId(k.Symbol),
+			})
+		}
+
+		chunks := chunkOkxArgs(args, okxArgsPerConn)
+		var wg sync.WaitGroup
+		for i, chunk := range chunks {
+			wg.Add(1)
+			go func(chunkIndex int, a []okxArg) {
+				defer wg.Done()
+				runOkxConn(chunkIndex, a, done)
+			}(i+1, chunk)
+		}
+		wg.Wait()
+
+		logger.Infof("✓ OKX kline multiplex reconnecting, REST sync for %d streams", len(keys))
+		for _, key := range keys {
+			klineStreamsMu.Lock()
+			ring := klineStreams[key]
+			klineStreamsMu.Unlock()
+			if ring == nil {
+				continue
+			}
+			klines, err := fetchOkxKlinesREST(key.Symbol, string(key.Interval), 200)
+			if err == nil && len(klines) > 0 {
+				ring.loadHistory(klines)
+			}
+		}
+
+		time.Sleep(backoff)
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+func chunkOkxArgs(args []okxArg, size int) [][]okxArg {
+	var out [][]okxArg
+	for i := 0; i < len(args); i += size {
+		end := i + size
+		if end > len(args) {
+			end = len(args)
+		}
+		out = append(out, args[i:end])
+	}
+	return out
+}
+
+// okxArg OKX 订阅参数
+type okxArg struct {
+	Channel string `json:"channel"`
+	InstID  string `json:"instId"`
+}
+
+// runOkxConn 单连接：发送 subscribe，保活 ping 20s，解析 data 写 ring
+func runOkxConn(chunkIndex int, args []okxArg, done chan struct{}) {
+	if len(args) == 0 {
+		return
+	}
+
+	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
+	conn, _, err := dialer.Dial(okxWSURL, nil)
+	if err != nil {
+		logger.Warnf("⚠️ OKX kline WS dial failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	subscribePayload := map[string]interface{}{
+		"op":   "subscribe",
+		"args": args,
+	}
+	subBody, _ := json.Marshal(subscribePayload)
+	if err := conn.WriteMessage(websocket.TextMessage, subBody); err != nil {
+		logger.Warnf("⚠️ OKX subscribe write failed: %v", err)
+		return
+	}
+
+	conn.SetReadDeadline(time.Now().Add(okxReadDeadline))
+	logger.Infof("[WS] Connected OKX multiplex stream chunk #%d with %d streams", chunkIndex, len(args))
+
+	stopPing := make(chan struct{})
+	defer close(stopPing)
+	go func() {
+		ticker := time.NewTicker(okxPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-stopPing:
+				return
+			case <-ticker.C:
+				if err := conn.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			logger.Warnf("[WARN] OKX WS connection dropped, attempting reconnect... error: %v", err)
+			return
+		}
+
+		conn.SetReadDeadline(time.Now().Add(okxReadDeadline))
+
+		// 兼容 "pong" 文本响应
+		if len(msg) == 4 && string(msg) == "pong" {
+			continue
+		}
+
+		var okxMsg struct {
+			Arg  *struct {
+				Channel string `json:"channel"`
+				InstID  string `json:"instId"`
+			} `json:"arg"`
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(msg, &okxMsg); err != nil || okxMsg.Arg == nil {
+			continue
+		}
+
+		channel := okxMsg.Arg.Channel
+		instId := okxMsg.Arg.InstID
+		if !strings.HasPrefix(channel, "candle") {
+			continue
+		}
+		// instId: BTC-USDT-SWAP -> symbol BTCUSDT
+		symbol := strings.ReplaceAll(instId, "-USDT-SWAP", "USDT")
+		symbol = strings.ReplaceAll(symbol, "-", "")
+		symbol = strings.ToUpper(symbol)
+		// channel: candle5m -> interval 5m
+		intervalStr := strings.TrimPrefix(channel, "candle")
+		if len(intervalStr) > 0 && intervalStr[len(intervalStr)-1] == 'H' {
+			intervalStr = strings.TrimSuffix(intervalStr, "H") + "h"
+		} else if len(intervalStr) > 0 && intervalStr[len(intervalStr)-1] == 'D' {
+			intervalStr = strings.TrimSuffix(intervalStr, "D") + "d"
+		} else if len(intervalStr) > 0 && intervalStr[len(intervalStr)-1] == 'W' {
+			intervalStr = strings.TrimSuffix(intervalStr, "W") + "w"
+		}
+
+		var dataArr []interface{}
+		if err := json.Unmarshal(okxMsg.Data, &dataArr); err != nil || len(dataArr) == 0 {
+			continue
+		}
+
+		// 取最后一根（最新）[ts, o, h, l, c, vol, ...]
+		last := dataArr[len(dataArr)-1]
+		arr, _ := last.([]interface{})
+		if len(arr) < 6 {
+			continue
+		}
+		tsMs, _ := strconv.ParseInt(fmtStr(arr[0]), 10, 64)
+		o, _ := strconv.ParseFloat(fmtStr(arr[1]), 64)
+		h, _ := strconv.ParseFloat(fmtStr(arr[2]), 64)
+		l, _ := strconv.ParseFloat(fmtStr(arr[3]), 64)
+		c, _ := strconv.ParseFloat(fmtStr(arr[4]), 64)
+		vol, _ := strconv.ParseFloat(fmtStr(arr[5]), 64)
+		barMs := intervalToBarMs(intervalStr)
+		kline := Kline{
+			OpenTime:  tsMs,
+			CloseTime: tsMs + barMs - 1,
+			Open:      o,
+			High:      h,
+			Low:       l,
+			Close:     c,
+			Volume:    vol,
+		}
+
+		intervalEnum, ok := mapIntervalToEnum(intervalStr)
+		if !ok {
+			continue
+		}
+		key := klineSeriesKey{
+			Symbol:   symbol,
+			Exchange: coinank_enum.Okex,
+			Interval: intervalEnum,
+		}
+		klineStreamsMu.Lock()
+		ring := klineStreams[key]
+		klineStreamsMu.Unlock()
+		if ring != nil {
+			ring.append(kline)
+		}
+
+		if rand.Intn(1000) == 0 {
+			logger.Infof("[WS Pulse] OKX 收到实时行情: %s %s, 当前价: %s", channel, instId, fmtStr(arr[4]))
+		}
+
+		select {
+		case klineUpdateCh <- KlineUpdateEvent{Symbol: symbol, Exchange: "okx", Interval: intervalStr}:
+		default:
+		}
 	}
 }
 
