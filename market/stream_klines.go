@@ -2,17 +2,28 @@ package market
 
 import (
 	"context"
+	"encoding/json"
+	"math/rand"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"nofx/logger"
 	"nofx/provider/coinank"
 	"nofx/provider/coinank/coinank_api"
 	"nofx/provider/coinank/coinank_enum"
 )
 
-// klineSeriesKey identifies a unique kline stream (symbol + exchange + interval).
+const (
+	binanceFuturesStreamURL = "wss://fstream.binance.com/stream"
+	binanceStreamsPerConn   = 100   // 单连接约 200–1024，取 100 稳妥
+	wsPingInterval          = 3 * time.Minute
+	wsReadDeadline          = 10 * time.Minute
+)
+
+// klineSeriesKey 唯一标识一条 K 线流 (symbol + exchange + interval)
 type klineSeriesKey struct {
 	Symbol   string
 	Exchange coinank_enum.Exchange
@@ -21,21 +32,19 @@ type klineSeriesKey struct {
 
 // KlineUpdateEvent 表示某条 K 线序列有推送更新（数据流驱动，非轮询）
 type KlineUpdateEvent struct {
-	Symbol   string // 如 POWERUSDT
-	Exchange string // 如 binance, okx
-	Interval string // 如 5m, 15m
+	Symbol   string
+	Exchange string
+	Interval string
 }
 
 var (
-	klineUpdateCh = make(chan KlineUpdateEvent, 256) // 数据流推送时写入，供 ATR 机器狗等消费
+	klineUpdateCh = make(chan KlineUpdateEvent, 256)
 )
 
-// SubscribeKlineUpdates 返回 K 线更新流；交易所推送新数据时写入，避免轮询与封禁
 func SubscribeKlineUpdates() <-chan KlineUpdateEvent {
 	return klineUpdateCh
 }
 
-// klineRing is a simple in-memory ring buffer for Kline data.
 type klineRing struct {
 	mu   sync.RWMutex
 	data []Kline
@@ -56,12 +65,10 @@ func (r *klineRing) append(k Kline) {
 	n := len(r.data)
 	if n > 0 {
 		last := &r.data[n-1]
-		// Same bar (same open time) → update in-place to reflect live tick.
 		if last.OpenTime == k.OpenTime {
 			*last = k
 			return
 		}
-		// Out-of-order old data: ignore.
 		if k.OpenTime < last.OpenTime {
 			return
 		}
@@ -71,14 +78,10 @@ func (r *klineRing) append(k Kline) {
 		r.data = append(r.data, k)
 		return
 	}
-
-	// When full, drop oldest (simple sliding window).
 	copy(r.data, r.data[1:])
 	r.data[r.cap-1] = k
 }
 
-// loadHistory bulk-loads historical K-lines (e.g. from REST) as the ring base.
-// klines should be oldest-first; only the last r.cap bars are kept.
 func (r *klineRing) loadHistory(klines []Kline) {
 	if len(klines) == 0 {
 		return
@@ -115,14 +118,12 @@ func (r *klineRing) snapshot(count int) []Kline {
 var (
 	klineStreamsMu       sync.Mutex
 	klineStreams         = make(map[klineSeriesKey]*klineRing)
-	klineMultiplexActive = make(map[coinank_enum.Exchange]chan struct{}) // exchange -> done chan
-	klineMultiplexMu     sync.Mutex
+	binanceMultiplexDone chan struct{}
+	binanceMultiplexOnce sync.Once
 )
 
-// ensureKlineStream ensures there is a running WebSocket stream for the given symbol/exchange/interval.
-// 多路复用：同一 exchange 共用一个 WS 连接，批量订阅，避免 120 个独立连接。
+// ensureKlineStream 为 (symbol, interval, exchange) 注册 ring 并触发多路复用（仅 Binance 走 WS）
 func ensureKlineStream(symbol, interval, exchange string) {
-	// Normalize inputs for key.
 	symbol = Normalize(symbol)
 	exchangeEnum := mapExchangeToEnum(exchange)
 	intervalEnum, ok := mapIntervalToEnum(interval)
@@ -130,7 +131,6 @@ func ensureKlineStream(symbol, interval, exchange string) {
 		return
 	}
 
-	// xyz assets are handled via Hyperliquid HTTP API and are not part of CoinAnk kline WS.
 	if IsXyzDexAsset(symbol) {
 		return
 	}
@@ -150,140 +150,88 @@ func ensureKlineStream(symbol, interval, exchange string) {
 	klineStreams[key] = ring
 	klineStreamsMu.Unlock()
 
-	// REST 预热：在启动 WS 前先拉取 200 根历史 K 线塞入 ring，避免冷启动只有 1 根
+	// REST 预热
 	const restPreFetchBars = 200
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	ts := time.Now().UnixMilli()
-	coinankKlines, err := coinank_api.Kline(ctx, key.Symbol, key.Exchange, ts, coinank_enum.To, restPreFetchBars, key.Interval)
-	cancel()
-	if err == nil && len(coinankKlines) > 0 {
-		klines := make([]Kline, len(coinankKlines))
-		for i, k := range coinankKlines {
-			klines[i] = coinankResultToKline(k)
+	if exchangeEnum == coinank_enum.Binance {
+		api := GetAPIClient()
+		klines, err := api.GetKlines(symbol, interval, restPreFetchBars)
+		if err == nil && len(klines) > 0 {
+			ring.loadHistory(klines)
+			logger.Infof("✓ K-line REST pre-warm (Binance): %s %s, %d bars", symbol, interval, len(klines))
+		} else if err != nil {
+			logger.Warnf("⚠️ Binance K-line pre-warm failed (%s %s): %v", symbol, interval, err)
 		}
-		ring.loadHistory(klines)
-		logger.Infof("✓ K-line REST pre-warm: %s %s %s, %d bars", key.Symbol, key.Exchange, key.Interval, len(klines))
-	} else if err != nil {
-		logger.Warnf("⚠️ K-line REST pre-warm failed (%s %s %s): %v, WS will fill from live only", key.Symbol, key.Exchange, key.Interval, err)
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ts := time.Now().UTC().UnixMilli()
+		coinankKlines, err := coinank_api.Kline(ctx, symbol, exchangeEnum, ts, coinank_enum.To, restPreFetchBars, intervalEnum)
+		cancel()
+		if err == nil && len(coinankKlines) > 0 {
+			klines := make([]Kline, len(coinankKlines))
+			for i, k := range coinankKlines {
+				klines[i] = coinankResultToKline(k)
+			}
+			ring.loadHistory(klines)
+			logger.Infof("✓ K-line REST pre-warm: %s %s %s, %d bars", symbol, exchange, interval, len(klines))
+		} else if err != nil {
+			logger.Warnf("⚠️ K-line REST pre-warm failed (%s %s %s): %v", symbol, exchange, interval, err)
+		}
 	}
 
-	startKlineMultiplex(key.Exchange, exchange)
-}
-
-// startKlineMultiplex 确保该 exchange 的多路复用连接已启动（单连接批量订阅）
-func startKlineMultiplex(exchangeEnum coinank_enum.Exchange, exchangeStr string) {
-	klineMultiplexMu.Lock()
-	if _, running := klineMultiplexActive[exchangeEnum]; running {
-		klineMultiplexMu.Unlock()
-		return
+	if exchangeEnum == coinank_enum.Binance {
+		startBinanceMultiplex()
 	}
-	done := make(chan struct{})
-	klineMultiplexActive[exchangeEnum] = done
-	klineMultiplexMu.Unlock()
-	go runKlineMultiplex(exchangeEnum, exchangeStr, done)
 }
 
-// runKlineMultiplex 单连接多路复用：同一 exchange 下所有 (symbol,interval) 共用一个 WS，批量订阅
-// 断线重连时 REST 全量同步，避免 ScreenerCache/Kline 脏数据
-func runKlineMultiplex(exchangeEnum coinank_enum.Exchange, exchangeStr string, done chan struct{}) {
-	defer func() {
-		klineMultiplexMu.Lock()
-		delete(klineMultiplexActive, exchangeEnum)
-		klineMultiplexMu.Unlock()
-		close(done)
-	}()
+// startBinanceMultiplex 启动 Binance 单连接多路复用（按需只起一次）
+func startBinanceMultiplex() {
+	binanceMultiplexOnce.Do(func() {
+		binanceMultiplexDone = make(chan struct{})
+		go runBinanceMultiplex(binanceMultiplexDone)
+	})
+}
 
-	ctx := context.Background()
+// runBinanceMultiplex 多路复用：将所有 Binance 流按 100 个一组拆成多连接，每连接 URL 聚合订阅
+func runBinanceMultiplex(done chan struct{}) {
+	defer close(done)
+
 	const (
-		initialBackoff   = 1 * time.Second
-		maxBackoff       = 30 * time.Second
-		restPreFetchBars = 200
+		initialBackoff = 1 * time.Second
+		maxBackoff     = 30 * time.Second
 	)
 	backoff := initialBackoff
 
 	for {
-		keys := getKeysForExchange(exchangeEnum)
+		select {
+		case <-done:
+			return
+		default:
+		}
+
+		keys := getKeysForExchange(coinank_enum.Binance)
 		if len(keys) == 0 {
 			return
 		}
 
-		ws, err := coinank_api.WsConn(ctx, true, false)
-		if err != nil {
-			logger.Warnf("⚠️ CoinAnk kline multiplex connect failed (%s): %v, retry in %s", exchangeEnum, err, backoff)
-			time.Sleep(backoff)
-			if backoff < maxBackoff {
-				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
-			}
-			continue
-		}
-		backoff = initialBackoff
-
-		// 批量订阅（多路复用：一个连接 N 个 topic）
-		batch := make([]struct {
-			Symbol   string
-			Exchange coinank_enum.Exchange
-			Interval coinank_enum.Interval
-		}, 0, len(keys))
+		// 每 binanceStreamsPerConn 个流一个连接
+		streamNames := make([]string, 0, len(keys))
 		for _, k := range keys {
-			batch = append(batch, struct {
-				Symbol   string
-				Exchange coinank_enum.Exchange
-				Interval coinank_enum.Interval
-			}{k.Symbol, k.Exchange, k.Interval})
+			streamNames = append(streamNames, strings.ToLower(k.Symbol)+"@kline_"+string(k.Interval))
 		}
-		if err := ws.SubscribeBatch(batch); err != nil {
-			logger.Warnf("⚠️ CoinAnk kline multiplex subscribe failed (%s): %v", exchangeEnum, err)
-			_ = ws.Close()
-			time.Sleep(backoff)
-			continue
-		}
-		logger.Infof("✓ CoinAnk kline multiplex subscribed: %s, %d streams", exchangeEnum, len(keys))
 
-		// Consume kline channel
-		for msg := range ws.KlineCh {
-			if msg == nil || !msg.Success {
-				continue
-			}
-			k := msg.Data
-			// 从 args 解析 symbol+interval（格式 kline@SYMBOL@exchange@interval）
-			parts := strings.Split(msg.Args, "@")
-			if len(parts) < 4 {
-				continue
-			}
-			sym, intervalStr := parts[1], parts[3]
-			intervalEnum, ok := mapIntervalToEnum(intervalStr)
-			if !ok {
-				continue
-			}
-			key := klineSeriesKey{Symbol: sym, Exchange: exchangeEnum, Interval: intervalEnum}
-			klineStreamsMu.Lock()
-			ring := klineStreams[key]
-			klineStreamsMu.Unlock()
-			if ring == nil {
-				continue
-			}
-			kline := Kline{
-				OpenTime:  k.StartTime,
-				Open:      k.Open,
-				High:      k.High,
-				Low:       k.Low,
-				Close:     k.Close,
-				Volume:    k.Volume,
-				CloseTime: k.EndTime,
-			}
-			ring.append(kline)
-			select {
-			case klineUpdateCh <- KlineUpdateEvent{Symbol: sym, Exchange: exchangeStr, Interval: intervalStr}:
-			default:
-			}
+		chunks := chunkStrings(streamNames, binanceStreamsPerConn)
+		var wg sync.WaitGroup
+		for i, chunk := range chunks {
+			wg.Add(1)
+			go func(chunkIndex int, streams []string) {
+				defer wg.Done()
+				runBinanceConn(chunkIndex, streams, done)
+			}(i+1, chunk)
 		}
-		_ = ws.Close()
+		wg.Wait()
 
-		// 断线重连前：REST 全量同步，避免丢包导致脏数据
-		logger.Infof("✓ CoinAnk kline multiplex reconnecting, REST sync for %d streams", len(keys))
+		// 全部断开后重连前 REST 全量同步
+		logger.Infof("✓ Binance kline multiplex reconnecting, REST sync for %d streams", len(keys))
 		for _, key := range keys {
 			klineStreamsMu.Lock()
 			ring := klineStreams[key]
@@ -291,15 +239,9 @@ func runKlineMultiplex(exchangeEnum coinank_enum.Exchange, exchangeStr string, d
 			if ring == nil {
 				continue
 			}
-			ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
-			ts := time.Now().UnixMilli()
-			coinankKlines, err := coinank_api.Kline(ctx2, key.Symbol, key.Exchange, ts, coinank_enum.To, restPreFetchBars, key.Interval)
-			cancel2()
-			if err == nil && len(coinankKlines) > 0 {
-				klines := make([]Kline, len(coinankKlines))
-				for i, k := range coinankKlines {
-					klines[i] = coinankResultToKline(k)
-				}
+			api := GetAPIClient()
+			klines, err := api.GetKlines(key.Symbol, string(key.Interval), 200)
+			if err == nil && len(klines) > 0 {
 				ring.loadHistory(klines)
 			}
 		}
@@ -310,6 +252,167 @@ func runKlineMultiplex(exchangeEnum coinank_enum.Exchange, exchangeStr string, d
 			if backoff > maxBackoff {
 				backoff = maxBackoff
 			}
+		}
+	}
+}
+
+func chunkStrings(s []string, size int) [][]string {
+	var out [][]string
+	for i := 0; i < len(s); i += size {
+		end := i + size
+		if end > len(s) {
+			end = len(s)
+		}
+		out = append(out, s[i:end])
+	}
+	return out
+}
+
+// binanceCombinedMessage 组合流单条消息：{"stream":"btcusdt@kline_5m","data":{...}}
+type binanceCombinedMessage struct {
+	Stream string          `json:"stream"`
+	Data   json.RawMessage `json:"data"`
+}
+
+// binanceKlineEvent 对应 data 里的 kline 事件，k 为 K 线内容
+type binanceKlineEvent struct {
+	EventType string         `json:"e"`
+	Symbol    string         `json:"s"`
+	Kline     binanceKlineK  `json:"k"`
+}
+
+type binanceKlineK struct {
+	OpenTime  int64  `json:"t"`
+	CloseTime int64  `json:"T"`
+	Interval  string `json:"i"`
+	Open      string `json:"o"`
+	Close     string `json:"c"`
+	High      string `json:"h"`
+	Low       string `json:"l"`
+	Volume    string `json:"v"`
+}
+
+func runBinanceConn(chunkIndex int, streamNames []string, done chan struct{}) {
+	if len(streamNames) == 0 {
+		return
+	}
+
+	streamsParam := strings.Join(streamNames, "/")
+	url := binanceFuturesStreamURL + "?streams=" + streamsParam
+
+	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
+	conn, _, err := dialer.Dial(url, nil)
+	if err != nil {
+		logger.Warnf("⚠️ Binance kline WS dial failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	conn.SetPingHandler(func(appData string) error {
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+	})
+	conn.SetPongHandler(func(appData string) error {
+		return nil
+	})
+
+	conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
+	logger.Infof("[WS] Connected Binance multiplex stream chunk #%d with %d streams", chunkIndex, len(streamNames))
+
+	// 保活：每 3 分钟发 Ping
+	stopPing := make(chan struct{})
+	defer close(stopPing)
+	go func() {
+		ticker := time.NewTicker(wsPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-stopPing:
+				return
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			logger.Warnf("[WARN] Binance WS connection dropped, attempting reconnect... error: %v", err)
+			return
+		}
+
+		conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
+
+		var wrapped binanceCombinedMessage
+		if err := json.Unmarshal(msg, &wrapped); err != nil {
+			continue
+		}
+
+		// stream 格式: btcusdt@kline_5m
+		parts := strings.SplitN(wrapped.Stream, "@", 2)
+		if len(parts) != 2 || !strings.HasPrefix(parts[1], "kline_") {
+			continue
+		}
+		symbolLower := parts[0]
+		intervalStr := strings.TrimPrefix(parts[1], "kline_")
+		symbol := strings.ToUpper(symbolLower)
+
+		var ev binanceKlineEvent
+		if err := json.Unmarshal(wrapped.Data, &ev); err != nil {
+			continue
+		}
+		k := ev.Kline
+
+		open, _ := strconv.ParseFloat(k.Open, 64)
+		high, _ := strconv.ParseFloat(k.High, 64)
+		low, _ := strconv.ParseFloat(k.Low, 64)
+		closeP, _ := strconv.ParseFloat(k.Close, 64)
+		vol, _ := strconv.ParseFloat(k.Volume, 64)
+
+		intervalEnum, ok := mapIntervalToEnum(intervalStr)
+		if !ok {
+			continue
+		}
+		key := klineSeriesKey{
+			Symbol:   symbol,
+			Exchange: coinank_enum.Binance,
+			Interval: intervalEnum,
+		}
+		klineStreamsMu.Lock()
+		ring := klineStreams[key]
+		klineStreamsMu.Unlock()
+		if ring == nil {
+			continue
+		}
+
+		ring.append(Kline{
+			OpenTime:  k.OpenTime,
+			CloseTime: k.CloseTime,
+			Open:      open,
+			High:      high,
+			Low:       low,
+			Close:     closeP,
+			Volume:    vol,
+		})
+
+		// 极低频采样日志：确认数据流脉搏，避免刷屏
+		if rand.Intn(1000) == 0 {
+			logger.Infof("[WS Pulse] 收到实时行情: %s, 当前价: %s", wrapped.Stream, k.Close)
+		}
+
+		select {
+		case klineUpdateCh <- KlineUpdateEvent{Symbol: symbol, Exchange: "binance", Interval: intervalStr}:
+		default:
 		}
 	}
 }
@@ -326,8 +429,6 @@ func getKeysForExchange(exchangeEnum coinank_enum.Exchange) []klineSeriesKey {
 	return keys
 }
 
-// refillKlineRing overwrites the in-memory ring with the given klines (e.g. after forced REST refetch when cache was stale).
-// Call this when data freshness check fails so that subsequent readers get fresh data.
 func refillKlineRing(symbol, interval, exchange string, klines []Kline) {
 	if len(klines) == 0 {
 		return
@@ -351,8 +452,6 @@ func refillKlineRing(symbol, interval, exchange string, klines []Kline) {
 	}
 }
 
-// getRealtimeKlines returns a recent snapshot of Klines from the WebSocket buffer, if available.
-// count <= 0 means "all available".
 func getRealtimeKlines(symbol, interval, exchange string, count int) ([]Kline, bool) {
 	symbol = Normalize(symbol)
 	exchangeEnum := mapExchangeToEnum(exchange)
@@ -395,7 +494,6 @@ func coinankResultToKline(k coinank.KlineResult) Kline {
 	}
 }
 
-// mapExchangeToEnum maps a human-readable exchange string to CoinAnk enum.
 func mapExchangeToEnum(exchange string) coinank_enum.Exchange {
 	switch strings.ToLower(strings.TrimSpace(exchange)) {
 	case "binance":
@@ -417,9 +515,10 @@ func mapExchangeToEnum(exchange string) coinank_enum.Exchange {
 	}
 }
 
-// mapIntervalToEnum maps timeframe string to CoinAnk interval enum.
+// mapIntervalToEnum 支持币安周期字符串 (1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w)
 func mapIntervalToEnum(interval string) (coinank_enum.Interval, bool) {
-	switch strings.TrimSpace(interval) {
+	interval = strings.TrimSpace(strings.ToLower(interval))
+	switch interval {
 	case "1m":
 		return coinank_enum.Minute1, true
 	case "3m":
