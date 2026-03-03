@@ -13,6 +13,8 @@ const INDICATORS = [
   { value: 'boll_pct', label: 'Boll%' },
   { value: 'atr_pct', label: 'ATR%' },
   { value: 'macd', label: 'MACD' },
+  // 潜伏吸筹强度：基于 OBV 与价格波动的比值，适合识别「价格横盘但资金持续流入」的老鼠仓形态
+  { value: 'obv_accumulation', label: '潜伏吸筹强度 (Accumulation Score)' },
 ]
 const OPERATORS = [
   { value: '>', label: '>' },
@@ -27,9 +29,9 @@ const REFRESH_INTERVAL_MS = 3000
 
 const defaultCondition: ScreenerFilterCondition = {
   timeframe: '5m',
-  indicator: 'adx',
+  indicator: 'obv_accumulation',
   operator: '>',
-  value: 25,
+  value: 5,
 }
 
 export function QuantDashboardPage() {

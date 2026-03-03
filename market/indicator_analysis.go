@@ -34,6 +34,8 @@ type IndicatorSnapshot struct {
 	ShortLiq float64 `json:"short_liq_usd"`
 	// VolumePOC：简化筹码分布的成交量密集价位（POC），基于当前 K 线窗口计算。
 	VolumePOC float64 `json:"volume_poc"`
+	// OBV：On-Balance Volume 指标，基于价格涨跌方向累加成交量，用于捕捉量价背离。
+	OBV float64 `json:"obv"`
 }
 
 // ComputeIndicatorSnapshot computes a snapshot of indicators on the last kline of the slice.
@@ -175,6 +177,31 @@ func ComputeIndicatorSnapshot(klines []Kline, rsiPeriod, emaPeriod, macdFast, ma
 	// VolumePOC：基于当前 K 线窗口的简化筹码分布 POC（成交量最密集价位）
 	if poc := CalculatePOC(klines, 50); poc > 0 && !math.IsNaN(poc) && !math.IsInf(poc, 0) {
 		snap.VolumePOC = poc
+	}
+
+	// OBV：On-Balance Volume（量价累积指标）
+	// 定义：
+	//  若 Close_t > Close_{t-1}，OBV_t = OBV_{t-1} + Volume_t
+	//  若 Close_t < Close_{t-1}，OBV_t = OBV_{t-1} - Volume_t
+	//  若 Close_t = Close_{t-1}，OBV_t = OBV_{t-1}
+	if len(klines) >= 2 {
+		obv := 0.0
+		prevClose := klines[0].Close
+		for i := 1; i < len(klines); i++ {
+			k := klines[i]
+			switch {
+			case k.Close > prevClose:
+				obv += k.Volume
+			case k.Close < prevClose:
+				obv -= k.Volume
+			default:
+				// equal: no change
+			}
+			prevClose = k.Close
+		}
+		if !math.IsNaN(obv) && !math.IsInf(obv, 0) {
+			snap.OBV = obv
+		}
 	}
 
 	return snap

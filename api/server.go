@@ -3485,6 +3485,7 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 		"long_liq_usd",
 		"short_liq_usd",
 		"liq_long_short_ratio",
+		"obv",
 	}
 	newBuckets := func() map[string]*indicatorBucket {
 		m := make(map[string]*indicatorBucket)
@@ -3560,6 +3561,7 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 				addSampleAllSides("adx", snap.ADX, isWin, true, side)
 				addSampleAllSides("bias", snap.Bias, isWin, true, side)
 				addSampleAllSides("vol_mult", snap.VolMult, isWin, true, side)
+				addSampleAllSides("obv", snap.OBV, isWin, true, side)
 				if snap.VolumePOC > 0 && snap.Close > 0 {
 					dev := (snap.Close - snap.VolumePOC) / snap.VolumePOC * 100
 					addSampleAllSides("poc_deviation_pct", dev, isWin, true, side)
@@ -3587,6 +3589,7 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 				addSampleAllSides("adx", snap.ADX, isWin, false, side)
 				addSampleAllSides("bias", snap.Bias, isWin, false, side)
 				addSampleAllSides("vol_mult", snap.VolMult, isWin, false, side)
+				addSampleAllSides("obv", snap.OBV, isWin, false, side)
 				if snap.VolumePOC > 0 && snap.Close > 0 {
 					dev := (snap.Close - snap.VolumePOC) / snap.VolumePOC * 100
 					addSampleAllSides("poc_deviation_pct", dev, isWin, false, side)

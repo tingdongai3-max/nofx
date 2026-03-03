@@ -1888,6 +1888,72 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 		}
 	}
 
+	// OBV Trend & Divergence（仅基于主周期 K 线，给 AI 语义化量价结构）
+	{
+		tf := indicators.Klines.PrimaryTimeframe
+		if tf == "" {
+			tf = "5m"
+		}
+		if data.TimeframeData != nil {
+			if tfData, ok := data.TimeframeData[tf]; ok && len(tfData.Klines) >= 3 {
+				kl := tfData.Klines
+				n := len(kl)
+
+				// 计算 OBV 全序列
+				obvVals := make([]float64, n)
+				prevClose := kl[0].Close
+				for i := 1; i < n; i++ {
+					obvVals[i] = obvVals[i-1]
+					switch {
+					case kl[i].Close > prevClose:
+						obvVals[i] += kl[i].Volume
+					case kl[i].Close < prevClose:
+						obvVals[i] -= kl[i].Volume
+					}
+					prevClose = kl[i].Close
+				}
+
+				startIdx := n - 5
+				if startIdx < 0 {
+					startIdx = 0
+				}
+				obvStart := obvVals[startIdx]
+				obvEnd := obvVals[n-1]
+				priceStart := kl[startIdx].Close
+				priceEnd := kl[n-1].Close
+
+				// OBV 趋势：根据近 5 根的变化方向与幅度判断 Rising / Falling / Neutral
+				deltaObv := obvEnd - obvStart
+				denom := math.Abs(obvStart)
+				if denom < 1e-8 {
+					denom = 1.0
+				}
+				relChange := deltaObv / denom
+				trend := "Neutral"
+				// 对 5 根 K 线采用稍高敏感度（约 3%）以捕捉更多资金流趋势提示
+				if relChange > 0.03 {
+					trend = "Rising"
+				} else if relChange < -0.03 {
+					trend = "Falling"
+				}
+
+				// 价与 OBV 的背离检测：价格涨而 OBV 跌 / 价格跌而 OBV 涨
+				priceUp := priceEnd > priceStart*1.001
+				priceDown := priceEnd < priceStart*0.999
+				obvUp := obvEnd > obvStart*1.001
+				obvDown := obvEnd < obvStart*0.999
+				divergence := "None"
+				if priceUp && obvDown {
+					divergence = "Bearish (Price up, Volume down)"
+				} else if priceDown && obvUp {
+					divergence = "Bullish (Price down, Volume up)"
+				}
+
+				sb.WriteString(fmt.Sprintf("OBV Trend (%s): %s. Divergence: %s.\n\n", strings.ToUpper(tf), trend, divergence))
+			}
+		}
+	}
+
 	if indicators.EnableFibonacci && len(data.Fibonacci) > 0 {
 		sb.WriteString("Fibonacci levels (resistance/support from recent range): ")
 		if v, ok := data.Fibonacci["high"]; ok {
