@@ -549,6 +549,8 @@ export interface IndicatorConfig {
   /** 放量：当前成交量/前N根K线平均成交量 */
   enable_vol_mult?: boolean;
   vol_mult_bars?: number;  // 默认 5
+  /** 成交量参考基准（小时），用于 realtime_rolling_volmult 基准窗口，默认 4 小时 */
+  volume_baseline_hours?: number;
   enable_oi: boolean;
   enable_funding_rate: boolean;
   ema_periods?: number[];

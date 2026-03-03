@@ -90,7 +90,8 @@ export function IndicatorEditor({
       volume: { zh: '成交量', en: 'Volume' },
       volumeDesc: { zh: '交易量分析', en: 'Trading volume analysis' },
       volMult: { zh: '放量', en: 'Vol Mult' },
-      volMultDesc: { zh: '当前成交量/前N根K线平均（倍数）', en: 'Current volume / avg(prev N bars)' },
+      volMultDesc: { zh: '当前 5 分钟滚动成交量，相对于「最近 N 小时」平均每 5 分钟成交量的倍数', en: '5‑min rolling volume vs avg 5‑min volume over last N hours' },
+      volumeBaselineHours: { zh: '成交量参考基准（小时）', en: 'Volume Baseline (hours)' },
       oi: { zh: '持仓量', en: 'Open Interest' },
       oiDesc: { zh: '合约未平仓量', en: 'Futures open interest' },
       fundingRate: { zh: '资金费率', en: 'Funding Rate' },
@@ -820,22 +821,52 @@ export function IndicatorEditor({
                   />
                 </div>
                 <p className="text-[10px] mb-1.5" style={{ color: '#5E6673' }}>{t(desc)}</p>
-                {periodKey && config[key as keyof IndicatorConfig] && (
-                  <input
-                    type="text"
-                    value={String((config[periodKey as keyof IndicatorConfig] as number) ?? defaultPeriods)}
-                    onChange={(e) => {
-                      if (disabled) return
-                      const n = parseInt(e.target.value.trim(), 10)
-                      if (!isNaN(n) && n >= 1 && n <= 100) {
-                        onChange({ ...config, [periodKey]: n })
-                      }
-                    }}
-                    disabled={disabled}
-                    placeholder={defaultPeriods}
-                    className="w-full px-2 py-1 rounded text-[10px] text-center"
-                    style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
-                  />
+                {/* 放量参数：前 N 根 K 线 + 成交量参考基准（小时） */}
+                {key === 'enable_vol_mult' && config.enable_vol_mult && (
+                  <div className="space-y-1.5 mt-1">
+                    <div className="flex items-center gap-1">
+                      <span className="text-[10px]" style={{ color: '#848E9C' }}>
+                        {language === 'zh' ? 'N 条均值' : 'Bars'}
+                      </span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={100}
+                        value={String(config.vol_mult_bars ?? defaultPeriods)}
+                        onChange={(e) => {
+                          if (disabled) return
+                          const n = parseInt(e.target.value.trim(), 10)
+                          if (!isNaN(n) && n >= 1 && n <= 100) {
+                            onChange({ ...config, vol_mult_bars: n })
+                          }
+                        }}
+                        disabled={disabled}
+                        className="flex-1 px-2 py-1 rounded text-[10px] text-center"
+                        style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
+                      />
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <span className="text-[10px]" style={{ color: '#848E9C' }}>
+                        {t('volumeBaselineHours')}
+                      </span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={72}
+                        value={String(config.volume_baseline_hours ?? 4)}
+                        onChange={(e) => {
+                          if (disabled) return
+                          const n = parseInt(e.target.value.trim(), 10)
+                          if (!isNaN(n) && n >= 1 && n <= 72) {
+                            onChange({ ...config, volume_baseline_hours: n })
+                          }
+                        }}
+                        disabled={disabled}
+                        className="flex-1 px-2 py-1 rounded text-[10px] text-center"
+                        style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
+                      />
+                    </div>
+                  </div>
                 )}
               </div>
             ))}

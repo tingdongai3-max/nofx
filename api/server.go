@@ -3543,6 +3543,17 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 				addSampleAllSides("adx", snap.ADX, isWin, true, side)
 				addSampleAllSides("bias", snap.Bias, isWin, true, side)
 				addSampleAllSides("vol_mult", snap.VolMult, isWin, true, side)
+				if snap.VolumePOC > 0 && snap.Close > 0 {
+					dev := (snap.Close - snap.VolumePOC) / snap.VolumePOC * 100
+					addSampleAllSides("poc_deviation_pct", dev, isWin, true, side)
+				}
+				if snap.LongLiq > 0 || snap.ShortLiq > 0 {
+					addSampleAllSides("long_liq_usd", snap.LongLiq, isWin, true, side)
+					addSampleAllSides("short_liq_usd", snap.ShortLiq, isWin, true, side)
+					if snap.ShortLiq > 0 {
+						addSampleAllSides("liq_long_short_ratio", snap.LongLiq/snap.ShortLiq, isWin, true, side)
+					}
+				}
 			}
 		}
 
@@ -3558,6 +3569,17 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 				addSampleAllSides("adx", snap.ADX, isWin, false, side)
 				addSampleAllSides("bias", snap.Bias, isWin, false, side)
 				addSampleAllSides("vol_mult", snap.VolMult, isWin, false, side)
+				if snap.VolumePOC > 0 && snap.Close > 0 {
+					dev := (snap.Close - snap.VolumePOC) / snap.VolumePOC * 100
+					addSampleAllSides("poc_deviation_pct", dev, isWin, false, side)
+				}
+				if snap.LongLiq > 0 || snap.ShortLiq > 0 {
+					addSampleAllSides("long_liq_usd", snap.LongLiq, isWin, false, side)
+					addSampleAllSides("short_liq_usd", snap.ShortLiq, isWin, false, side)
+					if snap.ShortLiq > 0 {
+						addSampleAllSides("liq_long_short_ratio", snap.LongLiq/snap.ShortLiq, isWin, false, side)
+					}
+				}
 			}
 		}
 	}

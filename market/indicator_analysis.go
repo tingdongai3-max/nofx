@@ -29,6 +29,11 @@ type IndicatorSnapshot struct {
 	Bias                   float64 `json:"bias"`
 	VolMult                float64 `json:"vol_mult"`                 // 兼容旧字段：等同于 realtime_rolling_volmult
 	RealtimeRollingVolMult float64 `json:"realtime_rolling_volmult"` // 实时 5 分钟滚动放量：当前 5 分钟滚动成交量 / 近 24 小时平均每 5 分钟成交量
+	// LongLiq / ShortLiq：在指定时间窗口内的多空爆仓成交额（USD），由 CoinAnk 爆仓统计接口提供（若可用）。
+	LongLiq  float64 `json:"long_liq_usd"`
+	ShortLiq float64 `json:"short_liq_usd"`
+	// VolumePOC：简化筹码分布的成交量密集价位（POC），基于当前 K 线窗口计算。
+	VolumePOC float64 `json:"volume_poc"`
 }
 
 // ComputeIndicatorSnapshot computes a snapshot of indicators on the last kline of the slice.
@@ -165,6 +170,11 @@ func ComputeIndicatorSnapshot(klines []Kline, rsiPeriod, emaPeriod, macdFast, ma
 				}
 			}
 		}
+	}
+
+	// VolumePOC：基于当前 K 线窗口的简化筹码分布 POC（成交量最密集价位）
+	if poc := CalculatePOC(klines, 50); poc > 0 && !math.IsNaN(poc) && !math.IsInf(poc, 0) {
+		snap.VolumePOC = poc
 	}
 
 	return snap

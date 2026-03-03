@@ -1817,6 +1817,19 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 	}
 	sb.WriteString("\n\n")
 
+	// 专门为 POC 与爆仓热度写一段自然语言解释，避免 AI 误解字段含义。
+	if poc, ok := data.DynamicIndicators["volume_poc"]; ok && poc > 0 {
+		dev := data.DynamicIndicators["poc_deviation_pct"]
+		sb.WriteString(fmt.Sprintf("POC (Volume Point of Control): 主筹码密集区价格约为 %.4f，当前价格相对 POC 偏离 %.2f%%（正值=在筹码上方，负值=在筹码下方）。\n\n", poc, dev))
+	}
+	if longLiq, okL := data.DynamicIndicators["long_liq_usd"]; okL {
+		if shortLiq, okS := data.DynamicIndicators["short_liq_usd"]; okS {
+			ratio := data.DynamicIndicators["liq_long_short_ratio"]
+			sb.WriteString(fmt.Sprintf("爆仓热度：最近一段时间内，多头爆仓约 %.0f USDT，空头爆仓约 %.0f USDT，多空爆仓比(多/空)=%.2f，用于判断是否存在“杀多/杀空”型流动性收集。\n\n",
+				longLiq, shortLiq, ratio))
+		}
+	}
+
 	if indicators.EnableFibonacci && len(data.Fibonacci) > 0 {
 		sb.WriteString("Fibonacci levels (resistance/support from recent range): ")
 		if v, ok := data.Fibonacci["high"]; ok {

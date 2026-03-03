@@ -243,6 +243,22 @@ func getIndicatorValueInternal(snap IndicatorSnapshot, name string) float64 {
 			return snap.RealtimeRollingVolMult
 		}
 		return snap.VolMult
+	case "volume_poc", "poc":
+		return snap.VolumePOC
+	case "poc_deviation_pct":
+		if snap.VolumePOC > 0 && snap.Close > 0 {
+			return (snap.Close - snap.VolumePOC) / snap.VolumePOC * 100
+		}
+		return 0
+	case "long_liq_usd":
+		return snap.LongLiq
+	case "short_liq_usd":
+		return snap.ShortLiq
+	case "liq_long_short_ratio":
+		if snap.ShortLiq > 0 {
+			return snap.LongLiq / snap.ShortLiq
+		}
+		return 0
 	case "emabias":
 		return snap.EMABias
 	case "boll_pct":

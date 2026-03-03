@@ -1106,6 +1106,8 @@ export function TraderDashboardPage({
                                                 { key: 'adx', label: 'ADX (14)', unit: '' },
                                                 { key: 'bias', label: language === 'zh' ? '乖离率 (Bias)' : 'Bias', unit: '%', signed: true },
                                                 { key: 'vol_mult', label: language === 'zh' ? `放量 (前${volMultBars}根)` : `Vol Mult (${volMultBars})`, unit: 'x', volMult: true },
+                                                { key: 'poc_deviation_pct', label: language === 'zh' ? 'POC 偏离度' : 'POC Deviation', unit: '%', signed: true },
+                                                { key: 'liq_long_short_ratio', label: language === 'zh' ? '爆仓热度(多/空)' : 'Liq Heat (L/S)', unit: 'x' },
                                             ]
                                             const formatBiasSuffix = (val: number | undefined) =>
                                                 val == null || val === 0 ? '' : val < 0 ? (language === 'zh' ? ' (EMA下)' : ' (Below)') : (language === 'zh' ? ' (EMA上)' : ' (Above)')

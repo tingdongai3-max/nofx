@@ -235,6 +235,22 @@ func GetWithExchange(symbol, exchange string, opts *IndicatorParams) (*Data, err
 	currentPrice := klines3m[len(klines3m)-1].Close
 	dynamicIndicators := fillDynamicIndicators(klines3m, opts)
 
+	// 实时爆仓数据：通过 CoinAnk 爆仓统计接口获取最近 1 小时多空爆仓成交额（USD），若可用则写入 DynamicIndicators。
+	if longLiq, shortLiq := fetchSymbolLiquidation(symbol, exchange, "1h"); longLiq > 0 || shortLiq > 0 {
+		if longLiq > 0 {
+			dynamicIndicators["long_liq_usd"] = longLiq
+		}
+		if shortLiq > 0 {
+			dynamicIndicators["short_liq_usd"] = shortLiq
+		}
+		if shortLiq > 0 {
+			ratio := longLiq / shortLiq
+			if !math.IsNaN(ratio) && !math.IsInf(ratio, 0) {
+				dynamicIndicators["liq_long_short_ratio"] = ratio
+			}
+		}
+	}
+
 	// Calculate price change percentage
 	// 1-hour price change = price from 20 3-minute K-lines ago
 	priceChange1h := 0.0
@@ -864,6 +880,22 @@ func fillDynamicIndicators(klines []Kline, opts *IndicatorParams) map[string]flo
 			}
 		}
 	}
+
+	// Volume POC & POC 偏离度：用于判断价格相对筹码密集区的位置
+	if len(klines) >= 2 {
+		poc := CalculatePOC(klines, 50)
+		if poc > 0 && !math.IsNaN(poc) && !math.IsInf(poc, 0) {
+			out["volume_poc"] = poc
+			lastPrice := klines[len(klines)-1].Close
+			if lastPrice > 0 {
+				dev := (lastPrice - poc) / poc * 100
+				if !math.IsNaN(dev) && !math.IsInf(dev, 0) {
+					out["poc_deviation_pct"] = dev
+				}
+			}
+		}
+	}
+
 	return out
 }
 
