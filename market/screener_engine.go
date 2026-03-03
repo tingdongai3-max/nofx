@@ -238,7 +238,10 @@ func getIndicatorValueInternal(snap IndicatorSnapshot, name string) float64 {
 		return snap.ADX
 	case "bias", "bias_20":
 		return snap.Bias
-	case "vol_mult":
+	case "vol_mult", "realtime_rolling_volmult":
+		if snap.RealtimeRollingVolMult != 0 {
+			return snap.RealtimeRollingVolMult
+		}
 		return snap.VolMult
 	case "emabias":
 		return snap.EMABias

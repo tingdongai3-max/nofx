@@ -199,8 +199,8 @@ func (pb *PositionBuilder) handleCloseWithPosition(
 		totalPnL,
 		totalFee,
 		closeReason,
-		mfe,
-		mae,
+		position.MaxFavorableExcursion,
+		position.MaxAdverseExcursion,
 		exitIndicatorsJSON,
 	)
 }

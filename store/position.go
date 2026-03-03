@@ -404,6 +404,31 @@ func (s *PositionStore) GetOpenPositionBySymbolAndSource(traderID, symbol, side,
 	return s.getOpenPositionBySymbolImpl(traderID, symbol, side, source)
 }
 
+// GetOpenPositionsBySymbolAndExchangeType returns all OPEN positions for a given symbol and exchange_type
+// across all traders. This is used by realtime market-driven updaters (e.g. WebSocket K-line stream) to
+// update MFE/MAE whenever price ticks.
+func (s *PositionStore) GetOpenPositionsBySymbolAndExchangeType(symbol, exchangeType string) ([]*TraderPosition, error) {
+	symbol = strings.TrimSpace(symbol)
+	exchangeType = strings.TrimSpace(strings.ToLower(exchangeType))
+
+	q := s.db.Where("symbol = ? AND status = ?", symbol, "OPEN")
+	if exchangeType != "" {
+		q = q.Where("LOWER(exchange_type) = ?", exchangeType)
+	}
+
+	var positions []*TraderPosition
+	if err := q.Find(&positions).Error; err != nil {
+		return nil, fmt.Errorf("failed to query open positions by symbol/exchange: %w", err)
+	}
+
+	for _, pos := range positions {
+		if pos.EntryQuantity == 0 {
+			pos.EntryQuantity = pos.Quantity
+		}
+	}
+	return positions, nil
+}
+
 func (s *PositionStore) getOpenPositionBySymbolImpl(traderID, symbol, side, source string) (*TraderPosition, error) {
 	var pos TraderPosition
 	q := s.db.Where("trader_id = ? AND symbol = ? AND side = ? AND status = ?", traderID, symbol, side, "OPEN")
@@ -1609,6 +1634,95 @@ func (s *PositionStore) ClosePositionWithAccurateData(id int64, exitPrice float6
 		"max_favorable_excursion": mfe,
 		"max_adverse_excursion":   mae,
 		"updated_at":              time.Now().UTC().UnixMilli(),
+	}).Error
+}
+
+// UpdateMaxExcursionsFromPrice updates MFE/MAE (max_favorable_excursion / max_adverse_excursion)
+// for a single OPEN position based on the latest market price. This is designed to be called
+// from streaming price feeds (K-line WebSocket) so that the database always holds the true
+// peak floating profit and worst floating loss for each position.
+//
+// Rules (price-based, USD):
+//   CurrentDiff = CurrentPrice - EntryPrice
+//   LONG:  Profit = max(0,  CurrentDiff), Loss = min(0,  CurrentDiff)
+//   SHORT: Profit = max(0, -CurrentDiff), Loss = min(0, -CurrentDiff)
+//   MFE (MaxProfit) is always >= 0; MAE (MaxLoss) is always <= 0.
+func (s *PositionStore) UpdateMaxExcursionsFromPrice(pos *TraderPosition, currentPrice float64) error {
+	if pos == nil {
+		return nil
+	}
+	if currentPrice <= 0 || pos.EntryPrice <= 0 {
+		return nil
+	}
+
+	// Determine effective quantity for excursion calculation (prefer entry_quantity if set)
+	qty := pos.EntryQuantity
+	if qty <= 0 {
+		qty = pos.Quantity
+	}
+	if qty <= 0 {
+		return nil
+	}
+
+	diff := currentPrice - pos.EntryPrice
+	var profitPerUnit, lossPerUnit float64
+
+	side := strings.ToUpper(strings.TrimSpace(pos.Side))
+	switch side {
+	case "SHORT":
+		rev := -diff
+		if rev > 0 {
+			profitPerUnit = rev
+			lossPerUnit = 0
+		} else {
+			profitPerUnit = 0
+			lossPerUnit = rev
+		}
+	default: // LONG (or unknown treated as long)
+		if diff > 0 {
+			profitPerUnit = diff
+			lossPerUnit = 0
+		} else {
+			profitPerUnit = 0
+			lossPerUnit = diff
+		}
+	}
+
+	profitUSD := profitPerUnit * qty
+	lossUSD := lossPerUnit * qty
+
+	// Initialize from existing extremes
+	mfe := pos.MaxFavorableExcursion
+	mae := pos.MaxAdverseExcursion
+
+	// Update MFE (MaxProfit, non-negative)
+	if profitUSD > 0 && profitUSD > mfe {
+		mfe = profitUSD
+	}
+	if mfe < 0 {
+		mfe = 0
+	}
+
+	// Update MAE (MaxLoss, non-positive)
+	if lossUSD < 0 {
+		if mae == 0 || lossUSD < mae {
+			mae = lossUSD
+		}
+	}
+	if mae > 0 {
+		mae = 0
+	}
+
+	// Nothing changed
+	if mfe == pos.MaxFavorableExcursion && mae == pos.MaxAdverseExcursion {
+		return nil
+	}
+
+	nowMs := time.Now().UTC().UnixMilli()
+	return s.db.Model(&TraderPosition{}).Where("id = ?", pos.ID).Updates(map[string]interface{}{
+		"max_favorable_excursion": mfe,
+		"max_adverse_excursion":   mae,
+		"updated_at":              nowMs,
 	}).Error
 }
 

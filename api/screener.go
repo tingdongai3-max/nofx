@@ -13,7 +13,7 @@ import (
 // ScreenerFilterCondition 单条过滤条件
 type ScreenerFilterCondition struct {
 	Timeframe string  `json:"timeframe"` // 5m, 15m, 1h
-	Indicator string  `json:"indicator"` // rsi, rsi_7, adx, bias, bias_20, vol_mult, emabias, boll_pct, atr_pct, macd
+	Indicator string  `json:"indicator"` // rsi, rsi_7, adx, bias, bias_20, vol_mult, realtime_rolling_volmult, emabias, boll_pct, atr_pct, macd
 	Operator  string  `json:"operator"`  // >, <, >=, <=, ==, between
 	Value     float64 `json:"value"`
 	Value2    float64 `json:"value2,omitempty"` // 仅 between 时使用
@@ -89,7 +89,10 @@ func getIndicatorValue(snap market.IndicatorSnapshot, name string) float64 {
 		return snap.ADX
 	case "bias", "bias_20":
 		return snap.Bias
-	case "vol_mult":
+	case "vol_mult", "realtime_rolling_volmult":
+		if snap.RealtimeRollingVolMult != 0 {
+			return snap.RealtimeRollingVolMult
+		}
 		return snap.VolMult
 	case "emabias":
 		return snap.EMABias

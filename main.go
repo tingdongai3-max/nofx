@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/google/uuid"
@@ -91,18 +92,18 @@ func main() {
 	auth.SetJWTSecret(cfg.JWTSecret)
 	logger.Info("🔑 JWT secret configured")
 
-	// WebSocket market monitor is NO LONGER USED
-	// All K-line data now comes from CoinAnk API instead of Binance WebSocket cache
-	// Commented out to reduce unnecessary connections:
-	// go market.NewWSMonitor(150).Start(nil)
-	// logger.Info("📊 WebSocket market monitor started")
-	// time.Sleep(500 * time.Millisecond)
-	logger.Info("📊 Using CoinAnk API for all market data (WebSocket cache disabled)")
+	// K-line market data now uses CoinAnk + native exchange WebSocket streams with REST fallback.
+	// WebSocket K-line streams are managed internally by market/stream_klines.go (no explicit WSMonitor).
+	logger.Info("📊 Using CoinAnk K-line WebSocket + REST fallback for market data (streaming enabled)")
 
 	// Create TraderManager and BacktestManager
 	traderManager := manager.NewTraderManager()
 	mcpClient := newSharedMCPClient()
 	backtestManager := backtest.NewManager(mcpClient)
+
+	// Start streaming updater for position MFE/MAE: whenever K-line WebSocket has new prices,
+	// update max_favorable_excursion / max_adverse_excursion in the database for all open positions.
+	startPositionExcursionUpdater(st)
 	if err := backtestManager.RestoreRuns(); err != nil {
 		logger.Warnf("⚠️ Failed to restore backtest history: %v", err)
 	}
@@ -156,6 +157,51 @@ func main() {
 	// Stop all traders
 	traderManager.StopAll()
 	logger.Info("✅ System shut down safely")
+}
+
+// startPositionExcursionUpdater listens to K-line WebSocket updates and updates
+// max_favorable_excursion / max_adverse_excursion for all open positions whose
+// symbol & exchange_type match the incoming ticker stream. This removes the need
+// to rely solely on decision-time snapshots and keeps floating PnL extremes in
+// the database as close to real-time as possible.
+func startPositionExcursionUpdater(st *store.Store) {
+	if st == nil {
+		return
+	}
+
+	go func() {
+		ch := market.SubscribeKlineUpdates()
+		for ev := range ch {
+			symbol := market.Normalize(ev.Symbol)
+			exchange := strings.ToLower(strings.TrimSpace(ev.Exchange))
+			interval := strings.TrimSpace(ev.Interval)
+			if symbol == "" || interval == "" {
+				continue
+			}
+
+			// Fetch latest price from K-line cache (with REST fallback when necessary).
+			data, err := market.GetWithTimeframesWithExchange(symbol, []string{interval}, interval, nil, nil, exchange)
+			if err != nil || data == nil || data.CurrentPrice <= 0 {
+				continue
+			}
+
+			// Find all open positions for this symbol & exchange_type across traders.
+			positions, err := st.Position().GetOpenPositionsBySymbolAndExchangeType(symbol, exchange)
+			if err != nil {
+				logger.Warnf("⚠️ Failed to load open positions for %s %s: %v", symbol, exchange, err)
+				continue
+			}
+			if len(positions) == 0 {
+				continue
+			}
+
+			for _, pos := range positions {
+				if err := st.Position().UpdateMaxExcursionsFromPrice(pos, data.CurrentPrice); err != nil {
+					logger.Warnf("⚠️ Failed to update MFE/MAE for %s %s: %v", pos.Symbol, pos.Side, err)
+				}
+			}
+		}
+	}()
 }
 
 // newSharedMCPClient creates a shared MCP AI client (for backtesting)

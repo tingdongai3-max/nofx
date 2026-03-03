@@ -845,18 +845,23 @@ func fillDynamicIndicators(klines []Kline, opts *IndicatorParams) map[string]flo
 			out[fmt.Sprintf("bias_%d", p)] = calculateBIAS(klines, p)
 		}
 	}
-	// 放量 vol_mult: 当前K线成交量 / 前 N 根 K 线成交量平均值
-	if n := opts.VolMultBars; n >= 1 && len(klines) > n {
+	// 放量 vol_mult / realtime_rolling_volmult:
+	//   分子：过去 300 秒滚动成交量
+	//   分母：近 24 小时平均每 5 分钟成交量
+	// 在 DynamicIndicators 中同时暴露 "vol_mult" 与 "realtime_rolling_volmult" 两个键，值相同。
+	if opts.VolMultBars >= 1 && len(klines) >= 2 {
 		last := klines[len(klines)-1]
-		sum := 0.0
-		for i := len(klines) - 1 - n; i < len(klines)-1; i++ {
-			if i >= 0 {
-				sum += klines[i].Volume
-			}
+		tfMs := int64(0)
+		if len(klines) >= 2 {
+			tfMs = klines[len(klines)-1].CloseTime - klines[len(klines)-2].CloseTime
 		}
-		avg := sum / float64(n)
-		if avg > 0 {
-			out["vol_mult"] = last.Volume / avg
+		rolling, avgPer5Min := computeRollingVolumeFromKlines(klines, last.CloseTime, tfMs)
+		if avgPer5Min > 0 && rolling > 0 {
+			volMult := rolling / avgPer5Min
+			if !math.IsNaN(volMult) && !math.IsInf(volMult, 0) {
+				out["vol_mult"] = volMult
+				out["realtime_rolling_volmult"] = volMult
+			}
 		}
 	}
 	return out

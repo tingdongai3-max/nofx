@@ -1423,7 +1423,8 @@ func (e *StrategyEngine) writeAvailableIndicators(sb *strings.Builder) {
 		if n <= 0 {
 			n = 5
 		}
-		sb.WriteString(fmt.Sprintf("- 放量 (Vol Mult): 当前成交量/前%d根K线平均成交量\n", n))
+		sb.WriteString(fmt.Sprintf("- 放量 (realtime_rolling_volmult): 当前 5 分钟滚动成交量 / 近约 24 小时平均每 5 分钟成交量（window=%d秒）\n", 300))
+		sb.WriteString("  该指标基于连续 5 分钟滚动窗口计算成交量动能，独立于 K 线开盘/收盘，避免新 K 线启动时的缩量误判导致错误平仓。\n")
 	}
 
 	if indicators.EnableOI {

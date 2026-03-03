@@ -19,15 +19,16 @@ func timeframeMsFromString(tf string) int64 {
 // IndicatorSnapshot aggregates key indicator values at a specific timestamp.
 // Price-based indicators are normalized to relative/percentage form for cross-symbol comparison.
 type IndicatorSnapshot struct {
-	Close   float64 `json:"close"`
-	RSI     float64 `json:"rsi"`
-	MACD    float64 `json:"macd"` // histogram (oscillator, unchanged)
-	ADX     float64 `json:"adx"`
-	EMABias float64 `json:"emabias"`  // (Close - EMA) / EMA * 100
-	BollPct float64 `json:"boll_pct"` // (Close - Lower) / (Upper - Lower), 0..1 band position
-	ATRPct  float64 `json:"atr_pct"`  // ATR / Close * 100
-	Bias    float64 `json:"bias"`
-	VolMult float64 `json:"vol_mult"` // 放量：当前K线成交量 / 前N根K线成交量平均值（N 可配置，默认5）
+	Close                  float64 `json:"close"`
+	RSI                    float64 `json:"rsi"`
+	MACD                   float64 `json:"macd"`                     // histogram (oscillator, unchanged)
+	ADX                    float64 `json:"adx"`
+	EMABias                float64 `json:"emabias"`                  // (Close - EMA) / EMA * 100
+	BollPct                float64 `json:"boll_pct"`                 // (Close - Lower) / (Upper - Lower), 0..1 band position
+	ATRPct                 float64 `json:"atr_pct"`                  // ATR / Close * 100
+	Bias                   float64 `json:"bias"`
+	VolMult                float64 `json:"vol_mult"`                 // 兼容旧字段：等同于 realtime_rolling_volmult
+	RealtimeRollingVolMult float64 `json:"realtime_rolling_volmult"` // 实时 5 分钟滚动放量：当前 5 分钟滚动成交量 / 近 24 小时平均每 5 分钟成交量
 }
 
 // ComputeIndicatorSnapshot computes a snapshot of indicators on the last kline of the slice.
@@ -131,48 +132,38 @@ func ComputeIndicatorSnapshot(klines []Kline, rsiPeriod, emaPeriod, macdFast, ma
 		snap.ATRPct = atr / close * 100
 	}
 
-	// VolMult 放量：智能动能继承法，避免周期初期的“极度缩量(0.001)”误判
-	if n := volMultBars; n >= 1 && len(klines) > n {
-		// 前 n 根已闭合 K 线的平均成交量（不包含最后一根“当前未闭合”）
-		start := len(klines) - 1 - n
-		if start < 0 {
-			start = 0
-		}
-		sum := 0.0
-		for i := start; i < len(klines)-1; i++ {
-			sum += klines[i].Volume
-		}
-		closedCount := len(klines) - 1 - start
-		if closedCount <= 0 {
-			closedCount = 1
-		}
-		avgVol := sum / float64(closedCount)
-		if avgVol <= 0 || math.IsNaN(avgVol) || math.IsInf(avgVol, 0) {
-			// 保持 snap.VolMult 默认 0
-		} else if nowMs > 0 && timeframeMs > 0 && len(klines) >= 2 {
-			// 智能动能继承：需要至少 2 根（上一根已闭合 + 当前未闭合）
-			lastClosedVol := klines[len(klines)-2].Volume
-			lastClosedVolMult := lastClosedVol / avgVol
-			currentRawVolMult := last.Volume / avgVol
-
-			elapsedMs := nowMs - last.OpenTime
-			isYoung := elapsedMs < (timeframeMs / 2) // 当前 K 线是否未走过半（如 5m 的前 2.5 分钟）
-
-			var finalVolMult float64
-			if currentRawVolMult > 1.0 {
-				// 场景1：当前实际量已突破均量，爆发极强，直接采信
-				finalVolMult = currentRawVolMult
-			} else if isYoung {
-				// 场景2：当前 K 线还很年轻，累计量少易造成 0.001 误判，继承上一根已确认动能
-				finalVolMult = lastClosedVolMult
-			} else {
-				// 场景3：当前 K 线已过半但量没起来，确认为缩量
-				finalVolMult = currentRawVolMult
+	// VolMult (realtime_rolling_volmult) 放量：基于连续 5 分钟滚动窗口的成交量动能，
+	// 分子：过去 300 秒滚动成交量（RollingVolume）
+	// 分母：近 24 小时（或可用历史）平均每 5 分钟成交量（AverageVolumePer5Min）
+	if len(klines) >= 2 {
+		rolling, avgPer5Min := computeRollingVolumeFromKlines(klines, nowMs, timeframeMs)
+		if avgPer5Min > 0 && rolling > 0 {
+			volMult := rolling / avgPer5Min
+			if !math.IsNaN(volMult) && !math.IsInf(volMult, 0) {
+				snap.RealtimeRollingVolMult = volMult
+				snap.VolMult = volMult
 			}
-			snap.VolMult = finalVolMult
 		} else {
-			// 未传 nowMs/timeframeMs 时沿用原逻辑
-			snap.VolMult = last.Volume / avgVol
+			// Fail-safe：若 WS / 时间戳异常导致 rolling 计算失败，则退化为旧的 N-bar 平均算法。
+			if n := volMultBars; n >= 1 && len(klines) > n {
+				start := len(klines) - 1 - n
+				if start < 0 {
+					start = 0
+				}
+				sum := 0.0
+				for i := start; i < len(klines)-1; i++ {
+					sum += klines[i].Volume
+				}
+				closedCount := len(klines) - 1 - start
+				if closedCount <= 0 {
+					closedCount = 1
+				}
+				avgVol := sum / float64(closedCount)
+				if avgVol > 0 && !math.IsNaN(avgVol) && !math.IsInf(avgVol, 0) {
+					snap.RealtimeRollingVolMult = last.Volume / avgVol
+					snap.VolMult = snap.RealtimeRollingVolMult
+				}
+			}
 		}
 	}
 
