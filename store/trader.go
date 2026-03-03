@@ -153,6 +153,13 @@ func (s *TraderStore) UpdateVirtualEquity(userID, id string, virtualEquity float
 		Update("virtual_equity", virtualEquity).Error
 }
 
+// UpdateStrategyID 仅更新某个 Trader 的 StrategyID 字段，用于在后端自动修复/绑定默认策略时持久化关联关系
+func (s *TraderStore) UpdateStrategyID(userID, id, strategyID string) error {
+	return s.db.Model(&Trader{}).
+		Where("id = ? AND user_id = ?", id, userID).
+		Update("strategy_id", strategyID).Error
+}
+
 // UpdateCustomPrompt updates custom prompt
 func (s *TraderStore) UpdateCustomPrompt(userID, id string, customPrompt string, overrideBase bool) error {
 	return s.db.Model(&Trader{}).
@@ -199,10 +206,7 @@ func (s *TraderStore) GetFullConfig(userID, traderID string) (*TraderFullConfig,
 	if trader.StrategyID != "" {
 		strategy, _ = s.getStrategyByID(userID, trader.StrategyID)
 	}
-	// If no associated strategy, get user's active strategy or default strategy
-	if strategy == nil {
-		strategy, _ = s.getActiveOrDefaultStrategy(userID)
-	}
+	// 安全模式：不再自动回退到激活/默认策略。若未绑定或找不到策略，保持 strategy=nil 交由上层显式处理。
 
 	return &TraderFullConfig{
 		Trader:   &trader,

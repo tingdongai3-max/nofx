@@ -22,6 +22,16 @@ const (
 	wsWriteWait    = 10 * time.Second
 )
 
+// defaultWSHeaders 模拟浏览器访问 CoinAnk 官方站点，避免握手阶段被风控拦截
+func defaultWSHeaders() http.Header {
+	h := http.Header{}
+	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+	h.Set("Origin", "https://www.coinank.com")
+	h.Set("Referer", "https://www.coinank.com/")
+	h.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	return h
+}
+
 var wsDialer = websocket.Dialer{
 	Proxy:            http.ProxyFromEnvironment,
 	HandshakeTimeout: 10 * time.Second,
@@ -38,7 +48,8 @@ type KlineWs struct {
 
 // WsConn connects via gorilla/websocket with Ping/Pong keepalive and extended ReadDeadline.
 func WsConn(ctx context.Context, needKline bool, needTicker bool) (*KlineWs, error) {
-	conn, _, err := wsDialer.DialContext(ctx, MainWsUrl, nil)
+	headers := defaultWSHeaders()
+	conn, _, err := wsDialer.DialContext(ctx, MainWsUrl, headers)
 	if err != nil {
 		return nil, err
 	}

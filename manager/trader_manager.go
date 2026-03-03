@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"nofx/debate"
 	"nofx/kernel"
@@ -11,6 +12,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // TraderExecutorAdapter wraps AutoTrader to implement debate.TraderExecutor
@@ -631,22 +634,39 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 		return fmt.Errorf("trader ID '%s' already exists", traderCfg.ID)
 	}
 
-	// Load strategy config (must have strategy)
+	// Load strategy config（安全模式：必须显式绑定且存在有效策略，禁止任何自动回退或隐式绑定）
 	var strategyConfig *store.StrategyConfig
-	if traderCfg.StrategyID != "" {
-		strategy, err := st.Strategy().Get(traderCfg.UserID, traderCfg.StrategyID)
-		if err != nil {
-			return fmt.Errorf("failed to load strategy %s for trader %s: %w", traderCfg.StrategyID, traderCfg.Name, err)
+	// 1) 检查是否显式绑定策略
+	if traderCfg.StrategyID == "" {
+		logger.Errorf("CRITICAL: Trader %s has NO strategy bound. Halting to prevent unintended trades.", traderCfg.Name)
+		if st != nil {
+			_ = st.Trader().UpdateStatus(traderCfg.UserID, traderCfg.ID, false)
 		}
-		// Parse JSON config
-		strategyConfig, err = strategy.ParseConfig()
-		if err != nil {
-			return fmt.Errorf("failed to parse strategy config for trader %s: %w", traderCfg.Name, err)
-		}
-		logger.Infof("✓ Trader %s loaded strategy config: %s", traderCfg.Name, strategy.Name)
-	} else {
 		return fmt.Errorf("trader %s has no strategy configured", traderCfg.Name)
 	}
+
+	// 2) 加载绑定策略，禁止任何 GetActive()/GetDefault() 回退
+	strategy, err := st.Strategy().Get(traderCfg.UserID, traderCfg.StrategyID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			logger.Errorf("CRITICAL: Trader %s bound strategy %s IS MISSING. Halting to prevent unintended trades.",
+				traderCfg.Name, traderCfg.StrategyID)
+		} else {
+			logger.Errorf("CRITICAL: Trader %s failed to load bound strategy %s: %v",
+				traderCfg.Name, traderCfg.StrategyID, err)
+		}
+		if st != nil {
+			_ = st.Trader().UpdateStatus(traderCfg.UserID, traderCfg.ID, false)
+		}
+		return fmt.Errorf("failed to load strategy %s for trader %s: %w", traderCfg.StrategyID, traderCfg.Name, err)
+	}
+
+	// 3) 解析策略配置（解析失败同样阻止 Trader 启动）
+	strategyConfig, err = strategy.ParseConfig()
+	if err != nil {
+		return fmt.Errorf("failed to parse strategy config for trader %s: %w", traderCfg.Name, err)
+	}
+	logger.Infof("✓ Trader %s loaded strategy config: %s", traderCfg.Name, strategy.Name)
 
 	// Build AutoTraderConfig (ai500APIURL/oiTopAPIURL obtained from strategy config, used in StrategyEngine)
 	traderConfig := trader.AutoTraderConfig{

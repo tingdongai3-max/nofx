@@ -1005,7 +1005,7 @@ func (s *Server) handleStartTrader(c *gin.Context) {
 		if fullCfg != nil && fullCfg.Trader != nil {
 			// Check strategy
 			if fullCfg.Strategy == nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "Trader has no strategy configured, please create a strategy in Strategy Studio and associate it with the trader"})
+				c.JSON(http.StatusBadRequest, gin.H{"error": "策略配置不完整，请先关联有效策略"})
 				return
 			}
 			// Check AI model

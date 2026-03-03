@@ -80,10 +80,10 @@ func getKlinesFromCoinAnk(symbol, interval, exchange string, limit int) ([]Kline
 	// Prefer live WebSocket buffer first to achieve real-time, zero-HTTP quotes.
 	ensureKlineStream(symbol, interval, exchange)
 	if live, ok := getRealtimeKlines(symbol, interval, exchange, limit); ok && len(live) > 0 {
-		// 数据新鲜度校验：若最新 K 线的收盘时间距当前超过 15 分钟，说明数据流已卡死，强制 REST 拉取并覆盖缓存
+		// 数据新鲜度校验：若最新 K 线的收盘时间距当前超过 10 秒，说明数据流已明显滞后，强制 REST 拉取并覆盖缓存
 		nowMs := time.Now().UTC().UnixMilli()
 		lastClose := live[len(live)-1].CloseTime
-		const maxStalenessMs = 3 * 60 * 1000 // 3 minutes：WS 推送严重卡死则立即弃缓存走 REST
+		const maxStalenessMs = 10 * 1000 // 10 seconds：高频场景下，缓存超过 10 秒即视为 stale，触发一次性 REST 补漏
 		if nowMs-lastClose <= maxStalenessMs {
 			return live, nil
 		}
