@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"gorm.io/driver/sqlite"
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -96,7 +96,7 @@ func TestHyperliquidPositionBuilding(t *testing.T) {
 	exchangeType := "hyperliquid"
 	symbol := "ETHUSDT"
 
-	// Test Case 1: Open Long â†’ Close Long (should result in 0 position)
+	// Test Case 1: Open Long â†?Close Long (should result in 0 position)
 	t.Run("Open and Close Long", func(t *testing.T) {
 		// Open Long: BUY 0.1 ETH @ 3500
 		err := posBuilder.ProcessTrade(
@@ -149,7 +149,7 @@ func TestHyperliquidPositionBuilding(t *testing.T) {
 	// Clear positions for next test
 	db.Exec("DELETE FROM trader_positions")
 
-	// Test Case 2: Open Short â†’ Close Short with BUY (the bug scenario!)
+	// Test Case 2: Open Short â†?Close Short with BUY (the bug scenario!)
 	t.Run("Open Short then Close with BUY", func(t *testing.T) {
 		// Open Short: SELL 0.05 ETH @ 3500
 		err := posBuilder.ProcessTrade(
@@ -206,7 +206,7 @@ func TestHyperliquidPositionBuilding(t *testing.T) {
 	// Clear positions
 	db.Exec("DELETE FROM trader_positions")
 
-	// Test Case 3: Position Averaging (Open â†’ Add â†’ Close)
+	// Test Case 3: Position Averaging (Open â†?Add â†?Close)
 	t.Run("Position Averaging", func(t *testing.T) {
 		// Open Long: BUY 0.1 ETH @ 3500
 		err := posBuilder.ProcessTrade(
