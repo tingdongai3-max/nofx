@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	talib "github.com/markcheno/go-talib"
@@ -300,6 +301,153 @@ var timeframeDurationMs = map[string]int64{
 	"1d": 24 * 3600 * 1000, "3d": 3 * 24 * 3600 * 1000, "1w": 7 * 24 * 3600 * 1000,
 }
 
+// ===== 实时成交量基准缓存：分母每小时刷新一次，避免每轮决策反复重算 =====
+
+type volBaselineCacheEntry struct {
+	Avg5Min    float64
+	LastUpdate time.Time
+}
+
+var (
+	volBaselineMu    sync.Mutex
+	volBaselineCache = make(map[string]volBaselineCacheEntry)
+)
+
+// getOrComputeBaseline5Min 使用 1m K 线序列估算「平均每 5 分钟成交量」，
+// 并按 symbol+exchange 维度缓存 1 小时，避免每轮决策抖动。
+func getOrComputeBaseline5Min(symbol, exchange string, oneMinBars []KlineBar) float64 {
+	if len(oneMinBars) == 0 {
+		return 0
+	}
+
+	now := time.Now()
+	key := fmt.Sprintf("%s|%s", strings.ToUpper(symbol), strings.ToLower(exchange))
+
+	volBaselineMu.Lock()
+	defer volBaselineMu.Unlock()
+
+	if entry, ok := volBaselineCache[key]; ok && now.Sub(entry.LastUpdate) < time.Hour && entry.Avg5Min > 0 {
+		return entry.Avg5Min
+	}
+
+	totalVol := 0.0
+	for _, b := range oneMinBars {
+		totalVol += b.Volume
+	}
+	count := len(oneMinBars)
+	if count == 0 {
+		return 0
+	}
+
+	avgPerMin := totalVol / float64(count)
+	avg5Min := avgPerMin * 5
+	if avg5Min <= 0 {
+		return 0
+	}
+
+	volBaselineCache[key] = volBaselineCacheEntry{
+		Avg5Min:    avg5Min,
+		LastUpdate: now,
+	}
+	return avg5Min
+}
+
+// enhanceRealtimeVolMultWith1m 使用 1m K 线最近 5 根成交量作为分子，
+// 使用按小时缓存的 baseline 作为分母，覆盖 vol_mult/realtime_rolling_volmult。
+// 若 1m 数据不够新鲜（>70s）或数值极小但价格波动正常，则打上 "volume_data_stale_flag"。
+func enhanceRealtimeVolMultWith1m(symbol, exchange string, timeframeData map[string]*TimeframeSeriesData, dynamic map[string]float64) {
+	if timeframeData == nil || dynamic == nil {
+		return
+	}
+
+	tfData, ok := timeframeData["1m"]
+	if !ok || tfData == nil || len(tfData.Klines) == 0 {
+		// 未订阅 1m，保持旧逻辑
+		return
+	}
+
+	bars := tfData.Klines
+	n := len(bars)
+	if n == 0 {
+		return
+	}
+
+	// 1) 新鲜度检查：最新 1m K 线收盘时间距离现在不得超过 70 秒
+	dur, ok := timeframeDurationMs["1m"]
+	if !ok {
+		dur = 60 * 1000
+	}
+	last := bars[n-1]
+	closeTimeMs := last.Time + dur
+	nowMs := time.Now().UTC().UnixMilli()
+	lagMs := nowMs - closeTimeMs
+
+	if lagMs > 70*1000 {
+		logger.Warnf("⚠️ Volume data stale for %s: last 1m close lag=%dms, marking vol_mult as unknown", symbol, lagMs)
+		delete(dynamic, "vol_mult")
+		delete(dynamic, "realtime_rolling_volmult")
+		dynamic["volume_data_stale_flag"] = 1
+		return
+	}
+
+	// 2) 分子：最近 5 根 1m K 线成交量之和
+	countBars := 5
+	if n < countBars {
+		countBars = n
+	}
+	startIdx := n - countBars
+	rolling := 0.0
+	for i := startIdx; i < n; i++ {
+		rolling += bars[i].Volume
+	}
+	if rolling <= 0 {
+		return
+	}
+
+	// 3) 分母：基准 5 分钟成交量（按小时缓存）
+	baseline := getOrComputeBaseline5Min(symbol, exchange, bars)
+	if baseline <= 0 {
+		return
+	}
+
+	volMult := rolling / baseline
+	if math.IsNaN(volMult) || math.IsInf(volMult, 0) {
+		return
+	}
+
+	// 4) 数据一致性检查：若 vol_mult 极小但 1m 价格波动正常，提示 Volume data might be stale
+	priceVolOk := false
+	if countBars >= 2 {
+		sumAbs := 0.0
+		prevClose := bars[startIdx].Close
+		steps := 0
+		for i := startIdx + 1; i < n; i++ {
+			c := bars[i].Close
+			if prevClose > 0 {
+				ch := math.Abs(c-prevClose) / prevClose
+				sumAbs += ch
+				steps++
+			}
+			prevClose = c
+		}
+		if steps > 0 {
+			avgChange := sumAbs / float64(steps)
+			// 阈值约 0.15%：价格在 5 根 1m 内有正常抖动，但 vol_mult 仍几乎为 0，则高度怀疑成交量数据异常
+			if avgChange > 0.0015 {
+				priceVolOk = true
+			}
+		}
+	}
+
+	if volMult < 0.05 && priceVolOk {
+		logger.Warnf("⚠️ realtime_rolling_volmult suspiciously low for %s: vol_mult=%.4f with normal 1m price volatility, volume data might be stale", symbol, volMult)
+		dynamic["volume_data_stale_flag"] = 1
+	}
+
+	dynamic["vol_mult"] = volMult
+	dynamic["realtime_rolling_volmult"] = volMult
+}
+
 // DataLastCloseTimeMs 返回该 Data 在指定周期下最后一根 K 线的收盘时间（UTC 毫秒）。ok 表示是否有有效数据。
 func DataLastCloseTimeMs(data *Data, timeframe string) (closeTimeMs int64, ok bool) {
 	if data == nil || data.TimeframeData == nil {
@@ -391,6 +539,20 @@ func GetWithTimeframesWithExchange(symbol string, timeframes []string, primaryTi
 	var primaryKlines []Kline
 	isXyzAsset := IsXyzDexAsset(symbol)
 
+	// 若策略开启放量指标，确保至少包含 1m 周期，以便用 1m×5 根构造实时成交量分子
+	if opts != nil && opts.VolMultBars > 0 {
+		has1m := false
+		for _, tf := range timeframes {
+			if tf == "1m" {
+				has1m = true
+				break
+			}
+		}
+		if !has1m {
+			timeframes = append(timeframes, "1m")
+		}
+	}
+
 	for _, tf := range timeframes {
 		limit := counts[tf]
 		if limit <= 0 {
@@ -434,6 +596,8 @@ func GetWithTimeframesWithExchange(symbol string, timeframes []string, primaryTi
 
 	currentPrice := primaryKlines[len(primaryKlines)-1].Close
 	dynamicIndicators := fillDynamicIndicators(primaryKlines, opts)
+	// 使用 1m K 线的最近 5 根作为实时成交量分子，分母按小时缓存，增强 realtime_rolling_volmult 的稳定性与实时性。
+	enhanceRealtimeVolMultWith1m(symbol, exchange, timeframeData, dynamicIndicators)
 	fibonacci := fillFibonacci(primaryKlines)
 
 	priceChange1h := calculatePriceChangeByBars(primaryKlines, primaryTimeframe, 60)

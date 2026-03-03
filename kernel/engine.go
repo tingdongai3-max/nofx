@@ -1832,6 +1832,9 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 		for _, k := range keys {
 			// 根据策略配置有选择地暴露指标，避免在 Prompt 中出现用户未勾选的高级指标字段名。
 			switch k {
+			case "volume_data_stale_flag":
+				// 内部标记，不作为数值指标暴露给 AI
+				continue
 			case "volume_poc", "poc_deviation_pct":
 				if !indicators.EnableVolumePOC {
 					continue
@@ -1868,6 +1871,11 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 					longLiq, shortLiq, ratio))
 			}
 		}
+	}
+
+	// 成交量数据新鲜度提示：若标记为 stale，提醒 AI 谨慎使用 vol_mult
+	if flag, ok := data.DynamicIndicators["volume_data_stale_flag"]; ok && flag > 0 {
+		sb.WriteString("⚠️ Volume data might be stale：当前最近 1 分钟成交量数据可能存在延迟或缓存问题，请将 vol_mult / realtime_rolling_volmult 仅作为弱提示，而不要当成强过滤条件。\n\n")
 	}
 
 	// 深度图：仅在策略勾选 EnableOrderBookDepth 时才接入，避免对所有策略增加额外网络开销。
