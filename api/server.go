@@ -898,8 +898,9 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 	}
 
 	// Update database
-	logger.Infof("🔄 Updating trader: ID=%s, Name=%s, AIModelID=%s, StrategyID=%s, ScanInterval=%d min",
-		traderRecord.ID, traderRecord.Name, traderRecord.AIModelID, traderRecord.StrategyID, scanIntervalMinutes)
+	logger.Infof("🔄 Updating trader: ID=%s, Name=%s, AIModelID=%s, StrategyID=%s, ScanInterval=%d min, IsDryRun=%v, VirtualEquity=%.2f",
+		traderRecord.ID, traderRecord.Name, traderRecord.AIModelID, traderRecord.StrategyID, scanIntervalMinutes,
+		traderRecord.IsDryRun, traderRecord.VirtualEquity)
 	err = s.store.Trader().Update(traderRecord)
 	if err != nil {
 		SafeInternalError(c, "Failed to update trader", err)
