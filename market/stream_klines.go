@@ -607,6 +607,8 @@ func runOkxConn(chunkIndex int, args []okxArg, done chan struct{}) {
 		if ring != nil {
 			ring.append(kline)
 		}
+		// 无锁热槽：仅内存覆盖，不等待 DB
+		SetLatestPrice(symbol, "okx", c, kline.CloseTime)
 
 		if rand.Intn(1000) == 0 {
 			logger.Infof("[WS Pulse] OKX 收到实时行情: %s %s, 当前价: %s", channel, instId, fmtStr(arr[4]))
@@ -840,6 +842,8 @@ func runBinanceConn(chunkIndex int, streamNames []string, done chan struct{}) {
 			Close:     closeP,
 			Volume:    vol,
 		})
+		// 无锁热槽：仅内存覆盖，不等待 DB，满足 ~1ms 内完成
+		SetLatestPrice(symbol, "binance", closeP, k.CloseTime)
 
 		// 极低频采样日志：确认数据流脉搏，避免刷屏
 		if rand.Intn(1000) == 0 {

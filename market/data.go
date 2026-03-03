@@ -81,15 +81,16 @@ func getKlinesFromCoinAnk(symbol, interval, exchange string, limit int) ([]Kline
 	// Prefer live WebSocket buffer first to achieve real-time, zero-HTTP quotes.
 	ensureKlineStream(symbol, interval, exchange)
 	if live, ok := getRealtimeKlines(symbol, interval, exchange, limit); ok && len(live) > 0 {
-		// 数据新鲜度校验：若最新 K 线的收盘时间距当前超过 10 秒，说明数据流已明显滞后，强制 REST 拉取并覆盖缓存
+		// 数据新鲜度校验：使用「本地时间 + 交易所服务器时间偏移」作为 effectiveNow，避免本地时钟快于交易所时误判为 stale
 		nowMs := time.Now().UTC().UnixMilli()
+		effectiveNowMs := nowMs + getServerTimeOffsetMs()
 		lastClose := live[len(live)-1].CloseTime
 		const maxStalenessMs = 10 * 1000 // 10 seconds：高频场景下，缓存超过 10 秒即视为 stale，触发一次性 REST 补漏
-		if nowMs-lastClose <= maxStalenessMs {
+		if effectiveNowMs-lastClose <= maxStalenessMs {
 			return live, nil
 		}
-		logger.Warnf("⚠️ K-line cache stale for %s %s %s: last CloseTime %d ms behind now %d, forcing REST refetch",
-			symbol, interval, exchange, nowMs-lastClose, nowMs)
+		logger.Warnf("⚠️ K-line cache stale for %s %s %s: last CloseTime %d ms behind effective now %d, forcing REST refetch",
+			symbol, interval, exchange, effectiveNowMs-lastClose, effectiveNowMs)
 	}
 
 	// Fallback: call CoinAnk free/open HTTP API (no authentication required).
@@ -233,7 +234,12 @@ func GetWithExchange(symbol, exchange string, opts *IndicatorParams) (*Data, err
 		return nil, fmt.Errorf("4-hour K-line data is empty")
 	}
 
+	// 读写分离：优先从无锁热槽取最新价（WebSocket 写入），避免被 DB/指标计算阻塞
 	currentPrice := klines3m[len(klines3m)-1].Close
+	if hot, hotMs, ok := GetLatestPrice(symbol, exchange, 15*1000); ok && hot > 0 {
+		currentPrice = hot
+		_ = hotMs
+	}
 	dynamicIndicators := fillDynamicIndicators(klines3m, opts)
 
 	// 实时爆仓数据：通过 CoinAnk 爆仓统计接口获取最近 1 小时多空爆仓成交额（USD），若可用则写入 DynamicIndicators。

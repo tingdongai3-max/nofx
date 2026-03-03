@@ -41,7 +41,10 @@ import (
 	"github.com/google/uuid"
 )
 
-const accountPositionsCacheTTL = 5 * time.Second
+const (
+	accountPositionsCacheTTL        = 5 * time.Second
+	accountPositionsCacheTTLDryRun  = 2 * time.Second // DryRun 缩短缓存，减少「持仓不显示」延迟
+)
 
 type ttlCacheEntry struct {
 	Body  []byte
@@ -2370,22 +2373,24 @@ func (s *Server) handlePositions(c *gin.Context) {
 			}
 			marginUsed := (pos.Quantity * markPrice) / float64(lev)
 			out = append(out, map[string]interface{}{
-				"symbol":                 pos.Symbol,
-				"side":                   strings.ToLower(pos.Side),
-				"entry_price":            pos.EntryPrice,
-				"mark_price":             markPrice,
-				"quantity":               pos.Quantity,
-				"leverage":               lev,
-				"unrealized_pnl":         unrealizedPnl,
-				"unrealized_pnl_pct":     unrealizedPnlPct,
-				"liquidation_price":      0.0,
-				"margin_used":            marginUsed,
-				"source":                 "dry_run",
-				"ai_reasoning_at_open":   pos.AiReasoningAtOpen,
+				"symbol":                      pos.Symbol,
+				"side":                        strings.ToLower(pos.Side),
+				"entry_price":                 pos.EntryPrice,
+				"mark_price":                  markPrice,
+				"quantity":                    pos.Quantity,
+				"leverage":                    lev,
+				"unrealized_pnl":              unrealizedPnl,
+				"unrealized_pnl_pct":          unrealizedPnlPct,
+				"max_favorable_excursion":     pos.MaxFavorableExcursion,
+				"max_adverse_excursion":       pos.MaxAdverseExcursion,
+				"liquidation_price":           0.0,
+				"margin_used":                 marginUsed,
+				"source":                      "dry_run",
+				"ai_reasoning_at_open":        pos.AiReasoningAtOpen,
 			})
 		}
 		body, _ := json.Marshal(out)
-		positionsCache.Store(cacheKey, &ttlCacheEntry{Body: body, Until: time.Now().Add(accountPositionsCacheTTL)})
+		positionsCache.Store(cacheKey, &ttlCacheEntry{Body: body, Until: time.Now().Add(accountPositionsCacheTTLDryRun)})
 		c.Data(http.StatusOK, "application/json", body)
 		return
 	}

@@ -1982,9 +1982,13 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 	if indicators.EnableOI || indicators.EnableFundingRate {
 		sb.WriteString(fmt.Sprintf("Additional data for %s:\n\n", data.Symbol))
 
-		if indicators.EnableOI && data.OpenInterest != nil {
-			sb.WriteString(fmt.Sprintf("Open Interest: Latest: %.2f Average: %.2f\n\n",
-				data.OpenInterest.Latest, data.OpenInterest.Average))
+		if indicators.EnableOI {
+			if data.OpenInterest != nil && (data.OpenInterest.Latest != 0 || data.OpenInterest.Average != 0) {
+				sb.WriteString(fmt.Sprintf("Open Interest: Latest: %.2f Average: %.2f\n\n",
+					data.OpenInterest.Latest, data.OpenInterest.Average))
+			} else {
+				sb.WriteString("[DATA_STALE] Open Interest data is missing or zero; do not rely on it for trading decisions.\n\n")
+			}
 		}
 
 		if indicators.EnableFundingRate {

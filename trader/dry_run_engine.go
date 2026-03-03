@@ -209,6 +209,12 @@ func (at *AutoTrader) executeDryRunCloseLong(decision *kernel.Decision, actionRe
 
 	closedNotional := closeQty * openPos.EntryPrice
 	mfe, mae := at.getDryRunMfeMae(normSymbol, "long", closedNotional)
+	// 优先使用 DB 中由 K 线逐笔更新的 MFE/MAE，与统计一致
+	if latest, _ := at.store.Position().GetOpenPositionByID(openPos.ID); latest != nil {
+		if latest.MaxFavorableExcursion != 0 || latest.MaxAdverseExcursion != 0 {
+			mfe, mae = latest.MaxFavorableExcursion, latest.MaxAdverseExcursion
+		}
+	}
 	orderID := at.dryRunOrderID()
 	nowMs := time.Now().UTC().UnixMilli()
 	pb := store.NewPositionBuilder(at.store.Position())
@@ -257,6 +263,12 @@ func (at *AutoTrader) executeDryRunCloseShort(decision *kernel.Decision, actionR
 
 	closedNotional := closeQty * openPos.EntryPrice
 	mfe, mae := at.getDryRunMfeMae(normSymbol, "short", closedNotional)
+	// 优先使用 DB 中由 K 线逐笔更新的 MFE/MAE，与统计一致
+	if latest, _ := at.store.Position().GetOpenPositionByID(openPos.ID); latest != nil {
+		if latest.MaxFavorableExcursion != 0 || latest.MaxAdverseExcursion != 0 {
+			mfe, mae = latest.MaxFavorableExcursion, latest.MaxAdverseExcursion
+		}
+	}
 	orderID := at.dryRunOrderID()
 	nowMs := time.Now().UTC().UnixMilli()
 	pb := store.NewPositionBuilder(at.store.Position())

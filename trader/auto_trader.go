@@ -160,6 +160,14 @@ type AutoTrader struct {
 	atrTrailingCtx        context.Context
 	atrTrailingCancel     context.CancelFunc
 	isExecuting           atomic.Bool       // 引擎互斥锁：防止多个 AI 决策线程重叠
+	peakBottomCh          chan peakBottomUpdate        // 异步极值更新，不阻塞 runCycle
+}
+
+// peakBottomUpdate 供监控协程批量更新 MFE/MAE 缓存
+type peakBottomUpdate struct {
+	Symbol  string
+	Side    string
+	PnlPct  float64
 }
 
 // resolveInitialBalanceForConfig 确定 PnL 分母（初始本金）：模拟盘必须用 VirtualEquity，禁止用实盘余额
@@ -397,8 +405,9 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		monitorWg:             sync.WaitGroup{},
 		peakPnLCache:          make(map[string]float64),
 		peakPnLCacheMutex:     sync.RWMutex{},
-		bottomPnLCache:       make(map[string]float64),
+		bottomPnLCache:        make(map[string]float64),
 		bottomPnLCacheMutex:   sync.RWMutex{},
+		peakBottomCh:          make(chan peakBottomUpdate, 256),
 		lastBalanceSyncTime:   time.Now(),
 		userID:                userID,
 	}, nil
@@ -419,6 +428,10 @@ func (at *AutoTrader) Run() error {
 	logger.Info("🤖 AI will make full decisions on leverage, position size, stop loss/take profit, etc.")
 	at.monitorWg.Add(1)
 	defer at.monitorWg.Done()
+
+	// 异步极值更新协程：不阻塞主交易循环 runCycle
+	at.monitorWg.Add(1)
+	go at.runPeakBottomWorker()
 
 	// Start drawdown monitoring
 	at.startDrawdownMonitor()
@@ -901,6 +914,8 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 		if marginUsed > 0 {
 			pnlPct = (unrealizedPnl / marginUsed) * 100
 		}
+		// DryRun 每轮异步更新内存极值，不阻塞 runCycle
+		at.submitPeakBottomUpdate(pos.Symbol, pos.Side, pnlPct)
 
 		posKey := pos.Symbol + "_" + strings.ToLower(pos.Side)
 		at.peakPnLCacheMutex.RLock()
@@ -2567,6 +2582,29 @@ func sortDecisionsByPriority(decisions []kernel.Decision) []kernel.Decision {
 	return sorted
 }
 
+// runPeakBottomWorker 在单独协程中处理 MFE/MAE 缓存更新，不阻塞 runCycle
+func (at *AutoTrader) runPeakBottomWorker() {
+	defer at.monitorWg.Done()
+	for {
+		select {
+		case <-at.stopMonitorCh:
+			return
+		case u := <-at.peakBottomCh:
+			at.UpdatePeakPnL(u.Symbol, u.Side, u.PnlPct)
+			at.UpdateBottomPnL(u.Symbol, u.Side, u.PnlPct)
+		}
+	}
+}
+
+// submitPeakBottomUpdate 非阻塞提交极值更新，供 runCycle/ DryRun 上下文使用
+func (at *AutoTrader) submitPeakBottomUpdate(symbol, side string, pnlPct float64) {
+	select {
+	case at.peakBottomCh <- peakBottomUpdate{Symbol: symbol, Side: side, PnlPct: pnlPct}:
+	default:
+		// 队列满时丢弃，避免阻塞主循环
+	}
+}
+
 // startDrawdownMonitor starts drawdown monitoring
 func (at *AutoTrader) startDrawdownMonitor() {
 	at.monitorWg.Add(1)
@@ -2637,15 +2675,10 @@ func (at *AutoTrader) checkPositionDrawdown() {
 		at.peakPnLCacheMutex.RUnlock()
 
 		if !exists {
-			// If no historical peak record, use current P&L as initial value
 			peakPnLPct = currentPnLPct
-			at.UpdatePeakPnL(symbol, side, currentPnLPct)
-		} else {
-			// Update peak cache
-			at.UpdatePeakPnL(symbol, side, currentPnLPct)
 		}
-		// Update bottom (MAE) cache: track max adverse excursion
-		at.UpdateBottomPnL(symbol, side, currentPnLPct)
+		// 异步更新 MFE/MAE 缓存，不阻塞监控循环
+		at.submitPeakBottomUpdate(symbol, side, currentPnLPct)
 
 		// Calculate drawdown (magnitude of decline from peak)
 		var drawdownPct float64
@@ -2828,11 +2861,8 @@ func (at *AutoTrader) checkPositionDrawdownDryRun() {
 		at.peakPnLCacheMutex.RUnlock()
 		if !exists {
 			peakPnLPct = currentPnLPct
-			at.UpdatePeakPnL(symbol, side, currentPnLPct)
-		} else {
-			at.UpdatePeakPnL(symbol, side, currentPnLPct)
 		}
-		at.UpdateBottomPnL(symbol, side, currentPnLPct)
+		at.submitPeakBottomUpdate(symbol, side, currentPnLPct)
 
 		drawdownPct := 0.0
 		if peakPnLPct > 0 && currentPnLPct < peakPnLPct {
