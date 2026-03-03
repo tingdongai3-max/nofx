@@ -551,6 +551,12 @@ export interface IndicatorConfig {
   vol_mult_bars?: number;  // 默认 5
   /** 成交量参考基准（小时），用于 realtime_rolling_volmult 基准窗口，默认 4 小时 */
   volume_baseline_hours?: number;
+  /** 爆仓数据开关：long_liq_usd / short_liq_usd / liq_long_short_ratio */
+  enable_liquidation?: boolean;
+  /** 筹码分布 POC 开关：volume_poc / poc_deviation_pct */
+  enable_volume_poc?: boolean;
+  /** 深度图开关：订单簿 1% 深度与挂单大墙（Wall Detection） */
+  enable_order_book_depth?: boolean;
   enable_oi: boolean;
   enable_funding_rate: boolean;
   ema_periods?: number[];

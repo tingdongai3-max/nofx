@@ -188,6 +188,12 @@ type IndicatorConfig struct {
 	PriceRankingDuration string `json:"price_ranking_duration,omitempty"` // durations: "1h" or "1h,4h,24h"
 	PriceRankingLimit    int    `json:"price_ranking_limit,omitempty"`    // number of entries per ranking (default 10)
 
+	// Depth / liquidation / POC optional indicators for AI Prompt
+	// 当未勾选时，这些指标不会出现在 AI 的文本 Prompt 中，以减少噪声干扰。
+	EnableLiquidation    bool `json:"enable_liquidation"`      // 爆仓数据（long_liq_usd / short_liq_usd / liq_long_short_ratio）
+	EnableVolumePOC      bool `json:"enable_volume_poc"`       // 筹码分布 POC 与 POC 偏离度
+	EnableOrderBookDepth bool `json:"enable_order_book_depth"` // 深度图：1% 买卖深度与挂单大墙（Wall Detection）
+
 	// 动态指标移动止盈止损（硬风控狗）：不经过 AI，价格跌破/突破指定指标线即市价平仓
 	EnableIndicatorTrailing bool   `json:"enable_indicator_trailing"`   // 是否开启指标追踪止盈止损
 	TrailingIndicator       string  `json:"trailing_indicator,omitempty"`   // 平仓线指标，如 "ema_20", "ema_50", "boll_middle_20"
@@ -309,6 +315,10 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 			VolMultBars:       5,
 			EnableOI:          true,
 			EnableFundingRate: true,
+			// 默认开启爆仓与 POC 指标提示，深度图默认关闭以避免额外开销，用户可在策略界面单独勾选。
+			EnableLiquidation:    true,
+			EnableVolumePOC:      true,
+			EnableOrderBookDepth: false,
 			EMAPeriods:        []int{20, 50},
 			RSIPeriods:        []int{7, 14},
 			ATRPeriods:        []int{14},

@@ -1427,6 +1427,18 @@ func (e *StrategyEngine) writeAvailableIndicators(sb *strings.Builder) {
 		sb.WriteString("  该指标基于连续 5 分钟滚动窗口计算成交量动能，独立于 K 线开盘/收盘，避免新 K 线启动时的缩量误判导致错误平仓。\n")
 	}
 
+	if indicators.EnableVolumePOC {
+		sb.WriteString("- Volume POC: 主筹码密集区价格（Volume Point of Control）及当前价格相对 POC 的偏离百分比，用于判断是在筹码上方追高还是在筹码下方抄底。\n")
+	}
+
+	if indicators.EnableLiquidation {
+		sb.WriteString("- Liquidation Heat: 最近一段时间内的多空爆仓金额与多空爆仓比(多/空)，用于识别是否存在“杀多/杀空”型流动性收集。\n")
+	}
+
+	if indicators.EnableOrderBookDepth {
+		sb.WriteString("- Order Book Depth: Top20 档订单簿 1% 买卖深度以及最近的大单墙（Wall），需结合爆仓数据判断是否存在虚假挂单 (Spoofing)。\n")
+	}
+
 	if indicators.EnableOI {
 		sb.WriteString("- Open Interest (OI) data\n")
 	}
@@ -1810,6 +1822,22 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 			keys = append(keys, k)
 		}
 		for _, k := range keys {
+			// 根据策略配置有选择地暴露指标，避免在 Prompt 中出现用户未勾选的高级指标字段名。
+			switch k {
+			case "volume_poc", "poc_deviation_pct":
+				if !indicators.EnableVolumePOC {
+					continue
+				}
+			case "long_liq_usd", "short_liq_usd", "liq_long_short_ratio":
+				if !indicators.EnableLiquidation {
+					continue
+				}
+			default:
+				// 将来若有 depth_* 一类键名，可在此按 EnableOrderBookDepth 开关过滤
+				if strings.HasPrefix(k, "depth_") && !indicators.EnableOrderBookDepth {
+					continue
+				}
+			}
 			v := data.DynamicIndicators[k]
 			readable := strings.ReplaceAll(k, "_", "")
 			sb.WriteString(fmt.Sprintf(", current_%s = %.3f", readable, v))
@@ -1817,16 +1845,39 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 	}
 	sb.WriteString("\n\n")
 
-	// 专门为 POC 与爆仓热度写一段自然语言解释，避免 AI 误解字段含义。
-	if poc, ok := data.DynamicIndicators["volume_poc"]; ok && poc > 0 {
-		dev := data.DynamicIndicators["poc_deviation_pct"]
-		sb.WriteString(fmt.Sprintf("POC (Volume Point of Control): 主筹码密集区价格约为 %.4f，当前价格相对 POC 偏离 %.2f%%（正值=在筹码上方，负值=在筹码下方）。\n\n", poc, dev))
+	// 专门为 POC 与爆仓热度写一段自然语言解释，避免 AI 误解字段含义（受策略开关控制）。
+	if indicators.EnableVolumePOC {
+		if poc, ok := data.DynamicIndicators["volume_poc"]; ok && poc > 0 {
+			dev := data.DynamicIndicators["poc_deviation_pct"]
+			sb.WriteString(fmt.Sprintf("POC (Volume Point of Control): 主筹码密集区价格约为 %.4f，当前价格相对 POC 偏离 %.2f%%（正值=在筹码上方，负值=在筹码下方）。\n\n", poc, dev))
+		}
 	}
-	if longLiq, okL := data.DynamicIndicators["long_liq_usd"]; okL {
-		if shortLiq, okS := data.DynamicIndicators["short_liq_usd"]; okS {
-			ratio := data.DynamicIndicators["liq_long_short_ratio"]
-			sb.WriteString(fmt.Sprintf("爆仓热度：最近一段时间内，多头爆仓约 %.0f USDT，空头爆仓约 %.0f USDT，多空爆仓比(多/空)=%.2f，用于判断是否存在“杀多/杀空”型流动性收集。\n\n",
-				longLiq, shortLiq, ratio))
+	if indicators.EnableLiquidation {
+		if longLiq, okL := data.DynamicIndicators["long_liq_usd"]; okL {
+			if shortLiq, okS := data.DynamicIndicators["short_liq_usd"]; okS {
+				ratio := data.DynamicIndicators["liq_long_short_ratio"]
+				sb.WriteString(fmt.Sprintf("爆仓热度：最近一段时间内，多头爆仓约 %.0f USDT，空头爆仓约 %.0f USDT，多空爆仓比(多/空)=%.2f，用于判断是否存在“杀多/杀空”型流动性收集。\n\n",
+					longLiq, shortLiq, ratio))
+			}
+		}
+	}
+
+	// 深度图：仅在策略勾选 EnableOrderBookDepth 时才接入，避免对所有策略增加额外网络开销。
+	if indicators.EnableOrderBookDepth {
+		if depth, err := market.AnalyzeMarketDepth(data.Symbol, "binance"); err == nil && depth != nil && depth.MidPrice > 0 {
+			bidUSD := depth.BidNotional1Pct
+			askUSD := depth.AskNotional1Pct
+			sb.WriteString(fmt.Sprintf("订单簿 1%% 深度：在 mid≈%.4f 附近，买盘深度≈%.0f USDT，卖盘深度≈%.0f USDT，买卖深度失衡度≈%.2f（>0=买盘更厚，<0=卖盘更厚）。\n",
+				depth.MidPrice, bidUSD, askUSD, depth.DepthImbalance))
+			if depth.NearestBidWall != nil {
+				sb.WriteString(fmt.Sprintf("最近买盘大墙：价格≈%.4f，挂单≈%.0f USDT，距离当前价约 %.2f%% 下方。\n",
+					depth.NearestBidWall.Price, depth.NearestBidWall.NotionalUSD, depth.NearestBidWall.DistancePct))
+			}
+			if depth.NearestAskWall != nil {
+				sb.WriteString(fmt.Sprintf("最近卖盘大墙：价格≈%.4f，挂单≈%.0f USDT，距离当前价约 %.2f%% 上方。\n",
+					depth.NearestAskWall.Price, depth.NearestAskWall.NotionalUSD, depth.NearestAskWall.DistancePct))
+			}
+			sb.WriteString("警告：注意虚假挂单（Spoofing）——当看到巨大买单/卖单墙同时旁边方向的爆仓数据并未明显放大时，该墙更可能是真实支撑/压力；若爆仓金额持续激增而墙体价格附近挂单频繁撤单，则更可能是诱导市场情绪的假墙，应降低信任度。\n\n")
 		}
 	}
 

@@ -92,6 +92,21 @@ export function IndicatorEditor({
       volMult: { zh: '放量', en: 'Vol Mult' },
       volMultDesc: { zh: '当前 5 分钟滚动成交量，相对于「最近 N 小时」平均每 5 分钟成交量的倍数', en: '5‑min rolling volume vs avg 5‑min volume over last N hours' },
       volumeBaselineHours: { zh: '成交量参考基准（小时）', en: 'Volume Baseline (hours)' },
+      liquidation: { zh: '爆仓数据', en: 'Liquidations' },
+      liquidationDesc: {
+        zh: '最近一段时间内的多空爆仓金额与多空爆仓比，用于识别“杀多/杀空”行情',
+        en: 'Recent long/short liquidation notional and long/short ratio, to detect stop-hunting flows',
+      },
+      volumePOC: { zh: '筹码分布 (POC)', en: 'Volume POC' },
+      volumePOCDesc: {
+        zh: '主筹码密集区价格及 POC 偏离度，帮助判断当前位置是“筹码上方追高”还是“筹码下方淘金”',
+        en: 'Volume point of control and deviation, to see whether price trades above or below main inventory zone',
+      },
+      orderBookDepth: { zh: '深度图墙体', en: 'Order Book Depth' },
+      orderBookDepthDesc: {
+        zh: 'Top20 档订单簿 1% 买卖深度与最近挂单大墙（包含 Spoofing 风险提示）',
+        en: 'Top-20 order book 1% bid/ask depth and nearest large walls (with spoofing risk warning)',
+      },
       oi: { zh: '持仓量', en: 'Open Interest' },
       oiDesc: { zh: '合约未平仓量', en: 'Futures open interest' },
       fundingRate: { zh: '资金费率', en: 'Funding Rate' },
@@ -798,6 +813,9 @@ export function IndicatorEditor({
               { key: 'enable_vol_mult', label: 'volMult', desc: 'volMultDesc', color: '#22d3ee' },
               { key: 'enable_oi', label: 'oi', desc: 'oiDesc', color: '#34d399' },
               { key: 'enable_funding_rate', label: 'fundingRate', desc: 'fundingRateDesc', color: '#fbbf24' },
+              { key: 'enable_liquidation', label: 'liquidation', desc: 'liquidationDesc', color: '#fb923c' },
+              { key: 'enable_volume_poc', label: 'volumePOC', desc: 'volumePOCDesc', color: '#38bdf8' },
+              { key: 'enable_order_book_depth', label: 'orderBookDepth', desc: 'orderBookDepthDesc', color: '#4ade80' },
             ].map(({ key, label, desc, color }) => (
               <div
                 key={key}

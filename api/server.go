@@ -3471,7 +3471,21 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 		lossExitVals    []float64
 	}
 
-	indicatorNames := []string{"rsi", "emabias", "boll_pct", "atr_pct", "macd", "adx", "bias", "vol_mult"}
+	// 指标列表：基础技术指标 + POC / 爆仓相关扩展指标
+	indicatorNames := []string{
+		"rsi",
+		"emabias",
+		"boll_pct",
+		"atr_pct",
+		"macd",
+		"adx",
+		"bias",
+		"vol_mult",
+		"poc_deviation_pct",
+		"long_liq_usd",
+		"short_liq_usd",
+		"liq_long_short_ratio",
+	}
 	newBuckets := func() map[string]*indicatorBucket {
 		m := make(map[string]*indicatorBucket)
 		for _, n := range indicatorNames {
@@ -3524,7 +3538,9 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 	}
 
 	// Iterate positions: parse pre-computed EntryIndicatorsJSON/ExitIndicatorsJSON (no network)
+	effectiveTradeCount := 0
 	for _, p := range filtered {
+		hadSample := false
 		isWin := p.RealizedPnL > 0
 		side := p.Side
 		if side == "" {
@@ -3535,6 +3551,7 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 		if p.EntryIndicatorsJSON != "" {
 			var snap market.IndicatorSnapshot
 			if json.Unmarshal([]byte(p.EntryIndicatorsJSON), &snap) == nil {
+				hadSample = true
 				addSampleAllSides("rsi", snap.RSI, isWin, true, side)
 				addSampleAllSides("emabias", snap.EMABias, isWin, true, side)
 				addSampleAllSides("boll_pct", snap.BollPct, isWin, true, side)
@@ -3561,6 +3578,7 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 		if p.ExitIndicatorsJSON != "" {
 			var snap market.IndicatorSnapshot
 			if json.Unmarshal([]byte(p.ExitIndicatorsJSON), &snap) == nil {
+				hadSample = true
 				addSampleAllSides("rsi", snap.RSI, isWin, false, side)
 				addSampleAllSides("emabias", snap.EMABias, isWin, false, side)
 				addSampleAllSides("boll_pct", snap.BollPct, isWin, false, side)
@@ -3581,6 +3599,10 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 					}
 				}
 			}
+		}
+
+		if hadSample {
+			effectiveTradeCount++
 		}
 	}
 
@@ -3660,7 +3682,8 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 		"vol_mult_bars":    volMultBars,
 		"from":             overallFromMs,
 		"to":               overallToMs,
-		"trade_count":      len(filtered),
+		// trade_count 统计“真正有指标快照样本”的交易数量，避免前端显示有样本但所有指标行都是空。
+		"trade_count":      effectiveTradeCount,
 		"indicators_all":   buildResult(indicatorsAll),
 		"indicators_long":  buildResult(indicatorsLong),
 		"indicators_short": buildResult(indicatorsShort),
