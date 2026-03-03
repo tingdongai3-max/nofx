@@ -236,13 +236,10 @@ func GetWithExchange(symbol, exchange string, opts *IndicatorParams) (*Data, err
 	dynamicIndicators := fillDynamicIndicators(klines3m, opts)
 
 	// 实时爆仓数据：通过 CoinAnk 爆仓统计接口获取最近 1 小时多空爆仓成交额（USD），若可用则写入 DynamicIndicators。
+	// 约定：只要接口返回任意一侧 >0，则视为“有数据”，此时必须显式写入 long/short，即便其中一侧为 0，以区分“真实为 0”与“完全无数据”。
 	if longLiq, shortLiq := fetchSymbolLiquidation(symbol, exchange, "1h"); longLiq > 0 || shortLiq > 0 {
-		if longLiq > 0 {
-			dynamicIndicators["long_liq_usd"] = longLiq
-		}
-		if shortLiq > 0 {
-			dynamicIndicators["short_liq_usd"] = shortLiq
-		}
+		dynamicIndicators["long_liq_usd"] = longLiq
+		dynamicIndicators["short_liq_usd"] = shortLiq
 		if shortLiq > 0 {
 			ratio := longLiq / shortLiq
 			if !math.IsNaN(ratio) && !math.IsInf(ratio, 0) {

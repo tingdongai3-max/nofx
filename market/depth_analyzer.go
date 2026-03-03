@@ -1,9 +1,13 @@
 package market
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // DepthWall 描述一侧订单簿上的“大单墙”
@@ -52,13 +56,33 @@ func AnalyzeMarketDepth(symbol, exchange string) (*DepthAnalysis, error) {
 	mgr := GlobalDepthManager()
 	snap, ok := mgr.GetSnapshot(sym, ex)
 	if !ok || snap == nil || (len(snap.Bids) == 0 && len(snap.Asks) == 0) {
-		return nil, fmt.Errorf("no depth snapshot for %s on %s", sym, ex)
+		// 本地快照完全缺失时，尝试使用一次性 HTTP REST 做兜底（避免因 WS 初始握手失败而完全没有深度信息）。
+		if httpSnap, err := fetchDepthSnapshotHTTP(sym, ex); err == nil {
+			snap = httpSnap
+		} else {
+			return nil, fmt.Errorf("no depth snapshot for %s on %s (WS empty, HTTP fallback failed: %v)", sym, ex, err)
+		}
 	}
 
 	bids := snap.Bids
 	asks := snap.Asks
 	if len(bids) == 0 || len(asks) == 0 {
 		return nil, fmt.Errorf("incomplete depth snapshot for %s on %s", sym, ex)
+	}
+
+	// Stale 判定：若最后更新时间早于当前超过 10 秒，说明 WS 更新可能滞后/短暂断开。
+	// 此时尝试额外发起一次 HTTP 请求作为补丁；若失败，则继续使用当前快照，不阻塞 AI 决策。
+	const staleThreshold = 10 * time.Second
+	if !snap.UpdatedAt.IsZero() {
+		age := time.Since(snap.UpdatedAt)
+		if age > staleThreshold {
+			if httpSnap, err := fetchDepthSnapshotHTTP(sym, ex); err == nil && httpSnap != nil &&
+				len(httpSnap.Bids) > 0 && len(httpSnap.Asks) > 0 {
+				snap = httpSnap
+				bids = snap.Bids
+				asks = snap.Asks
+			}
+		}
 	}
 
 	bestBid := bids[0][0]
@@ -164,4 +188,141 @@ func AnalyzeMarketDepth(symbol, exchange string) (*DepthAnalysis, error) {
 		NearestAskWall:  nearestAskWall,
 	}, nil
 }
+
+// fetchDepthSnapshotHTTP 使用 HTTP REST 获取一次性订单簿快照，用于 WS 长时间滞后的兜底方案。
+// 为了控制复杂度，目前仅对 binance 做实现；其它交易所返回错误，由调用方决定是否使用旧快照继续决策。
+func fetchDepthSnapshotHTTP(symbol, exchange string) (*OrderBookSnapshot, error) {
+	ex := strings.ToLower(strings.TrimSpace(exchange))
+	sym := strings.ToUpper(strings.TrimSpace(symbol))
+
+	switch ex {
+	case "binance":
+		const depthLimit = 20
+		url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/depth?symbol=%s&limit=%d", sym, depthLimit)
+
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Get(url)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("binance depth http status=%d", resp.StatusCode)
+		}
+
+		var payload struct {
+			LastUpdateID int         `json:"lastUpdateId"`
+			Bids         [][]string  `json:"bids"`
+			Asks         [][]string  `json:"asks"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			return nil, err
+		}
+		if len(payload.Bids) == 0 || len(payload.Asks) == 0 {
+			return nil, fmt.Errorf("empty binance depth for %s", sym)
+		}
+
+		parseSide := func(rows [][]string) [][2]float64 {
+			out := make([][2]float64, 0, len(rows))
+			for _, r := range rows {
+				if len(r) < 2 {
+					continue
+				}
+				price, err1 := strconv.ParseFloat(r[0], 64)
+				qty, err2 := strconv.ParseFloat(r[1], 64)
+				if err1 != nil || err2 != nil || price <= 0 || qty <= 0 {
+					continue
+				}
+				out = append(out, [2]float64{price, qty})
+			}
+			return out
+		}
+
+		bids := parseSide(payload.Bids)
+		asks := parseSide(payload.Asks)
+		if len(bids) == 0 || len(asks) == 0 {
+			return nil, fmt.Errorf("parsed empty binance depth for %s", sym)
+		}
+
+		return &OrderBookSnapshot{
+			Exchange: ex,
+			Symbol:   sym,
+			Bids:     bids,
+			Asks:     asks,
+			BestBid:  bids[0][0],
+			BestAsk:  asks[0][0],
+			UpdatedAt: time.Now().UTC(),
+		}, nil
+	case "okx":
+		// OKX REST: https://www.okx.com/api/v5/market/books?instId=BTC-USDT-SWAP&sz=20
+		instID := toOKXInstID(sym)
+		url := fmt.Sprintf("https://www.okx.com/api/v5/market/books?instId=%s&sz=%d", instID, 20)
+
+		client := &http.Client{Timeout: 2 * time.Second}
+		resp, err := client.Get(url)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("okx depth http status=%d", resp.StatusCode)
+		}
+
+		var payload struct {
+			Code string `json:"code"`
+			Msg  string `json:"msg"`
+			Data []struct {
+				Bids [][]string `json:"bids"`
+				Asks [][]string `json:"asks"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			return nil, err
+		}
+		if payload.Code != "0" {
+			return nil, fmt.Errorf("okx depth error code=%s msg=%s", payload.Code, payload.Msg)
+		}
+		if len(payload.Data) == 0 {
+			return nil, fmt.Errorf("empty okx depth for %s", instID)
+		}
+
+		parseSide := func(rows [][]string) [][2]float64 {
+			out := make([][2]float64, 0, len(rows))
+			for _, r := range rows {
+				if len(r) < 2 {
+					continue
+				}
+				price, err1 := strconv.ParseFloat(r[0], 64)
+				qty, err2 := strconv.ParseFloat(r[1], 64)
+				if err1 != nil || err2 != nil || price <= 0 || qty <= 0 {
+					continue
+				}
+				out = append(out, [2]float64{price, qty})
+			}
+			return out
+		}
+
+		book := payload.Data[0]
+		bids := parseSide(book.Bids)
+		asks := parseSide(book.Asks)
+		if len(bids) == 0 || len(asks) == 0 {
+			return nil, fmt.Errorf("parsed empty okx depth for %s", instID)
+		}
+
+		return &OrderBookSnapshot{
+			Exchange: ex,
+			Symbol:   sym,
+			Bids:     bids,
+			Asks:     asks,
+			BestBid:  bids[0][0],
+			BestAsk:  asks[0][0],
+			UpdatedAt: time.Now().UTC(),
+		}, nil
+	default:
+		return nil, fmt.Errorf("http depth fallback not implemented for exchange=%s", ex)
+	}
+}
+
 

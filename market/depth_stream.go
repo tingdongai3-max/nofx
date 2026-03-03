@@ -391,6 +391,32 @@ func (c *okxDepthClient) run() {
 			}
 		}
 
+		// 心跳：OKX WS 要求客户端定期发送 ping，否则可能返回 4004 断开连接。
+		// 这里每 15 秒发送一次 {"op":"ping"}，若失败则让读循环感知并触发重连。
+		pingDone := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-pingDone:
+					return
+				case <-ticker.C:
+					c.mu.Lock()
+					if c.conn == nil {
+						c.mu.Unlock()
+						continue
+					}
+					err := c.conn.WriteJSON(map[string]string{"op": "ping"})
+					c.mu.Unlock()
+					if err != nil {
+						logger.Warnf("⚠️ OKX depth WS ping failed: %v", err)
+						return
+					}
+				}
+			}
+		}()
+
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
@@ -399,6 +425,8 @@ func (c *okxDepthClient) run() {
 			}
 			c.handleMessage(msg)
 		}
+
+		close(pingDone)
 
 		conn.Close()
 

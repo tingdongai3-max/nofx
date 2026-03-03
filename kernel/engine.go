@@ -255,6 +255,13 @@ func NewStrategyEngine(config *store.StrategyConfig) *StrategyEngine {
 	}
 	client := nofxos.NewClient(nofxos.DefaultBaseURL, apiKey)
 
+	// Debug: 打印本次策略的关键指标开关，便于确认 Prompt 注入是否与配置一致。
+	logger.Infof("Strategy indicator toggles: EnableLiquidation=%v, EnableVolumePOC=%v, EnableOrderBookDepth=%v",
+		config.Indicators.EnableLiquidation,
+		config.Indicators.EnableVolumePOC,
+		config.Indicators.EnableOrderBookDepth,
+	)
+
 	return &StrategyEngine{
 		config:       config,
 		nofxosClient: client,
