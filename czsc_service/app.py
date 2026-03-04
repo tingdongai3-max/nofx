@@ -105,20 +105,25 @@ def run_czsc_analyze(symbol: str, timeframe: str, klines: list[dict]) -> dict[st
         return empty_labels(timeframe)
 
     try:
-        # 强制类型转换，确保所有数值字段为 float，时间为 datetime
+        # 强制类型转换，确保所有数值字段为 float，时间为 datetime，freq 为有效周期，id 唯一递增
         bars: list[RawBar] = []
-        for k in klines:
+        for i, k in enumerate(klines):
+            open_price = float(k["open"])
+            high_price = float(k["high"])
+            low_price = float(k["low"])
+            close_price = float(k["close"])
+            vol = float(k.get("volume", 0) or 0.0)
             rb = RawBar(
                 symbol=symbol,
-                id=0,  # id 字段在 CZSC 中主要用于区分顺序，这里可选填
-                freq=None,
+                id=i,  # 唯一自增 ID
                 dt=datetime.fromtimestamp(float(k["time"]) / 1000.0),
-                open=float(k["open"]),
-                high=float(k["high"]),
-                low=float(k["low"]),
-                close=float(k["close"]),
-                vol=float(k.get("volume", 0) or 0.0),
-                amount=0,
+                open=open_price,
+                high=high_price,
+                low=low_price,
+                close=close_price,
+                vol=vol,
+                freq=Freq.F60,  # 当前约定按 1h 级别分析，必须提供有效 freq
+                amount=vol * close_price,  # 简单成交额估算：vol * close
             )
             bars.append(rb)
 
