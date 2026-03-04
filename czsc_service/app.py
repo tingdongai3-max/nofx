@@ -147,6 +147,17 @@ def run_czsc_analyze(symbol: str, timeframe: str, klines: list[dict]) -> dict[st
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest) -> dict[str, Any]:
+    # Debug: 检查 Go 侧发送的 K 线数量与字段形态
+    try:
+        print(f"DEBUG: Symbol {req.symbol} sent {len(req.klines)} bars.")
+        if req.klines:
+            first = req.klines[0]
+            first_dict = first.model_dump()
+            print(f"DEBUG: First bar keys: {list(first_dict.keys())}")
+            print(f"DEBUG: First bar time: {first_dict.get('time')}")
+    except Exception as debug_err:
+        print(f"DEBUG: analyze inspect error: {debug_err}")
+
     if len(req.klines) < 20:
         raise HTTPException(status_code=400, detail="Need at least 20 klines")
     klist = [k.model_dump() for k in req.klines]
