@@ -296,10 +296,12 @@ func NewStrategyEngine(config *store.StrategyConfig) *StrategyEngine {
 	client := nofxos.NewClient(nofxos.DefaultBaseURL, apiKey)
 
 	// Debug: 打印本次策略的关键指标开关，便于确认 Prompt 注入是否与配置一致。
-	logger.Infof("Strategy indicator toggles: EnableLiquidation=%v, EnableVolumePOC=%v, EnableOrderBookDepth=%v",
+	logger.Infof("Strategy indicator toggles: EnableLiquidation=%v, EnableVolumePOC=%v, EnableOrderBookDepth=%v, EnableCZSC=%v, CZSCServiceURL=%q",
 		config.Indicators.EnableLiquidation,
 		config.Indicators.EnableVolumePOC,
 		config.Indicators.EnableOrderBookDepth,
+		config.Indicators.EnableCZSC,
+		config.Indicators.CZSCServiceURL,
 	)
 
 	return &StrategyEngine{
@@ -527,7 +529,13 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 	}
 
 	// 缠论 CZSC 预处理：并发请求中间件，避免 20–30 币串行造成秒级延迟
-	if config.Indicators.EnableCZSC && config.Indicators.CZSCServiceURL != "" {
+	if config.Indicators.EnableCZSC {
+		// 兼容旧策略：若 DB 中 CZSCServiceURL 为空，则在内存里回退到默认本地服务地址
+		serviceURL := config.Indicators.CZSCServiceURL
+		if strings.TrimSpace(serviceURL) == "" {
+			serviceURL = "http://127.0.0.1:8765"
+		}
+
 		ctx.CZSCLabelsMap = make(map[string]*CZSCLabels)
 		var mu sync.Mutex
 		var g errgroup.Group
@@ -541,9 +549,9 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 			}
 			symbol := symbol
 			klines := tfData.Klines
-			serviceURL := config.Indicators.CZSCServiceURL
+			url := serviceURL
 			g.Go(func() error {
-				labels, err := FetchCZSCLabels(symbol, primaryTimeframe, klines, serviceURL)
+				labels, err := FetchCZSCLabels(symbol, primaryTimeframe, klines, url)
 				if err != nil {
 					logger.Warnf("czsc: %s %s: %v", symbol, primaryTimeframe, err)
 					return nil
