@@ -87,6 +87,8 @@ export function IndicatorEditor({
       biasDesc: { zh: '收盘价相对均线的偏离程度', en: 'Deviation of price from moving average' },
       fibonacci: { zh: '斐波那契回撤', en: 'Fibonacci' },
       fibonacciDesc: { zh: '阻力/支撑位写入 AI 文本', en: 'Resistance/support levels in AI prompt' },
+      czsc: { zh: '缠论 CZSC', en: 'Chan Theory (CZSC)' },
+      czscDesc: { zh: '笔/线段/中枢/买卖点注入 AI，依标签做浪浪交易法', en: 'Bi/segment/zhongshu/buy-sell points in AI prompt for wave trading' },
       volume: { zh: '成交量', en: 'Volume' },
       volumeDesc: { zh: '交易量分析', en: 'Trading volume analysis' },
       volMult: { zh: '放量', en: 'Vol Mult' },
@@ -749,6 +751,7 @@ export function IndicatorEditor({
               { key: 'enable_boll', label: 'boll', desc: 'bollDesc', color: '#ec4899', periodKey: 'boll_periods', defaultPeriods: '20' },
               { key: 'enable_bias', label: 'bias', desc: 'biasDesc', color: '#14b8a6', periodKey: 'bias_periods', defaultPeriods: '6,12,24' },
               { key: 'enable_fibonacci', label: 'fibonacci', desc: 'fibonacciDesc', color: '#f59e0b' },
+              { key: 'enable_czsc', label: 'czsc', desc: 'czscDesc', color: '#8b5cf6' },
             ].map(({ key, label, desc, color, periodKey, defaultPeriods }) => (
               <div
                 key={key}

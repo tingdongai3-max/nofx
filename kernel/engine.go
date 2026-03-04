@@ -16,7 +16,10 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // ============================================================================
@@ -145,12 +148,48 @@ type Context struct {
 	MultiTFMarket   map[string]map[string]*market.Data `json:"-"`
 	OITopDataMap    map[string]*OITopData              `json:"-"`
 	QuantDataMap    map[string]*QuantData              `json:"-"`
+	CZSCLabelsMap   map[string]*CZSCLabels            `json:"-"` // 缠论标签（笔/线段/中枢/买卖点），仅当 EnableCZSC 时填充
 	OIRankingData      *nofxos.OIRankingData      `json:"-"` // Market-wide OI ranking data
 	NetFlowRankingData *nofxos.NetFlowRankingData `json:"-"` // Market-wide fund flow ranking data
 	PriceRankingData   *nofxos.PriceRankingData   `json:"-"` // Market-wide price gainers/losers
 	BTCETHLeverage     int                          `json:"-"`
 	AltcoinLeverage int                                `json:"-"`
 	Timeframes      []string                           `json:"-"`
+}
+
+// CZSCLabels 缠论分析结果：笔、线段、中枢、1/2/3类买卖点（由 CZSC 中间件返回，原样注入 Prompt）
+type CZSCLabels struct {
+	Bi            []CZSCBiSegment   `json:"bi,omitempty"`             // 笔
+	Xd            []CZSCBiSegment   `json:"xd,omitempty"`             // 线段
+	Zs            []CZSCZhongshu    `json:"zs,omitempty"`             // 中枢
+	BuySellPoints []CZSCBuySellPoint `json:"buy_sell_points,omitempty"` // 买卖点（1买/2买/3买、1卖/2卖/3卖）
+	Timeframe     string            `json:"timeframe,omitempty"`
+}
+
+// CZSCBiSegment 笔或线段的一段（起止时间与价格）
+type CZSCBiSegment struct {
+	StartTime int64   `json:"start_time"`
+	EndTime   int64   `json:"end_time"`
+	High      float64 `json:"high"`
+	Low       float64 `json:"low"`
+	Direction string  `json:"direction,omitempty"` // up / down
+}
+
+// CZSCZhongshu 中枢（区间与高低点）
+type CZSCZhongshu struct {
+	StartTime int64   `json:"start_time"`
+	EndTime   int64   `json:"end_time"`
+	ZG        float64 `json:"zg"` // 中枢高点
+	ZD        float64 `json:"zd"` // 中枢低点
+	GG        float64 `json:"gg,omitempty"`
+	DD        float64 `json:"dd,omitempty"`
+}
+
+// CZSCBuySellPoint 买卖点
+type CZSCBuySellPoint struct {
+	Type  string  `json:"type"`  // 1买 2买 3买 / 1卖 2卖 3卖
+	Time  int64   `json:"time"`
+	Price float64 `json:"price"`
 }
 
 // Decision AI trading decision
@@ -485,6 +524,40 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 		}
 
 		ctx.MarketDataMap[coin.Symbol] = data
+	}
+
+	// 缠论 CZSC 预处理：并发请求中间件，避免 20–30 币串行造成秒级延迟
+	if config.Indicators.EnableCZSC && config.Indicators.CZSCServiceURL != "" {
+		ctx.CZSCLabelsMap = make(map[string]*CZSCLabels)
+		var mu sync.Mutex
+		var g errgroup.Group
+		for symbol, data := range ctx.MarketDataMap {
+			if data == nil || data.TimeframeData == nil {
+				continue
+			}
+			tfData, ok := data.TimeframeData[primaryTimeframe]
+			if !ok || len(tfData.Klines) < 20 {
+				continue
+			}
+			symbol, data := symbol, data
+			klines := tfData.Klines
+			serviceURL := config.Indicators.CZSCServiceURL
+			g.Go(func() error {
+				labels, err := FetchCZSCLabels(symbol, primaryTimeframe, klines, serviceURL)
+				if err != nil {
+					logger.Warnf("czsc: %s %s: %v", symbol, primaryTimeframe, err)
+					return nil
+				}
+				mu.Lock()
+				ctx.CZSCLabelsMap[symbol] = labels
+				mu.Unlock()
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			logger.Warnf("czsc: errgroup: %v", err)
+		}
+		logger.Infof("📊 CZSC labels fetched for %d symbols (concurrent)", len(ctx.CZSCLabelsMap))
 	}
 
 	logger.Infof("📊 Successfully fetched multi-timeframe market data for %d coins", len(ctx.MarketDataMap))
@@ -1673,7 +1746,11 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 
 		sourceTags := e.formatCoinSourceTag(coin.Sources)
 		sb.WriteString(fmt.Sprintf("### %d. %s%s\n\n", displayedCount, coin.Symbol, sourceTags))
-		sb.WriteString(e.formatMarketData(marketData))
+		var czscLabels *CZSCLabels
+		if ctx.CZSCLabelsMap != nil {
+			czscLabels = ctx.CZSCLabelsMap[coin.Symbol]
+		}
+		sb.WriteString(e.formatMarketData(marketData, czscLabels))
 
 		if ctx.QuantDataMap != nil {
 			if quantData, hasQuant := ctx.QuantDataMap[coin.Symbol]; hasQuant {
@@ -1738,7 +1815,11 @@ func (e *StrategyEngine) formatPositionInfo(index int, pos PositionInfo, ctx *Co
 		pos.Leverage, pos.MarginUsed, pos.LiquidationPrice, holdingDuration))
 
 	if marketData, ok := ctx.MarketDataMap[pos.Symbol]; ok {
-		sb.WriteString(e.formatMarketData(marketData))
+		var czscLabels *CZSCLabels
+		if ctx.CZSCLabelsMap != nil {
+			czscLabels = ctx.CZSCLabelsMap[pos.Symbol]
+		}
+		sb.WriteString(e.formatMarketData(marketData, czscLabels))
 
 		if ctx.QuantDataMap != nil {
 			if quantData, hasQuant := ctx.QuantDataMap[pos.Symbol]; hasQuant {
@@ -1816,13 +1897,97 @@ func (e *StrategyEngine) formatCoinSourceTag(sources []string) string {
 // Market Data Formatting
 // ============================================================================
 
-func (e *StrategyEngine) formatMarketData(data *market.Data) string {
+// appendVolumeAuxForCZSC 在缠论标签模式下追加核心量能指标（VolMult、OBV），供 AI 辅助确认回抽是否有资金承接
+func (e *StrategyEngine) appendVolumeAuxForCZSC(sb *strings.Builder, data *market.Data, indicators store.IndicatorConfig) {
+	if data.DynamicIndicators == nil {
+		return
+	}
+	if flag, ok := data.DynamicIndicators["volume_data_stale_flag"]; ok && flag > 0 {
+		sb.WriteString("⚠️ Volume data might be stale，请将 vol_mult 仅作弱提示。\n\n")
+	}
+	if indicators.EnableVolMult {
+		if v, ok := data.DynamicIndicators["vol_mult"]; ok {
+			sb.WriteString(fmt.Sprintf("VolMult (放量倍数) = %.3f（>1 为放量，辅助确认该笔/回抽是否有资金承接）。\n", v))
+		}
+		if v, ok := data.DynamicIndicators["realtime_rolling_volmult"]; ok {
+			sb.WriteString(fmt.Sprintf("RealtimeRollingVolMult = %.3f\n", v))
+		}
+		sb.WriteString("\n")
+	}
+	tf := indicators.Klines.PrimaryTimeframe
+	if tf == "" {
+		tf = "5m"
+	}
+	if data.TimeframeData != nil {
+		if tfData, ok := data.TimeframeData[tf]; ok && len(tfData.Klines) >= 3 {
+			kl := tfData.Klines
+			n := len(kl)
+			obvVals := make([]float64, n)
+			prevClose := kl[0].Close
+			for i := 1; i < n; i++ {
+				obvVals[i] = obvVals[i-1]
+				switch {
+				case kl[i].Close > prevClose:
+					obvVals[i] += kl[i].Volume
+				case kl[i].Close < prevClose:
+					obvVals[i] -= kl[i].Volume
+				}
+				prevClose = kl[i].Close
+			}
+			startIdx := n - 5
+			if startIdx < 0 {
+				startIdx = 0
+			}
+			deltaObv := obvVals[n-1] - obvVals[startIdx]
+			denom := math.Abs(obvVals[startIdx])
+			if denom < 1e-8 {
+				denom = 1.0
+			}
+			relChange := deltaObv / denom
+			trend := "Neutral"
+			if relChange > 0.03 {
+				trend = "Rising"
+			} else if relChange < -0.03 {
+				trend = "Falling"
+			}
+			priceStart := kl[startIdx].Close
+			priceEnd := kl[n-1].Close
+			obvUp := obvVals[n-1] > obvVals[startIdx]*1.001
+			obvDown := obvVals[n-1] < obvVals[startIdx]*0.999
+			priceUp := priceEnd > priceStart*1.001
+			priceDown := priceEnd < priceStart*0.999
+			divergence := "None"
+			if priceUp && obvDown {
+				divergence = "Bearish (Price up, Volume down)"
+			} else if priceDown && obvUp {
+				divergence = "Bullish (Price down, Volume up)"
+			}
+			sb.WriteString(fmt.Sprintf("OBV Trend (%s): %s. Divergence: %s.\n\n", strings.ToUpper(tf), trend, divergence))
+		}
+	}
+}
+
+func (e *StrategyEngine) formatMarketData(data *market.Data, czscLabels *CZSCLabels) string {
 	var sb strings.Builder
 	indicators := e.config.Indicators
 
 	// 明确标注币种
 	sb.WriteString(fmt.Sprintf("=== %s Market Data ===\n\n", data.Symbol))
 	sb.WriteString(fmt.Sprintf("current_price = %.4f", data.CurrentPrice))
+
+	// 缠论开关开启且本币有标签：以标签为主，并保留核心量能指标（VolMult、OBV）辅助背驰/回抽确认
+	if indicators.EnableCZSC && czscLabels != nil {
+		sb.WriteString("\n\n")
+		sb.WriteString("## CZSC 缠论标签（笔 / 线段 / 中枢 / 1/2/3类买卖点）\n\n")
+		jsonBytes, _ := json.MarshalIndent(czscLabels, "", "  ")
+		sb.WriteString("```json\n")
+		sb.Write(jsonBytes)
+		sb.WriteString("\n```\n\n")
+		sb.WriteString("**请主要依据以上缠论标签执行浪浪交易法，直接对笔、线段、中枢与买卖点做出反应，无需从原始K线自行推断结构。**\n\n")
+		// 量价不完全分家：保留 VolMult / OBV 等量能指标，供 AI 确认回抽是否有资金承接
+		e.appendVolumeAuxForCZSC(&sb, data, indicators)
+		return sb.String()
+	}
 	// 使用 DynamicIndicators 透传用户配置的指标（如 EMA200、RSI14）给 AI
 	if len(data.DynamicIndicators) > 0 {
 		keys := make([]string, 0, len(data.DynamicIndicators))

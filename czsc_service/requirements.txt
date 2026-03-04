@@ -1,0 +1,5 @@
+# NoFx CZSC 缠论中间件
+# 可选：安装 czsc 后启用完整笔/线段/中枢/买卖点分析
+# pip install czsc -U
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0

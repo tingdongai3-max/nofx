@@ -545,6 +545,8 @@ export interface IndicatorConfig {
   enable_boll: boolean;
   enable_bias?: boolean;
   enable_fibonacci: boolean;
+  enable_czsc?: boolean;
+  czsc_service_url?: string;
   enable_volume: boolean;
   /** 放量：当前成交量/前N根K线平均成交量 */
   enable_vol_mult?: boolean;

@@ -203,6 +203,10 @@ type IndicatorConfig struct {
 	// ATR 移动止盈止损：开启后开仓不设交易所固定 TP/SL，由 AI 输出 ATR 倍数，机器狗按价格流监控并触发
 	EnableATRTrailing    bool `json:"enable_atr_trailing"`    // 是否使用 ATR 倍数移动止盈止损（AI 输出 atr_sl_mult / atr_tp_mult / atr_tp_stages）
 	EnableStagedTakeProfit bool `json:"enable_staged_take_profit"` // 允许分批止盈：关闭后 AI 只能使用单一 take_profit 全仓止盈，不能使用 take_profit_stages / atr_tp_stages
+
+	// 缠论 CZSC：开启后对 K 线做笔/线段/中枢/买卖点分析，将标签注入 Prompt，AI 依标签做浪浪交易法，不开启时与之前一致
+	EnableCZSC       bool   `json:"enable_czsc"`        // 是否启用缠论分析（笔、线段、中枢、1/2/3类买卖点）
+	CZSCServiceURL   string `json:"czsc_service_url,omitempty"` // CZSC 中间件地址，默认 http://127.0.0.1:8765
 }
 
 // KlineConfig K-line configuration
@@ -349,6 +353,8 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 			TrailingOffsetPercent:   0,
 			EnableATRTrailing:       false,
 			EnableStagedTakeProfit:  true,
+			EnableCZSC:              false,
+			CZSCServiceURL:          "http://127.0.0.1:8765",
 			BIASPeriods:             []int{6, 12, 24},
 		},
 		RiskControl: RiskControlConfig{
