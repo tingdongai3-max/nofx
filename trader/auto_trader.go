@@ -2582,7 +2582,7 @@ func sortDecisionsByPriority(decisions []kernel.Decision) []kernel.Decision {
 	return sorted
 }
 
-// runPeakBottomWorker 在单独协程中处理 MFE/MAE 缓存更新，不阻塞 runCycle
+// runPeakBottomWorker 在单独协程中处理 MFE/MAE 缓存更新并落库，不阻塞 runCycle
 func (at *AutoTrader) runPeakBottomWorker() {
 	defer at.monitorWg.Done()
 	for {
@@ -2592,8 +2592,48 @@ func (at *AutoTrader) runPeakBottomWorker() {
 		case u := <-at.peakBottomCh:
 			at.UpdatePeakPnL(u.Symbol, u.Side, u.PnlPct)
 			at.UpdateBottomPnL(u.Symbol, u.Side, u.PnlPct)
+			// 按 IsDryRun 落库：DryRun 更新 dry_run 仓位 MFE/MAE，实盘更新实盘表
+			at.persistPeakBottomToDB(u.Symbol, u.Side)
 		}
 	}
+}
+
+// persistPeakBottomToDB 根据 IsDryRun 将当前极值写入 DB（dry_run 仓位或实盘仓位）
+func (at *AutoTrader) persistPeakBottomToDB(symbol, side string) {
+	if at.store == nil {
+		return
+	}
+	normSymbol := market.Normalize(symbol)
+	sideUpper := strings.ToUpper(side)
+	var pos *store.TraderPosition
+	var err error
+	if at.config.IsDryRun {
+		pos, err = at.store.Position().GetOpenPositionBySymbolAndSource(at.id, normSymbol, sideUpper, "dry_run")
+	} else {
+		pos, err = at.store.Position().GetOpenPositionBySymbol(at.id, normSymbol, sideUpper)
+		if err == nil && pos != nil && pos.Source == "dry_run" {
+			pos = nil
+		}
+	}
+	if err != nil || pos == nil {
+		return
+	}
+	price, _, ok := market.GetLatestPrice(normSymbol, at.exchange, 60*1000)
+	if !ok || price <= 0 {
+		return
+	}
+	if err := at.store.Position().UpdateMaxExcursionsFromPrice(pos, price); err != nil {
+		return
+	}
+	logger.Debugf("✓ Updated peak PnL for %s %s: %.2f%%", normSymbol, side, at.peakPnLPctForLog(symbol, side))
+}
+
+// peakPnLPctForLog 仅用于日志展示，读缓存中的 peak PnL %
+func (at *AutoTrader) peakPnLPctForLog(symbol, side string) float64 {
+	posKey := symbol + "_" + strings.ToLower(side)
+	at.peakPnLCacheMutex.RLock()
+	defer at.peakPnLCacheMutex.RUnlock()
+	return at.peakPnLCache[posKey]
 }
 
 // submitPeakBottomUpdate 非阻塞提交极值更新，供 runCycle/ DryRun 上下文使用
@@ -2647,7 +2687,19 @@ func (at *AutoTrader) checkPositionDrawdown() {
 		symbol := pos["symbol"].(string)
 		side := pos["side"].(string)
 		entryPrice := pos["entryPrice"].(float64)
-		markPrice := pos["markPrice"].(float64)
+		markPrice := 0.0
+		if mp, ok := pos["markPrice"].(float64); ok {
+			markPrice = mp
+		}
+		if markPrice <= 0 {
+			// 交易所/行情不可用时，回退热槽最后缓存价，不跳过极值对比
+			if hot, _, ok := market.GetLatestPrice(market.Normalize(symbol), at.exchange, 5*60*1000); ok && hot > 0 {
+				markPrice = hot
+			}
+		}
+		if markPrice <= 0 {
+			continue
+		}
 		quantity := pos["positionAmt"].(float64)
 		if quantity < 0 {
 			quantity = -quantity // Short position quantity is negative, convert to positive
@@ -2842,11 +2894,19 @@ func (at *AutoTrader) checkPositionDrawdownDryRun() {
 			leverage = 10
 		}
 
-		data, err := market.GetWithExchange(symbol, at.exchange, nil)
-		if err != nil {
+		markPrice := 0.0
+		if data, err := market.GetWithExchange(symbol, at.exchange, nil); err == nil && data != nil {
+			markPrice = data.CurrentPrice
+		}
+		if markPrice <= 0 {
+			// CoinAnk/行情不可用时，强制回退热槽最后缓存价，不跳过极值对比
+			if hot, _, ok := market.GetLatestPrice(market.Normalize(symbol), at.exchange, 5*60*1000); ok && hot > 0 {
+				markPrice = hot
+			}
+		}
+		if markPrice <= 0 {
 			continue
 		}
-		markPrice := data.CurrentPrice
 
 		var currentPnLPct float64
 		if pos.Side == "LONG" {
