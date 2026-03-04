@@ -96,7 +96,7 @@ def _czsc_to_output(c, timeframe: str) -> dict[str, Any]:
 
 
 def run_czsc_analyze(symbol: str, timeframe: str, klines: list[dict]) -> dict[str, Any]:
-    """使用 czsc 库进行缠论分析；连续 K 线时优先 update 模式（热加载），否则全量 init。"""
+    """使用 czsc 库进行缠论分析；解析 K 线时做强制类型转换并显式打印调试信息。"""
     try:
         from czsc.objects import RawBar
         from czsc.analyze import CZSC
@@ -104,50 +104,57 @@ def run_czsc_analyze(symbol: str, timeframe: str, klines: list[dict]) -> dict[st
     except ImportError:
         return empty_labels(timeframe)
 
-    if len(klines) < 20:
-        return empty_labels(timeframe)
-
     try:
-        key = (symbol, timeframe)
-        with _czsc_cache_lock:
-            entry = _czsc_cache.get(key)
-            # 连续扩展：新 K 线前 n 条与缓存一致，仅追加新 bar 并 update
-            if entry is not None:
-                n_bars = entry["n_bars"]
-                last_time = entry["last_bar_time"]
-                if len(klines) >= n_bars and klines[n_bars - 1]["time"] == last_time and len(klines) > n_bars:
-                    c = entry["czsc"]
-                    from czsc.objects import RawBar
-                    from czsc.enum import Freq
-                    freq_map = {"1m": Freq.F1, "3m": Freq.F3, "5m": Freq.F5, "15m": Freq.F15, "30m": Freq.F30,
-                                "1h": Freq.F60, "2h": Freq.F120, "4h": Freq.F240, "1d": Freq.D}
-                    freq = freq_map.get(timeframe.lower(), Freq.F5)
-                    for j, k in enumerate(klines[n_bars:]):
-                        dt = datetime.fromtimestamp(k["time"] / 1000.0)
-                        bar = RawBar(
-                            symbol=symbol,
-                            id=n_bars + j,
-                            freq=freq,
-                            dt=dt,
-                            open=float(k["open"]),
-                            close=float(k["close"]),
-                            high=float(k["high"]),
-                            low=float(k["low"]),
-                            vol=float(k.get("volume", 0)),
-                            amount=0,
-                        )
-                        c.update(bar)
-                    entry["n_bars"] = len(klines)
-                    entry["last_bar_time"] = klines[-1]["time"]
-                    return _czsc_to_output(c, timeframe)
-                # 非连续或变短，下面全量重建并更新缓存
-            bars, freq = _klines_to_bars(symbol, timeframe, klines)
-            c = CZSC(bars)
-            _czsc_cache[key] = {"czsc": c, "n_bars": len(klines), "last_bar_time": klines[-1]["time"]}
-        return _czsc_to_output(c, timeframe)
-    except Exception:
-        with _czsc_cache_lock:
-            _czsc_cache.pop((symbol, timeframe), None)
+        # 强制类型转换，确保所有数值字段为 float，时间为 datetime
+        bars: list[RawBar] = []
+        for k in klines:
+            rb = RawBar(
+                symbol=symbol,
+                id=0,  # id 字段在 CZSC 中主要用于区分顺序，这里可选填
+                freq=None,
+                dt=datetime.fromtimestamp(float(k["time"]) / 1000.0),
+                open=float(k["open"]),
+                high=float(k["high"]),
+                low=float(k["low"]),
+                close=float(k["close"]),
+                vol=float(k.get("volume", 0) or 0.0),
+                amount=0,
+            )
+            bars.append(rb)
+
+        if len(bars) < 50:
+            print(f"DEBUG: {symbol} bars too few ({len(bars)}), skipping analysis.")
+            return empty_labels(timeframe)
+
+        # 初始化分析器
+        c = CZSC(bars)
+
+        # 显式打印笔的数量，方便确认 CZSC 是否正常工作
+        bi_len = len(c.bi_list) if getattr(c, "bi_list", None) else 0
+        print(f"DEBUG: {symbol} analysis done. bi_list length = {bi_len}")
+
+        # 复用统一输出结构，将笔写入 JSON
+        out = empty_labels(timeframe)
+        for bi in getattr(c, "bi_list", []):
+            start_dt = bi.fx_a.elements[0].dt
+            end_dt = bi.fx_b.elements[-1].dt
+            direction = "up" if str(bi.direction).lower().startswith("up") else "down"
+            out["bi"].append({
+                "start_time": int(start_dt.timestamp() * 1000),
+                "end_time": int(end_dt.timestamp() * 1000),
+                "high": bi.high,
+                "low": bi.low,
+                "direction": direction,
+            })
+        return out
+    except Exception as e:
+        # 任何错误都打印出来，避免“静默失败 + 空结果”
+        print(f"CRITICAL ERROR during analysis for {symbol}: {str(e)}")
+        try:
+            import traceback
+            traceback.print_exc()
+        except Exception:
+            pass
         return empty_labels(timeframe)
 
 
