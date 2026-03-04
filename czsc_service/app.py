@@ -56,7 +56,8 @@ def _klines_to_bars(symbol: str, timeframe: str, klines: list[dict]) -> tuple[li
     freq = freq_map.get(timeframe.lower(), Freq.F5)
     bars: list[RawBar] = []
     for i, k in enumerate(klines):
-        dt = datetime.utcfromtimestamp(k["time"] / 1000.0)
+        # Go 侧传入的是毫秒时间戳，这里按本地时区转换为 datetime，避免时区导致的序列错位
+        dt = datetime.fromtimestamp(k["time"] / 1000.0)
         bar = RawBar(
             symbol=symbol,
             id=i,
@@ -75,6 +76,11 @@ def _klines_to_bars(symbol: str, timeframe: str, klines: list[dict]) -> tuple[li
 
 def _czsc_to_output(c, timeframe: str) -> dict[str, Any]:
     out = empty_labels(timeframe)
+    try:
+        # 调试：看 CZSC 实际识别出了多少笔
+        print(f"DEBUG: CZSC bi_list length = {len(getattr(c, 'bi_list', []))}")
+    except Exception:
+        pass
     for bi in c.bi_list:
         start_dt = bi.fx_a.elements[0].dt
         end_dt = bi.fx_b.elements[-1].dt
@@ -117,7 +123,7 @@ def run_czsc_analyze(symbol: str, timeframe: str, klines: list[dict]) -> dict[st
                                 "1h": Freq.F60, "2h": Freq.F120, "4h": Freq.F240, "1d": Freq.D}
                     freq = freq_map.get(timeframe.lower(), Freq.F5)
                     for j, k in enumerate(klines[n_bars:]):
-                        dt = datetime.utcfromtimestamp(k["time"] / 1000.0)
+                        dt = datetime.fromtimestamp(k["time"] / 1000.0)
                         bar = RawBar(
                             symbol=symbol,
                             id=n_bars + j,
