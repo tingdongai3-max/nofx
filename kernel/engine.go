@@ -539,7 +539,7 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 			if !ok || len(tfData.Klines) < 20 {
 				continue
 			}
-			symbol, data := symbol, data
+			symbol := symbol
 			klines := tfData.Klines
 			serviceURL := config.Indicators.CZSCServiceURL
 			g.Go(func() error {
