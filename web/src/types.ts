@@ -481,6 +481,9 @@ export interface StrategyConfig {
   custom_prompt?: string;
   risk_control: RiskControlConfig;
   prompt_sections?: PromptSectionsConfig;
+  // 缠论 CZSC：前端可能直接在 StrategyConfig 层读取这两个字段，后端仍以 indicators.enable_czsc / czsc_service_url 为准
+  enable_czsc?: boolean;
+  czsc_service_url?: string;
   // Grid trading configuration (only used when strategy_type is 'grid_trading')
   grid_config?: GridStrategyConfig;
 }

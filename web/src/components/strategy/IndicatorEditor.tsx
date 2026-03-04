@@ -796,6 +796,29 @@ export function IndicatorEditor({
               </div>
             ))}
           </div>
+
+          {/* 缠论 CZSC 服务 URL：仅在勾选 CZSC 时展示，允许覆盖默认本地地址 */}
+          {config.enable_czsc && (
+            <div className="mt-3 space-y-1.5">
+              <span className="text-[10px]" style={{ color: '#848E9C' }}>
+                {language === 'zh'
+                  ? '缠论服务 URL（留空则使用默认 http://127.0.0.1:8765）'
+                  : 'CZSC service URL (leave empty for http://127.0.0.1:8765)'}
+              </span>
+              <input
+                type="text"
+                value={config.czsc_service_url || ''}
+                placeholder="http://127.0.0.1:8765"
+                onChange={(e) => {
+                  if (disabled) return
+                  onChange({ ...config, czsc_service_url: e.target.value })
+                }}
+                disabled={disabled}
+                className="w-full px-2 py-1 rounded text-[10px] font-mono"
+                style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
+              />
+            </div>
+          )}
         </div>
       </div>
 
