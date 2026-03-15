@@ -3133,14 +3133,6 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 		return
 	}
 
-	// For exchanges without OrderSync (e.g., Binance): record immediately and poll for fill data
-	orderRecord := at.createOrderRecord(orderID, symbol, action, positionSide, quantity, price, leverage)
-	if err := at.store.Order().CreateOrder(orderRecord); err != nil {
-		logger.Infof("  ⚠️ Failed to record order: %v", err)
-	} else {
-		logger.Infof("  📝 Order recorded: %s [%s] %s", orderID, action, symbol)
-	}
-
 	// Wait for order to be filled and get actual fill data
 	time.Sleep(500 * time.Millisecond)
 	for i := 0; i < 5; i++ {
