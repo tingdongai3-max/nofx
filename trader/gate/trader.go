@@ -32,6 +32,10 @@ type GateTrader struct {
 	contractsCache      map[string]*gateapi.Contract
 	contractsCacheMutex sync.RWMutex
 	cacheDuration       time.Duration
+
+	// OrderSync control
+	orderSyncStopChan chan struct{}
+	orderSyncTicker   *time.Ticker
 }
 
 // NewGateTrader creates a new Gate trader instance

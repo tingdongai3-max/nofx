@@ -470,6 +470,13 @@ func (t *FuturesTrader) determineOrderAction(side, positionSide string, realized
 
 // StartOrderSync starts background order sync task for Binance
 func (t *FuturesTrader) StartOrderSync(traderID string, exchangeID string, exchangeType string, st *store.Store, interval time.Duration) {
+	// Stop any existing OrderSync first
+	t.StopOrderSync()
+
+	// Initialize stop channel and ticker
+	t.orderSyncStopChan = make(chan struct{})
+	t.orderSyncTicker = time.NewTicker(interval)
+
 	// Run first sync immediately
 	go func() {
 		logger.Infof("🔄 Running initial Binance order sync...")
@@ -479,14 +486,32 @@ func (t *FuturesTrader) StartOrderSync(traderID string, exchangeID string, excha
 	}()
 
 	// Then run periodically
-	ticker := time.NewTicker(interval)
 	go func() {
-		for range ticker.C {
-			if err := t.SyncOrdersFromBinance(traderID, exchangeID, exchangeType, st); err != nil {
-				logger.Infof("⚠️  Binance order sync failed: %v (sleep 30s before retry)", err)
-				time.Sleep(30 * time.Second) // 失败后至少 30 秒再重试，避免死亡循环
+		for {
+			select {
+			case <-t.orderSyncStopChan:
+				t.orderSyncTicker.Stop()
+				logger.Infof("🔄 Binance order sync stopped for trader %s", traderID)
+				return
+			case <-t.orderSyncTicker.C:
+				if err := t.SyncOrdersFromBinance(traderID, exchangeID, exchangeType, st); err != nil {
+					logger.Infof("⚠️  Binance order sync failed: %v (sleep 30s before retry)", err)
+					time.Sleep(30 * time.Second) // 失败后至少 30 秒再重试，避免死亡循环
+				}
 			}
 		}
 	}()
 	logger.Infof("🔄 Binance order sync started (interval: %v)", interval)
+}
+
+// StopOrderSync stops the background order sync task
+func (t *FuturesTrader) StopOrderSync() {
+	if t.orderSyncStopChan != nil {
+		close(t.orderSyncStopChan)
+		t.orderSyncStopChan = nil
+	}
+	if t.orderSyncTicker != nil {
+		t.orderSyncTicker.Stop()
+		t.orderSyncTicker = nil
+	}
 }

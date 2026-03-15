@@ -38,6 +38,10 @@ type AsterTrader struct {
 	// Cache symbol precision information
 	symbolPrecision map[string]SymbolPrecision
 	mu              sync.RWMutex
+
+	// OrderSync control
+	orderSyncStopChan chan struct{}
+	orderSyncTicker   *time.Ticker
 }
 
 // SymbolPrecision Symbol precision information

@@ -66,6 +66,10 @@ type FuturesTrader struct {
 
 	// User Data Stream control
 	userDataStop chan struct{}
+
+	// OrderSync control
+	orderSyncStopChan chan struct{}
+	orderSyncTicker   *time.Ticker
 }
 
 const binanceFuturesTestnetURL = "https://testnet.binancefuture.com"

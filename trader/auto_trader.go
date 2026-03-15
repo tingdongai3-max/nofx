@@ -620,6 +620,37 @@ func (at *AutoTrader) Stop() {
 	at.isRunning = false
 	at.isRunningMutex.Unlock()
 
+	// Stop OrderSync for all exchanges
+	if at.trader != nil {
+		if binanceTrader, ok := at.trader.(*binance.FuturesTrader); ok {
+			binanceTrader.StopOrderSync()
+		}
+		if lighterTrader, ok := at.trader.(*lighter.LighterTraderV2); ok {
+			lighterTrader.StopOrderSync()
+		}
+		if hyperliquidTrader, ok := at.trader.(*hyperliquid.HyperliquidTrader); ok {
+			hyperliquidTrader.StopOrderSync()
+		}
+		if bybitTrader, ok := at.trader.(*bybit.BybitTrader); ok {
+			bybitTrader.StopOrderSync()
+		}
+		if okxTrader, ok := at.trader.(*okx.OKXTrader); ok {
+			okxTrader.StopOrderSync()
+		}
+		if bitgetTrader, ok := at.trader.(*bitget.BitgetTrader); ok {
+			bitgetTrader.StopOrderSync()
+		}
+		if asterTrader, ok := at.trader.(*aster.AsterTrader); ok {
+			asterTrader.StopOrderSync()
+		}
+		if gateTrader, ok := at.trader.(*gate.GateTrader); ok {
+			gateTrader.StopOrderSync()
+		}
+		if kucoinTrader, ok := at.trader.(*kucoin.KuCoinTrader); ok {
+			kucoinTrader.StopOrderSync()
+		}
+	}
+
 	if at.watchdogCancel != nil {
 		at.watchdogCancel()
 		at.watchdogCancel = nil

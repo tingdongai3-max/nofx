@@ -59,6 +59,10 @@ type BitgetTrader struct {
 
 	// Cache duration
 	cacheDuration time.Duration
+
+	// OrderSync control
+	orderSyncStopChan chan struct{}
+	orderSyncTicker   *time.Ticker
 }
 
 // BitgetContract Bitget contract info

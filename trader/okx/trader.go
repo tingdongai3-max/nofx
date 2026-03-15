@@ -72,6 +72,10 @@ type OKXTrader struct {
 
 	// Cache duration
 	cacheDuration time.Duration
+
+	// OrderSync control
+	orderSyncStopChan chan struct{}
+	orderSyncTicker   *time.Ticker
 }
 
 // IsTestnet returns whether the trader is using OKX simulated (demo) environment

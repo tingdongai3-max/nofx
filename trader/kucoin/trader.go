@@ -71,6 +71,10 @@ type KuCoinTrader struct {
 
 	// Cache duration
 	cacheDuration time.Duration
+
+	// OrderSync control
+	orderSyncStopChan chan struct{}
+	orderSyncTicker   *time.Ticker
 }
 
 // KuCoinContract represents contract info

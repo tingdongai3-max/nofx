@@ -284,32 +284,58 @@ const (
 // StartOrderSync starts background order sync task for OKX.
 // 模拟盘强制 2 分钟间隔；50111 后冷却 5 分钟并只打一次日志，彻底阻断疯狂轮询。
 func (t *OKXTrader) StartOrderSync(traderID string, exchangeID string, exchangeType string, st *store.Store, interval time.Duration) {
+	// Stop any existing OrderSync first
+	t.StopOrderSync()
+
 	if t.IsTestnet() && interval < okxSyncIntervalDemo {
 		interval = okxSyncIntervalDemo
 	}
 	if interval < okxSyncIntervalLive {
 		interval = okxSyncIntervalLive
 	}
-	ticker := time.NewTicker(interval)
+
+	// Initialize stop channel and ticker
+	t.orderSyncStopChan = make(chan struct{})
+	t.orderSyncTicker = time.NewTicker(interval)
+
 	go func() {
 		last50111Log := time.Time{}
-		for range ticker.C {
-			err := t.SyncOrdersFromOKX(traderID, exchangeID, exchangeType, st)
-			if err == nil {
-				continue
-			}
-			errStr := err.Error()
-			is50111 := strings.Contains(errStr, okxSyncBackoffCode) || strings.Contains(errStr, okxSyncInvalidKeyCode)
-			if is50111 {
-				if time.Since(last50111Log) > okxSyncCooldown50111 {
-					logger.Warnf("⚠️ OKX order sync 50111/Invalid KEY, cooling down %v (no more attempts until then)", okxSyncCooldown50111)
-					last50111Log = time.Now()
+		for {
+			select {
+			case <-t.orderSyncStopChan:
+				t.orderSyncTicker.Stop()
+				logger.Infof("🔄 OKX order sync stopped for trader %s", traderID)
+				return
+			case <-t.orderSyncTicker.C:
+				err := t.SyncOrdersFromOKX(traderID, exchangeID, exchangeType, st)
+				if err == nil {
+					continue
 				}
-				time.Sleep(okxSyncCooldown50111)
-				continue
+				errStr := err.Error()
+				is50111 := strings.Contains(errStr, okxSyncBackoffCode) || strings.Contains(errStr, okxSyncInvalidKeyCode)
+				if is50111 {
+					if time.Since(last50111Log) > okxSyncCooldown50111 {
+						logger.Warnf("⚠️ OKX order sync 50111/Invalid KEY, cooling down %v (no more attempts until then)", okxSyncCooldown50111)
+						last50111Log = time.Now()
+					}
+					time.Sleep(okxSyncCooldown50111)
+					continue
+				}
+				logger.Infof("⚠️  OKX order sync failed: %v", err)
 			}
-			logger.Infof("⚠️  OKX order sync failed: %v", err)
 		}
 	}()
 	logger.Infof("🔄 OKX order sync started (interval: %v)", interval)
+}
+
+// StopOrderSync stops the background order sync task
+func (t *OKXTrader) StopOrderSync() {
+	if t.orderSyncStopChan != nil {
+		close(t.orderSyncStopChan)
+		t.orderSyncStopChan = nil
+	}
+	if t.orderSyncTicker != nil {
+		t.orderSyncTicker.Stop()
+		t.orderSyncTicker = nil
+	}
 }

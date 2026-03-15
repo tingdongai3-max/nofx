@@ -139,13 +139,38 @@ func (t *HyperliquidTrader) SyncOrdersFromHyperliquid(traderID string, exchangeI
 
 // StartOrderSync starts background order sync task
 func (t *HyperliquidTrader) StartOrderSync(traderID string, exchangeID string, exchangeType string, st *store.Store, interval time.Duration) {
-	ticker := time.NewTicker(interval)
+	// Stop any existing OrderSync first
+	t.StopOrderSync()
+
+	// Initialize stop channel and ticker
+	t.orderSyncStopChan = make(chan struct{})
+	t.orderSyncTicker = time.NewTicker(interval)
+
 	go func() {
-		for range ticker.C {
-			if err := t.SyncOrdersFromHyperliquid(traderID, exchangeID, exchangeType, st); err != nil {
-				logger.Infof("⚠️  Hyperliquid order sync failed: %v", err)
+		for {
+			select {
+			case <-t.orderSyncStopChan:
+				t.orderSyncTicker.Stop()
+				logger.Infof("🔄 Hyperliquid order sync stopped for trader %s", traderID)
+				return
+			case <-t.orderSyncTicker.C:
+				if err := t.SyncOrdersFromHyperliquid(traderID, exchangeID, exchangeType, st); err != nil {
+					logger.Infof("⚠️  Hyperliquid order sync failed: %v", err)
+				}
 			}
 		}
 	}()
 	logger.Infof("🔄 Hyperliquid order sync started (interval: %v)", interval)
+}
+
+// StopOrderSync stops the background order sync task
+func (t *HyperliquidTrader) StopOrderSync() {
+	if t.orderSyncStopChan != nil {
+		close(t.orderSyncStopChan)
+		t.orderSyncStopChan = nil
+	}
+	if t.orderSyncTicker != nil {
+		t.orderSyncTicker.Stop()
+		t.orderSyncTicker = nil
+	}
 }

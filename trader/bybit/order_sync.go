@@ -301,13 +301,38 @@ func (t *BybitTrader) SyncOrdersFromBybit(traderID string, exchangeID string, ex
 
 // StartOrderSync starts background order sync task for Bybit
 func (t *BybitTrader) StartOrderSync(traderID string, exchangeID string, exchangeType string, st *store.Store, interval time.Duration) {
-	ticker := time.NewTicker(interval)
+	// Stop any existing OrderSync first
+	t.StopOrderSync()
+
+	// Initialize stop channel and ticker
+	t.orderSyncStopChan = make(chan struct{})
+	t.orderSyncTicker = time.NewTicker(interval)
+
 	go func() {
-		for range ticker.C {
-			if err := t.SyncOrdersFromBybit(traderID, exchangeID, exchangeType, st); err != nil {
-				logger.Infof("⚠️  Bybit order sync failed: %v", err)
+		for {
+			select {
+			case <-t.orderSyncStopChan:
+				t.orderSyncTicker.Stop()
+				logger.Infof("🔄 Bybit order sync stopped for trader %s", traderID)
+				return
+			case <-t.orderSyncTicker.C:
+				if err := t.SyncOrdersFromBybit(traderID, exchangeID, exchangeType, st); err != nil {
+					logger.Infof("⚠️  Bybit order sync failed: %v", err)
+				}
 			}
 		}
 	}()
 	logger.Infof("🔄 Bybit order sync started (interval: %v)", interval)
+}
+
+// StopOrderSync stops the background order sync task
+func (t *BybitTrader) StopOrderSync() {
+	if t.orderSyncStopChan != nil {
+		close(t.orderSyncStopChan)
+		t.orderSyncStopChan = nil
+	}
+	if t.orderSyncTicker != nil {
+		t.orderSyncTicker.Stop()
+		t.orderSyncTicker = nil
+	}
 }

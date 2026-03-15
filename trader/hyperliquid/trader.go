@@ -32,6 +32,10 @@ type HyperliquidTrader struct {
 	xyzMetaMutex sync.RWMutex
 	privateKey   *ecdsa.PrivateKey // For xyz dex signing
 	isTestnet    bool
+
+	// OrderSync control
+	orderSyncStopChan chan struct{}
+	orderSyncTicker   *time.Ticker
 }
 
 // xyzDexMeta represents metadata for xyz dex assets

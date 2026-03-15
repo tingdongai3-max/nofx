@@ -42,6 +42,10 @@ type BybitTrader struct {
 
 	// Cache duration (15 seconds)
 	cacheDuration time.Duration
+
+	// OrderSync control
+	orderSyncStopChan chan struct{}
+	orderSyncTicker   *time.Ticker
 }
 
 // NewBybitTrader creates a Bybit trader

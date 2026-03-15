@@ -91,6 +91,10 @@ type LighterTraderV2 struct {
 	marketMutex         sync.RWMutex
 	marketListCache     []MarketInfo // Cached market list
 	marketListCacheTime time.Time    // Time when cache was populated
+
+	// OrderSync control
+	orderSyncStopChan chan struct{}
+	orderSyncTicker   *time.Ticker
 }
 
 // NewLighterTraderV2 Create new LIGHTER trader (using official SDK)

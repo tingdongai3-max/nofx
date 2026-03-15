@@ -148,16 +148,41 @@ func (t *LighterTraderV2) SyncOrdersFromLighter(traderID string, exchangeID stri
 
 // StartOrderSync starts background order sync task
 func (t *LighterTraderV2) StartOrderSync(traderID string, exchangeID string, exchangeType string, st *store.Store, interval time.Duration) {
-	ticker := time.NewTicker(interval)
+	// Stop any existing OrderSync first
+	t.StopOrderSync()
+
+	// Initialize stop channel and ticker
+	t.orderSyncStopChan = make(chan struct{})
+	t.orderSyncTicker = time.NewTicker(interval)
+
 	go func() {
-		for range ticker.C {
-			if err := t.SyncOrdersFromLighter(traderID, exchangeID, exchangeType, st); err != nil {
-				// Only log non-404 errors to reduce log spam
-				if !strings.Contains(err.Error(), "status 404") {
-					logger.Infof("⚠️  Order sync failed: %v", err)
+		for {
+			select {
+			case <-t.orderSyncStopChan:
+				t.orderSyncTicker.Stop()
+				logger.Infof("🔄 Lighter order sync stopped for trader %s", traderID)
+				return
+			case <-t.orderSyncTicker.C:
+				if err := t.SyncOrdersFromLighter(traderID, exchangeID, exchangeType, st); err != nil {
+					// Only log non-404 errors to reduce log spam
+					if !strings.Contains(err.Error(), "status 404") {
+						logger.Infof("⚠️  Order sync failed: %v", err)
+					}
 				}
 			}
 		}
 	}()
 	logger.Infof("🔄 Lighter order+position sync started (interval: %v)", interval)
+}
+
+// StopOrderSync stops the background order sync task
+func (t *LighterTraderV2) StopOrderSync() {
+	if t.orderSyncStopChan != nil {
+		close(t.orderSyncStopChan)
+		t.orderSyncStopChan = nil
+	}
+	if t.orderSyncTicker != nil {
+		t.orderSyncTicker.Stop()
+		t.orderSyncTicker = nil
+	}
 }
