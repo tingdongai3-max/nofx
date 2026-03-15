@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import useSWR from 'swr'
 import { api } from '../lib/api'
@@ -169,6 +169,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [showAdminList, setShowAdminList] = useState(false)
   const [viewingAdminId, setViewingAdminId] = useState<string | null>(null)
+  const [filterMode, setFilterMode] = useState<'all' | 'live' | 'paper'>('all')
 
   // Toggle wallet address visibility for a trader
   const toggleTraderAddressVisibility = (traderId: string) => {
@@ -212,6 +213,16 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
     api.getTraders,
     { refreshInterval: 5000 }
   )
+
+  // 根据 filterMode 过滤交易员
+  const filteredTraders = useMemo(() => {
+    if (!traders) return []
+    if (filterMode === 'all') return traders
+    if (filterMode === 'live') return traders.filter(t => !t.is_dry_run)
+    return traders.filter(t => t.is_dry_run)
+  }, [traders, filterMode])
+
+  const filteredTradersCount = filteredTraders.length
 
   // 加载AI模型和交易所配置
   useEffect(() => {
@@ -830,7 +841,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
               <h1 className="text-2xl md:text-3xl font-bold font-mono tracking-tight text-white flex items-center gap-3 uppercase">
                 {t('aiTraders', language)}
                 <span className="text-xs font-mono font-normal px-2 py-0.5 rounded bg-nofx-gold/10 text-nofx-gold border border-nofx-gold/20 tracking-wider">
-                  {traders?.length || 0} ACTIVE_NODES
+                  {filteredTradersCount} ACTIVE_NODES
                 </span>
               </h1>
               <p className="text-xs font-mono text-zinc-500 uppercase tracking-widest mt-1 ml-1 flex items-center gap-2">
@@ -883,6 +894,40 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
               </span>
             </button>
           </div>
+        </div>
+
+        {/* Filter Tabs */}
+        <div className="flex items-center gap-2 p-1 rounded-lg bg-black/30 border border-white/5 w-fit">
+          <button
+            onClick={() => setFilterMode('all')}
+            className={`px-4 py-2 rounded text-xs font-mono uppercase tracking-wider transition-all ${
+              filterMode === 'all'
+                ? 'bg-nofx-gold text-black font-bold'
+                : 'text-zinc-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            {t('all', language) || '全部'}
+          </button>
+          <button
+            onClick={() => setFilterMode('live')}
+            className={`px-4 py-2 rounded text-xs font-mono uppercase tracking-wider transition-all ${
+              filterMode === 'live'
+                ? 'bg-green-600 text-white font-bold'
+                : 'text-zinc-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            {t('live', language) || '实盘'}
+          </button>
+          <button
+            onClick={() => setFilterMode('paper')}
+            className={`px-4 py-2 rounded text-xs font-mono uppercase tracking-wider transition-all ${
+              filterMode === 'paper'
+                ? 'bg-amber-600 text-white font-bold'
+                : 'text-zinc-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            {t('paper', language) || '模拟盘'}
+          </button>
         </div>
 
         {/* Configuration Status Grid */}
@@ -1089,9 +1134,9 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                 </div>
               ))}
             </div>
-          ) : traders && traders.length > 0 ? (
+          ) : filteredTraders && filteredTraders.length > 0 ? (
             <div className="space-y-3 md:space-y-4">
-              {traders.map((trader) => (
+              {filteredTraders?.map((trader) => (
                 <div
                   key={trader.trader_id}
                   className="flex flex-col md:flex-row md:items-center justify-between p-3 md:p-4 rounded transition-all hover:translate-y-[-1px] gap-3 md:gap-4"
@@ -1334,7 +1379,9 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
             >
               <Bot className="w-16 h-16 md:w-24 md:h-24 mx-auto mb-3 md:mb-4 opacity-50" />
               <div className="text-base md:text-lg font-semibold mb-2">
-                {t('noTraders', language)}
+                {filteredTradersCount === 0 && filterMode !== 'all'
+                  ? (filterMode === 'live' ? (t('noLiveTraders', language) || '暂无实盘交易员') : (t('noPaperTraders', language) || '暂无模拟盘交易员'))
+                  : t('noTraders', language)}
               </div>
               <div className="text-xs md:text-sm mb-3 md:mb-4">
                 {t('createFirstTrader', language)}
