@@ -180,6 +180,26 @@ func (s *PositionStore) InitTables() error {
 		return fmt.Errorf("failed to migrate pending_reasonings table: %w", err)
 	}
 
+	// For SQLite (or non-PostgreSQL), ensure MFE/MAE columns exist after AutoMigrate
+	if !s.isPostgres() {
+		// SQLite: check if column exists using PRAGMA
+		for _, col := range []string{"max_favorable_excursion", "max_adverse_excursion"} {
+			var count int64
+			s.db.Raw(fmt.Sprintf("SELECT COUNT(*) FROM pragma_table_info('trader_positions') WHERE name = ?", col)).Scan(&count)
+			if count == 0 {
+				s.db.Exec(fmt.Sprintf("ALTER TABLE trader_positions ADD COLUMN %s REAL DEFAULT 0", col))
+			}
+		}
+		// Also ensure indicator snapshot columns exist
+		for _, col := range []string{"entry_indicators", "exit_indicators"} {
+			var count int64
+			s.db.Raw(fmt.Sprintf("SELECT COUNT(*) FROM pragma_table_info('trader_positions') WHERE name = ?", col)).Scan(&count)
+			if count == 0 {
+				s.db.Exec(fmt.Sprintf("ALTER TABLE trader_positions ADD COLUMN %s TEXT DEFAULT ''", col))
+			}
+		}
+	}
+
 	// Create unique partial index for exchange position deduplication
 	var indexSQL string
 	if s.isPostgres() {
@@ -278,7 +298,7 @@ func (s *PositionStore) ReducePositionQuantity(id int64, reduceQty float64, exit
 	// Check if position should be fully closed (quantity reduced to ~0)
 	const QUANTITY_TOLERANCE = 0.0001
 	if newQty <= QUANTITY_TOLERANCE {
-		// Auto-close: set status to CLOSED (MFE/MAE not tracked for partial-close path)
+		// Auto-close: set status to CLOSED, preserve existing MFE/MAE from the position
 		return s.db.Model(&TraderPosition{}).Where("id = ?", id).Updates(map[string]interface{}{
 			"quantity":                  0,
 			"fee":                       newFee,
@@ -287,8 +307,8 @@ func (s *PositionStore) ReducePositionQuantity(id int64, reduceQty float64, exit
 			"status":                    "CLOSED",
 			"exit_time":                 nowMs,
 			"close_reason":              "sync",
-			"max_favorable_excursion":   0,
-			"max_adverse_excursion":    0,
+			"max_favorable_excursion":   pos.MaxFavorableExcursion,
+			"max_adverse_excursion":    pos.MaxAdverseExcursion,
 			"updated_at":                nowMs,
 		}).Error
 	}

@@ -60,6 +60,11 @@ export function IndicatorEditor({
       timeframesDesc: { zh: '选择 K 线分析周期，★ 为主周期（双击设置）', en: 'Select K-line timeframes, ★ = primary (double-click)' },
       timeframeKlineCounts: { zh: '各周期 K 线数量', en: 'K-line count per timeframe' },
       timeframeKlineCountsDesc: { zh: '为每个周期设置获取的 K 线根数，未填则用默认', en: 'Set count per timeframe; empty uses default' },
+      auxiliaryTimeframe: { zh: '辅助周期', en: 'Auxiliary Timeframe' },
+      auxiliaryTimeframeTag: { zh: '趋势辅助', en: 'Trend Only' },
+      auxiliaryTimeframeDesc: { zh: '仅发送指标趋势判断，不发送K线数据，可帮助减少上下文长度', en: 'Only sends indicator trends, no K-lines, helps reduce context length' },
+      auxiliaryTimeframeNone: { zh: '不使用辅助周期', en: 'No auxiliary timeframe' },
+      none: { zh: '无', en: 'None' },
       scalp: { zh: '超短', en: 'Scalp' },
       intraday: { zh: '日内', en: 'Intraday' },
       swing: { zh: '波段', en: 'Swing' },
@@ -719,6 +724,65 @@ export function IndicatorEditor({
                 </div>
               </div>
             )}
+
+            {/* 辅助周期选择 (Auxiliary Timeframe) */}
+            <div className="mt-3 pt-2" style={{ borderTop: '1px solid #2B3139' }}>
+              <div className="flex items-center gap-2 mb-2">
+                <p className="text-[10px] font-medium" style={{ color: '#EAECEF' }}>{t('auxiliaryTimeframe')}</p>
+                <span className="text-[10px] px-1.5 py-0.5 rounded" style={{ background: 'rgba(14, 203, 129, 0.1)', color: '#0ECB81' }}>{t('auxiliaryTimeframeTag')}</span>
+              </div>
+              <p className="text-[10px] mb-2" style={{ color: '#5E6673' }}>{t('auxiliaryTimeframeDesc')}</p>
+              <div className="flex flex-wrap gap-1.5">
+                <button
+                  onClick={() => {
+                    if (disabled) return
+                    onChange({
+                      ...config,
+                      klines: { ...config.klines, auxiliary_timeframe: undefined },
+                    })
+                  }}
+                  disabled={disabled}
+                  className={`px-2 py-1 rounded text-xs font-medium transition-all ${
+                    !config.klines.auxiliary_timeframe ? '' : 'opacity-40 hover:opacity-70'
+                  }`}
+                  style={{
+                    background: !config.klines.auxiliary_timeframe ? 'rgba(14, 203, 129, 0.15)' : 'transparent',
+                    border: `1px solid ${!config.klines.auxiliary_timeframe ? '#0ECB81' : '#2B3139'}`,
+                    color: !config.klines.auxiliary_timeframe ? '#0ECB81' : '#848E9C',
+                  }}
+                  title={t('auxiliaryTimeframeNone')}
+                >
+                  {t('none')}
+                </button>
+                {allTimeframes.map((tf) => {
+                  const isSelected = config.klines.auxiliary_timeframe === tf.value
+                  const categoryColor = categoryColors[tf.category]
+                  return (
+                    <button
+                      key={tf.value}
+                      onClick={() => {
+                        if (disabled) return
+                        onChange({
+                          ...config,
+                          klines: { ...config.klines, auxiliary_timeframe: tf.value },
+                        })
+                      }}
+                      disabled={disabled}
+                      className={`px-2 py-1 rounded text-xs font-medium transition-all ${
+                        isSelected ? '' : 'opacity-40 hover:opacity-70'
+                      }`}
+                      style={{
+                        background: isSelected ? `${categoryColor}15` : 'transparent',
+                        border: `1px solid ${isSelected ? categoryColor : '#2B3139'}`,
+                        color: isSelected ? categoryColor : '#848E9C',
+                      }}
+                    >
+                      {tf.label}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
           </div>
         </div>
       </div>

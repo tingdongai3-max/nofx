@@ -200,6 +200,22 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 
 	skippedCount := 0
 	for _, trade := range allTrades {
+		// 【核心修复】查找原始挂单的TraderID，而不是直接使用传入的traderID
+		// 多个trader共享同一Binance API时，需要通过订单ID(OrderID)找到真正下单的trader
+		// 注意：TradeID 是成交ID，OrderID 是订单ID，需要用 OrderID 去查找原始订单
+		originalOrder, _ := orderStore.GetOrderByExchangeID(exchangeID, trade.OrderID)
+		actualTraderID := traderID
+		if originalOrder != nil {
+			// 找到了原始挂单，用原始挂单的TraderID
+			actualTraderID = originalOrder.TraderID
+			logger.Infof("  🔍 Found original order for trade %s (orderID=%s), using TraderID=%s (original: %s)",
+				trade.TradeID, trade.OrderID, actualTraderID, traderID)
+		} else {
+			// 没找到原始挂单，可能是新下的订单（由当前trader触发同步）
+			// 继续使用传入的traderID
+			logger.Infof("  🔍 No original order found for trade %s (orderID=%s), using TraderID=%s", trade.TradeID, trade.OrderID, traderID)
+		}
+
 		// Check if trade already exists
 		existing, err := orderStore.GetOrderByExchangeID(exchangeID, trade.TradeID)
 		if err == nil && existing != nil {
@@ -230,7 +246,7 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 		// Create order record - use Unix milliseconds UTC
 		tradeTimeMs := trade.Time.UTC().UnixMilli()
 		orderRecord := &store.TraderOrder{
-			TraderID:        traderID,
+			TraderID:        actualTraderID,
 			ExchangeID:      exchangeID,
 			ExchangeType:    exchangeType,
 			ExchangeOrderID: trade.TradeID,
@@ -258,7 +274,7 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 
 		// Create fill record - use Unix milliseconds UTC
 		fillRecord := &store.TraderFill{
-			TraderID:        traderID,
+			TraderID:        actualTraderID,
 			ExchangeID:      exchangeID,
 			ExchangeType:    exchangeType,
 			OrderID:         orderRecord.ID,

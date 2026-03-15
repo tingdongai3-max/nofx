@@ -92,8 +92,12 @@ func formatContextData(ctx *Context, lang Language) string {
 
 	// 8. 元信息（当前时间等）放在最后，减少对上下文缓存前缀的影响
 	if lang == LangChinese {
-		sb.WriteString(fmt.Sprintf("## 元信息\n\n时间: %s | 周期: #%d | 运行时长: %d 分钟\n\n",
-			ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes))
+		// 显示UTC时间和北京时间
+		now := time.Now()
+		beijingLoc, _ := time.LoadLocation("Asia/Shanghai")
+		beijingTime := now.In(beijingLoc).Format("2006-01-02 15:04:05")
+		sb.WriteString(fmt.Sprintf("## 元信息\n\n时间: %s (UTC) / %s (北京时间) | 周期: #%d | 运行时长: %d 分钟\n\n",
+			ctx.CurrentTime, beijingTime, ctx.CallCount, ctx.RuntimeMinutes))
 	} else {
 		sb.WriteString(fmt.Sprintf("## Meta\n\nTime: %s | Period: #%d | Runtime: %d minutes\n\n",
 			ctx.CurrentTime, ctx.CallCount, ctx.RuntimeMinutes))
@@ -233,6 +237,20 @@ func formatCurrentPositionsZH(ctx *Context) string {
 		// 计算回撤
 		drawdown := pos.UnrealizedPnLPct - pos.PeakPnLPct
 
+		// 计算持仓时长
+		holdingDuration := ""
+		if pos.UpdateTime > 0 {
+			durationMs := time.Now().UnixMilli() - pos.UpdateTime
+			durationMin := durationMs / (1000 * 60)
+			if durationMin < 60 {
+				holdingDuration = fmt.Sprintf(" | 持仓 %d 分钟", durationMin)
+			} else {
+				durationHour := durationMin / 60
+				durationMinRemainder := durationMin % 60
+				holdingDuration = fmt.Sprintf(" | 持仓 %d 小时 %d 分钟", durationHour, durationMinRemainder)
+			}
+		}
+
 		sb.WriteString(fmt.Sprintf("%d. %s %s | ", i+1, pos.Symbol, strings.ToUpper(pos.Side)))
 		sb.WriteString(fmt.Sprintf("进场 %.4f 当前 %.4f | ", pos.EntryPrice, pos.MarkPrice))
 		sb.WriteString(fmt.Sprintf("数量 %.4f | ", pos.Quantity))
@@ -242,7 +260,7 @@ func formatCurrentPositionsZH(ctx *Context) string {
 		sb.WriteString(fmt.Sprintf("峰值盈亏 %.2f%% | ", pos.PeakPnLPct))
 		sb.WriteString(fmt.Sprintf("杠杆 %dx | ", pos.Leverage))
 		sb.WriteString(fmt.Sprintf("保证金 %.0f USDT | ", pos.MarginUsed))
-		sb.WriteString(fmt.Sprintf("强平价 %.4f\n", pos.LiquidationPrice))
+		sb.WriteString(fmt.Sprintf("强平价 %.4f%s\n", pos.LiquidationPrice, holdingDuration))
 
 		// 添加分析提示
 		if drawdown < -0.30*pos.PeakPnLPct && pos.PeakPnLPct > 0.02 {

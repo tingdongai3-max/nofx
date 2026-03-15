@@ -10,6 +10,7 @@ import (
 	"nofx/logger"
 	"nofx/market"
 	"nofx/mcp"
+	"nofx/ta"
 	"nofx/provider/nofxos"
 	"nofx/security"
 	"nofx/store"
@@ -157,13 +158,13 @@ type Context struct {
 	Timeframes      []string                           `json:"-"`
 }
 
-// CZSCLabels 缠论分析结果：笔、线段、中枢、1/2/3类买卖点（由 CZSC 中间件返回，原样注入 Prompt）
+// CZSCLabels 缠论分析结果：笔、笔中枢、MACD动力学（由 CZSC 中间件返回，原样注入 Prompt）
+// 注意：新版本已删除线段(xd)和买卖点，改为提供客观数据，由 LLM 做决策
 type CZSCLabels struct {
-	Bi            []CZSCBiSegment   `json:"bi,omitempty"`             // 笔
-	Xd            []CZSCBiSegment   `json:"xd,omitempty"`             // 线段
-	Zs            []CZSCZhongshu    `json:"zs,omitempty"`             // 中枢
-	BuySellPoints []CZSCBuySellPoint `json:"buy_sell_points,omitempty"` // 买卖点（1买/2买/3买、1卖/2卖/3卖）
-	Timeframe     string            `json:"timeframe,omitempty"`
+	Bi          []CZSCBiSegment   `json:"bi,omitempty"`   // 笔
+	Zs          []CZSCZhongshu    `json:"zs,omitempty"`  // 笔中枢
+	MacdSignals CZSCMacdSignals   `json:"macd_signals,omitempty"` // MACD 动力学数据
+	Timeframe   string            `json:"timeframe,omitempty"`
 }
 
 // CZSCBiSegment 笔或线段的一段（起止时间与价格）
@@ -185,11 +186,19 @@ type CZSCZhongshu struct {
 	DD        float64 `json:"dd,omitempty"`
 }
 
-// CZSCBuySellPoint 买卖点
-type CZSCBuySellPoint struct {
-	Type  string  `json:"type"`  // 1买 2买 3买 / 1卖 2卖 3卖
-	Time  int64   `json:"time"`
-	Price float64 `json:"price"`
+// CZSCMacdSignals MACD 动力学数据
+type CZSCMacdSignals struct {
+	Diff       float64            `json:"diff"`        // DIF 线数值
+	Dea        float64            `json:"dea"`         // DEA 线数值
+	Histogram  float64            `json:"histogram"`   // MACD 柱子
+	ZeroCross string              `json:"zero_cross"`  // 零轴位置：above_zero / near_zero / below_zero
+	BcSignals []CZSCBcSignal     `json:"bc_signals"`  // 背驰信号列表
+}
+
+// CZSCBcSignal 背驰信号
+type CZSCBcSignal struct {
+	Signal string `json:"signal"` // 信号名称
+	Time   int64  `json:"time"`  // 时间戳
 }
 
 // Decision AI trading decision
@@ -459,13 +468,14 @@ func ensureKlineDataFreshness(ctx *Context, engine *StrategyEngine) error {
 			continue
 		}
 		lagMs := nowMs - lastCloseMs
-		if lagMs <= 0 {
-			continue // 负数或零：当前未闭合的 K 线，数据非常新鲜，放行
-		}
-		if lagMs > maxStalenessMs {
-			logger.Infof("[ERROR] K-line data is stale, aborting trade: %s primary %s lastClose=%d now=%d lag=%d ms",
-				symbol, primaryTF, lastCloseMs, nowMs, lagMs)
-			return fmt.Errorf("[ERROR] K-line data is stale, aborting trade")
+		// 记录数据新鲜度（lag>0表示有延迟，lag<=0表示数据很新鲜）
+		if lagMs > 0 {
+			logger.Infof("  📊 [%s] Kline freshness: primary %s lastCloseLag=%d ms (%.1f sec)", symbol, primaryTF, lagMs, float64(lagMs)/1000)
+			if lagMs > maxStalenessMs {
+				logger.Infof("[ERROR] K-line data is stale, aborting trade: %s primary %s lastClose=%d now=%d lag=%d ms",
+					symbol, primaryTF, lastCloseMs, nowMs, lagMs)
+				return fmt.Errorf("[ERROR] K-line data is stale, aborting trade")
+			}
 		}
 	}
 	return nil
@@ -493,12 +503,22 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 	}
 
 	// 各周期 K 线数量：优先用 TimeframeCounts，否则用默认梯队（小周期多、大周期少）
+	// CZSC 需要至少 300 根 K 线才能确保 MACD 预热 + 中枢构成，强制提升主周期数量
+	czscMinCount := 300
+	if config.Indicators.Klines.CZSCKlineCount > 0 {
+		czscMinCount = config.Indicators.Klines.CZSCKlineCount
+	}
 	counts := make(map[string]int)
 	for _, tf := range timeframes {
 		if n, ok := config.Indicators.Klines.TimeframeCounts[tf]; ok && n > 0 {
 			counts[tf] = n
 		} else {
 			counts[tf] = market.DefaultCountForTimeframe(tf)
+		}
+		// CZSC 开启时，确保主周期至少有 300 根 K 线
+		if config.Indicators.EnableCZSC && tf == primaryTimeframe && counts[tf] < czscMinCount {
+			logger.Infof("📊 CZSC enabled: upgrading %s count from %d to %d", tf, counts[tf], czscMinCount)
+			counts[tf] = czscMinCount
 		}
 	}
 	logger.Infof("📊 Strategy timeframes: %v, Primary: %s, counts: %v", timeframes, primaryTimeframe, counts)
@@ -529,11 +549,18 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 	}
 
 	// 缠论 CZSC 预处理：并发请求中间件，避免 20–30 币串行造成秒级延迟
+	// CZSC 需要至少 300 根 K 线才能确保：1) MACD 均线预热充分 2) 有足够笔构成中枢
 	if config.Indicators.EnableCZSC {
 		// 兼容旧策略：若 DB 中 CZSCServiceURL 为空，则在内存里回退到默认本地服务地址
 		serviceURL := config.Indicators.CZSCServiceURL
 		if strings.TrimSpace(serviceURL) == "" {
 			serviceURL = "http://127.0.0.1:8765"
+		}
+
+		// 获取更多 K 线用于 CZSC 分析（300根确保 MACD 预热 + 中枢构成）
+		czscKlineCount := 300
+		if config.Indicators.Klines.CZSCKlineCount > 0 {
+			czscKlineCount = config.Indicators.Klines.CZSCKlineCount
 		}
 
 		ctx.CZSCLabelsMap = make(map[string]*CZSCLabels)
@@ -548,13 +575,32 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 				continue
 			}
 			symbol := symbol
-			klines := tfData.Klines
+			// 截取最近 N 根 K 线（如果不够就全部传入）
+			startIdx := 0
+			if len(tfData.Klines) > czscKlineCount {
+				startIdx = len(tfData.Klines) - czscKlineCount
+			}
+			klines := tfData.Klines[startIdx:]
 			url := serviceURL
 			g.Go(func() error {
 				labels, err := FetchCZSCLabels(symbol, primaryTimeframe, klines, url)
 				if err != nil {
 					logger.Warnf("czsc: %s %s: %v", symbol, primaryTimeframe, err)
 					return nil
+				}
+				// 添加调试日志：检查 ZS 和 MACD 数据
+				if labels != nil {
+					zsCount := len(labels.Zs)
+					biCount := len(labels.Bi)
+					macdDiff := labels.MacdSignals.Diff
+					macdDea := labels.MacdSignals.Dea
+					macdHist := labels.MacdSignals.Histogram
+					logger.Debugf("czsc: %s bi=%d zs=%d macd=%.4f/%.4f/%.4f",
+						symbol, biCount, zsCount, macdDiff, macdDea, macdHist)
+					// 警告：如果开启了 CZSC 但 ZS 为空
+					if zsCount == 0 && biCount > 0 {
+						logger.Warnf("⚠️ czsc: %s has %d bi but 0 zs (need 3+ overlapping bi for zone)", symbol, biCount)
+					}
 				}
 				mu.Lock()
 				ctx.CZSCLabelsMap[symbol] = labels
@@ -1803,6 +1849,8 @@ func (e *StrategyEngine) formatPositionInfo(index int, pos PositionInfo, ctx *Co
 	if pos.UpdateTime > 0 {
 		durationMs := time.Now().UnixMilli() - pos.UpdateTime
 		durationMin := durationMs / (1000 * 60)
+		logger.Infof("  📊 [Position %s] UpdateTime=%d, now=%d, durationMs=%d, durationMin=%d",
+			pos.Symbol, pos.UpdateTime, time.Now().UnixMilli(), durationMs, durationMin)
 		if durationMin < 60 {
 			holdingDuration = fmt.Sprintf(" | Holding Duration %d min", durationMin)
 		} else {
@@ -1905,6 +1953,60 @@ func (e *StrategyEngine) formatCoinSourceTag(sources []string) string {
 // Market Data Formatting
 // ============================================================================
 
+// appendMacroTrend 追加宏观趋势数据（SuperTrend + ADX）
+func (e *StrategyEngine) appendMacroTrend(sb *strings.Builder, data *market.Data) {
+	// 尝试从多周期市场数据获取大级别 K 线
+	var longKlines []ta.Kline
+
+	// 优先使用 1h 或 1d K 线计算宏观趋势
+	if data.TimeframeData != nil {
+		// 尝试 1h
+		if m, ok := data.TimeframeData["1h"]; ok && m != nil && len(m.Klines) > 20 {
+			longKlines = convertToTAKlines(m.Klines)
+		} else if m, ok := data.TimeframeData["4h"]; ok && m != nil && len(m.Klines) > 20 {
+			// 尝试 4h
+			longKlines = convertToTAKlines(m.Klines)
+		} else if m, ok := data.TimeframeData["1d"]; ok && m != nil && len(m.Klines) > 20 {
+			// 尝试 1d
+			longKlines = convertToTAKlines(m.Klines)
+		}
+	}
+
+	// 如果没有多周期数据，无法计算宏观趋势
+	if len(longKlines) == 0 {
+		return
+	}
+
+	if len(longKlines) > 14 {
+		trend := ta.GetMacroTrend(longKlines, "1h")
+
+		sb.WriteString("\n\n## 宏观趋势（SuperTrend + ADX）\n\n")
+		sb.WriteString(fmt.Sprintf("```json\n"))
+		jsonBytes, _ := json.MarshalIndent(trend, "", "  ")
+		sb.Write(jsonBytes)
+		sb.WriteString(fmt.Sprintf("\n```\n\n"))
+		sb.WriteString(fmt.Sprintf("趋势方向: %s | ADX: %.2f (%s) | SuperTrend: %.4f\n\n",
+			trend.Direction, trend.ADXValue, trend.TrendStrength, trend.SuperTrend))
+	}
+}
+
+// convertToTAKlines 将 market.KlineBar 转换为 ta.Kline
+func convertToTAKlines(klines []market.KlineBar) []ta.Kline {
+	result := make([]ta.Kline, len(klines))
+	for i, k := range klines {
+		result[i] = ta.Kline{
+			OpenTime:  k.Time,
+			Open:     k.Open,
+			High:     k.High,
+			Low:      k.Low,
+			Close:    k.Close,
+			Volume:   k.Volume,
+			CloseTime: k.Time + 60000, // KlineBar only has Time, estimate CloseTime as +1min
+		}
+	}
+	return result
+}
+
 // appendVolumeAuxForCZSC 在缠论标签模式下追加核心量能指标（VolMult、OBV），供 AI 辅助确认回抽是否有资金承接
 func (e *StrategyEngine) appendVolumeAuxForCZSC(sb *strings.Builder, data *market.Data, indicators store.IndicatorConfig) {
 	if data.DynamicIndicators == nil {
@@ -1975,6 +2077,12 @@ func (e *StrategyEngine) appendVolumeAuxForCZSC(sb *strings.Builder, data *marke
 	}
 }
 
+// AIPayload AI 数据载荷结构
+type AIPayload struct {
+	MacroTrend ta.MacroTrend         `json:"macro_trend"` // Go端计算的大级别趋势
+	CZSCData  map[string]interface{} `json:"czsc_data"`  // Python端返回的小级别缠论与MACD数据
+}
+
 func (e *StrategyEngine) formatMarketData(data *market.Data, czscLabels *CZSCLabels) string {
 	var sb strings.Builder
 	indicators := e.config.Indicators
@@ -1983,18 +2091,21 @@ func (e *StrategyEngine) formatMarketData(data *market.Data, czscLabels *CZSCLab
 	sb.WriteString(fmt.Sprintf("=== %s Market Data ===\n\n", data.Symbol))
 	sb.WriteString(fmt.Sprintf("current_price = %.4f", data.CurrentPrice))
 
+	// 尝试计算宏观趋势（如果有多周期数据）
+	e.appendMacroTrend(&sb, data)
+
 	// 缠论开关开启且本币有标签：以标签为主，并保留核心量能指标（VolMult、OBV）辅助背驰/回抽确认
 	if indicators.EnableCZSC && czscLabels != nil {
 		sb.WriteString("\n\n")
-		sb.WriteString("## CZSC 缠论标签（笔 / 线段 / 中枢 / 1/2/3类买卖点）\n\n")
+		sb.WriteString("## CZSC 缠论数据（笔 / 笔中枢 / MACD动力学）\n\n")
 		jsonBytes, _ := json.MarshalIndent(czscLabels, "", "  ")
 		sb.WriteString("```json\n")
 		sb.Write(jsonBytes)
 		sb.WriteString("\n```\n\n")
-		sb.WriteString("**请主要依据以上缠论标签执行浪浪交易法，直接对笔、线段、中枢与买卖点做出反应，无需从原始K线自行推断结构。**\n\n")
+		sb.WriteString("**以上为客观数据，请依据笔结构、笔中枢支撑/压力位、MACD零轴位置与背驰信号，自主判断交易方向。**\n\n")
 		// 量价不完全分家：保留 VolMult / OBV 等量能指标，供 AI 确认回抽是否有资金承接
 		e.appendVolumeAuxForCZSC(&sb, data, indicators)
-		return sb.String()
+		// 继续添加 POC、爆仓、Depth 数据（不 return）
 	}
 	// 使用 DynamicIndicators 透传用户配置的指标（如 EMA200、RSI14）给 AI
 	if len(data.DynamicIndicators) > 0 {
@@ -2169,9 +2280,24 @@ func (e *StrategyEngine) formatMarketData(data *market.Data, czscLabels *CZSCLab
 		}
 	}
 
+	// 辅助周期：仅发送指标趋势判断，不发送K线数据
+	auxTf := indicators.Klines.AuxiliaryTimeframe
+	if auxTf != "" && len(data.TimeframeData) > 0 {
+		if tfData, ok := data.TimeframeData[auxTf]; ok {
+			sb.WriteString(fmt.Sprintf("## 辅助周期 %s 指标趋势（仅作参考，不含K线数据）\n\n", strings.ToUpper(auxTf)))
+			e.formatAuxiliaryTimeframeIndicators(&sb, tfData, indicators)
+		}
+	}
+
 	if len(data.TimeframeData) > 0 {
 		timeframeOrder := []string{"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"}
+		// 辅助周期不发送完整K线数据（已在上面单独处理）
+		skipAuxTf := auxTf != ""
 		for _, tf := range timeframeOrder {
+			// 跳过辅助周期（已用简化格式单独处理）
+			if skipAuxTf && tf == auxTf {
+				continue
+			}
 			if tfData, ok := data.TimeframeData[tf]; ok {
 				sb.WriteString(fmt.Sprintf("=== %s Timeframe (oldest → latest) ===\n\n", strings.ToUpper(tf)))
 				e.formatTimeframeSeriesData(&sb, tfData, indicators)
@@ -2857,4 +2983,132 @@ func detectLanguage(text string) Language {
 		}
 	}
 	return LangEnglish
+}
+
+// formatAuxiliaryTimeframeIndicators 为辅助周期生成指标趋势（不含K线数据）
+// 只输出用户勾选的指标的当前状态/趋势，用于减少上下文长度
+func (e *StrategyEngine) formatAuxiliaryTimeframeIndicators(sb *strings.Builder, tfData *market.TimeframeSeriesData, indicators store.IndicatorConfig) {
+	if tfData == nil {
+		return
+	}
+
+	// 只输出用户勾选的指标，不输出K线数据
+	hasIndicator := false
+
+	// EMA 趋势 - 使用 EMA20Values 或 EMA50Values
+	if indicators.EnableEMA && (len(tfData.EMA20Values) > 0 || len(tfData.EMA50Values) > 0) {
+		ema := tfData.EMA20Values
+		if len(ema) == 0 {
+			ema = tfData.EMA50Values
+		}
+		if len(ema) > 0 {
+			emaTrend := "震荡"
+			if len(ema) >= 2 {
+				if ema[len(ema)-1] > ema[len(ema)-2]*1.001 {
+					emaTrend = "上升"
+				} else if ema[len(ema)-1] < ema[len(ema)-2]*0.999 {
+					emaTrend = "下降"
+				}
+			}
+			sb.WriteString(fmt.Sprintf("- EMA: 当前 %.4f，趋势 %s\n", ema[len(ema)-1], emaTrend))
+			hasIndicator = true
+		}
+	}
+
+	// RSI - 使用 RSI7Values 或 RSI14Values
+	if indicators.EnableRSI && (len(tfData.RSI7Values) > 0 || len(tfData.RSI14Values) > 0) {
+		rsi := tfData.RSI14Values
+		if len(rsi) == 0 {
+			rsi = tfData.RSI7Values
+		}
+		if len(rsi) > 0 {
+			lastRsi := rsi[len(rsi)-1]
+			rsiZone := "中性"
+			if lastRsi > 70 {
+				rsiZone = "超买"
+			} else if lastRsi < 30 {
+				rsiZone = "超卖"
+			}
+			sb.WriteString(fmt.Sprintf("- RSI: 当前 %.1f (%s)\n", lastRsi, rsiZone))
+			hasIndicator = true
+		}
+	}
+
+	// MACD
+	if indicators.EnableMACD && len(tfData.MACDValues) > 0 {
+		macd := tfData.MACDValues[len(tfData.MACDValues)-1]
+		macdTrend := "震荡"
+		if len(tfData.MACDValues) >= 2 {
+			prevMacd := tfData.MACDValues[len(tfData.MACDValues)-2]
+			if macd > prevMacd*1.01 {
+				macdTrend = "金叉/多头"
+			} else if macd < prevMacd*0.99 {
+				macdTrend = "死叉/空头"
+			}
+		}
+		sb.WriteString(fmt.Sprintf("- MACD: 当前 %.4f，状态 %s\n", macd, macdTrend))
+		hasIndicator = true
+	}
+
+	// ATR - 使用 ATR14
+	if indicators.EnableATR && tfData.ATR14 > 0 {
+		sb.WriteString(fmt.Sprintf("- ATR: %.4f\n", tfData.ATR14))
+		hasIndicator = true
+	}
+
+	// BOLL - 使用 BOLLUpper, BOLLMiddle, BOLLLower
+	if indicators.EnableBOLL && len(tfData.BOLLUpper) > 0 {
+		upper := tfData.BOLLUpper[len(tfData.BOLLUpper)-1]
+		middle := tfData.BOLLMiddle[len(tfData.BOLLMiddle)-1]
+		lower := tfData.BOLLLower[len(tfData.BOLLLower)-1]
+		// 获取当前价格
+		var currentPrice float64
+		if len(tfData.Klines) > 0 {
+			currentPrice = tfData.Klines[len(tfData.Klines)-1].Close
+		}
+		pos := "中轨"
+		if currentPrice > upper {
+			pos = "上轨外(超买)"
+		} else if currentPrice < lower {
+			pos = "下轨外(超卖)"
+		} else if currentPrice > middle {
+			pos = "中上轨之间"
+		} else {
+			pos = "中下轨之间"
+		}
+		sb.WriteString(fmt.Sprintf("- BOLL: 价格在 %s\n", pos))
+		hasIndicator = true
+	}
+
+	// 成交量变化 - 使用 Volume
+	if indicators.EnableVolume && len(tfData.Volume) > 0 {
+		vol := tfData.Volume
+		volTrend := "持平"
+		if len(vol) >= 2 {
+			avgVol := 0.0
+			count := 0
+			for i := len(vol) - 5; i < len(vol)-1; i++ {
+				if i >= 0 {
+					avgVol += vol[i]
+					count++
+				}
+			}
+			if count > 0 {
+				avgVol /= float64(count)
+			}
+			lastVol := vol[len(vol)-1]
+			if avgVol > 0 && lastVol > avgVol*1.5 {
+				volTrend = "放量"
+			} else if avgVol > 0 && lastVol < avgVol*0.5 {
+				volTrend = "缩量"
+			}
+		}
+		sb.WriteString(fmt.Sprintf("- 成交量: %s\n", volTrend))
+		hasIndicator = true
+	}
+
+	if !hasIndicator {
+		sb.WriteString("（未勾选任何技术指标）\n")
+	}
+	sb.WriteString("\n")
 }

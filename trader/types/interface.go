@@ -26,7 +26,8 @@ type ClosedPnLRecord struct {
 // TradeRecord represents a single trade/fill from exchange
 // Used for reconstructing position history with unified algorithm
 type TradeRecord struct {
-	TradeID      string    // Unique trade ID from exchange
+	TradeID      string    // Unique trade ID from exchange (成交ID)
+	OrderID      string    // Original order ID (订单ID，用于关联原始下单的TraderID)
 	Symbol       string    // Trading pair (e.g., "BTCUSDT")
 	Side         string    // "BUY" or "SELL"
 	PositionSide string    // "LONG", "SHORT", or "BOTH" (for one-way mode)

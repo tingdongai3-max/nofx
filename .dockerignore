@@ -7,6 +7,7 @@
 Dockerfile
 docker-compose.yml
 .dockerignore
+docker/
 
 # IDE
 .idea
@@ -25,7 +26,7 @@ nofx_test
 
 # Test files
 *_test.go
-test_*
+test_
 
 # Documentation
 *.md
@@ -35,11 +36,12 @@ docs/
 # Runtime data
 decision_logs/
 *.log
+data/
 
 # Config files (should be mounted)
 config.json
 
-# Web build artifacts (but include source for multi-stage build)
+# Web build artifacts
 web/node_modules/
 web/dist/
 
@@ -47,3 +49,27 @@ web/dist/
 tmp/
 temp/
 *.tmp
+
+# ==================== 大文件/目录排除（关键）====================
+# Go 模块缓存 - 这个目录非常大！
+# 注意：已移除 pkg/ 排除（改用 ta/ 目录）
+
+# Vendor 目录（如果使用 Go vendor）
+# vendor/
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+
+# 压缩包文件
+*.tar.gz
+*.zip
+*.tar.bz2
+
+# 迁移文件
+migration/
+migrations/
+
+# 缠论相关大文件
+czsc_cache/

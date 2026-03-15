@@ -1,65 +1,40 @@
 # docker/backend/Dockerfile
 
 # ═══════════════════════════════════════════════════════════════
-# NOFX Backend Dockerfile (Go + TA-Lib)
-# Multi-stage build with shared TA-Lib compilation stage
-# Versions extracted as ARGs for maintainability
+# NOFX Backend Dockerfile - Pure Go (无 CGO 依赖)
 # ═══════════════════════════════════════════════════════════════
 
 ARG GO_VERSION=1.25-alpine
-ARG ALPINE_VERSION=latest
-ARG TA_LIB_VERSION=0.4.0
+ARG ALPINE_VERSION=3.19
 
 # ──────────────────────────────────────────────────────────────
-# TA-Lib Build Stage (shared across builds)
-# ──────────────────────────────────────────────────────────────
-FROM alpine:${ALPINE_VERSION} AS ta-lib-builder
-ARG TA_LIB_VERSION
-
-RUN apk update && apk add --no-cache \
-    wget tar make gcc g++ musl-dev autoconf automake
-
-RUN wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-${TA_LIB_VERSION}-src.tar.gz && \
-    tar -xzf ta-lib-${TA_LIB_VERSION}-src.tar.gz && \
-    cd ta-lib && \
-    if [ "$(uname -m)" = "aarch64" ]; then \
-        CONFIG_GUESS=$(find /usr/share -name config.guess | head -1) && \
-        CONFIG_SUB=$(find /usr/share -name config.sub | head -1) && \
-        cp "$CONFIG_GUESS" config.guess && \
-        cp "$CONFIG_SUB" config.sub && \
-        chmod +x config.guess config.sub; \
-    fi && \
-    ./configure --prefix=/usr/local && \
-    make && make install && \
-    cd .. && rm -rf ta-lib ta-lib-${TA_LIB_VERSION}-src.tar.gz
-
-# ──────────────────────────────────────────────────────────────
-# Backend Build Stage (Go Application)
+# Stage 1: Backend Build (Pure Go)
 # ──────────────────────────────────────────────────────────────
 FROM golang:${GO_VERSION} AS backend-builder
 
-RUN apk update && apk add --no-cache git make gcc g++ musl-dev
-
-COPY --from=ta-lib-builder /usr/local /usr/local
+RUN apk update && apk add --no-cache git make
 
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=1 GOOS=linux \
-    CGO_CFLAGS="-D_LARGEFILE64_SOURCE" \
-    go build -trimpath -ldflags="-s -w" -o nofx .
+
+# Pure Go 构建 - 无 CGO
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o nofx .
 
 # ──────────────────────────────────────────────────────────────
-# Runtime Stage (Minimal Executable Environment)
+# Stage 2: Runtime (最小化镜像)
 # ──────────────────────────────────────────────────────────────
 FROM alpine:${ALPINE_VERSION}
 
-RUN apk update && apk add --no-cache ca-certificates tzdata sqlite
+RUN apk update && apk add --no-cache --virtual=.build-deps \
+    ca-certificates tzdata sqlite && \
+    apk del .build-deps
 
-COPY --from=ta-lib-builder /usr/local /usr/local
 WORKDIR /app
+
+# 复制二进制文件
 COPY --from=backend-builder /app/nofx .
 
 EXPOSE 8080

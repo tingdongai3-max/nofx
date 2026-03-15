@@ -1588,6 +1588,7 @@ func (t *FuturesTrader) GetTradesForSymbol(symbol string, startTime time.Time, l
 
 		trade := types.TradeRecord{
 			TradeID:      strconv.FormatInt(at.ID, 10),
+			OrderID:      strconv.FormatInt(at.OrderID, 10),
 			Symbol:       at.Symbol,
 			Side:         string(at.Side),
 			PositionSide: string(at.PositionSide),
@@ -1635,6 +1636,7 @@ func (t *FuturesTrader) GetTradesForSymbolFromID(symbol string, fromID int64, li
 
 		trade := types.TradeRecord{
 			TradeID:      strconv.FormatInt(at.ID, 10),
+			OrderID:      strconv.FormatInt(at.OrderID, 10),
 			Symbol:       at.Symbol,
 			Side:         string(at.Side),
 			PositionSide: string(at.PositionSide),

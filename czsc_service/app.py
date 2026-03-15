@@ -1,23 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-NoFx CZSC 缠论中间件：接收 K 线 JSON，返回笔/线段/中枢/买卖点标签，供 NoFx 注入 AI Prompt。
-支持热加载：同 symbol+timeframe 连续 K 线用 update 模式，减少重复 init。
+NoFx CZSC 缠论数据中间件（Data Provider）
+仅提供客观数据提取，不包含任何主观交易决策。
+所有决策由下游 LLM Prompt 处理。
+
+输出字段：
+- bi: 笔序列
+- zs: 笔中枢
+- macd_signals: MACD 动力学数据
+
 启动: uvicorn app:app --host 0.0.0.0 --port 8765 --workers 4
 """
 from __future__ import annotations
 
-import threading
 from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="NoFx CZSC", version="0.1.0")
-
-# 热加载：按 (symbol, timeframe) 缓存 CZSC 实例与最后一条 K 线信息，连续请求用 update 而非全量 init
-_czsc_cache: dict[tuple[str, str], dict[str, Any]] = {}
-_czsc_cache_lock = threading.Lock()
+app = FastAPI(title="NoFx CZSC Data Provider", version="0.3.0-data-only")
 
 
 class KlineBar(BaseModel):
@@ -35,149 +37,262 @@ class AnalyzeRequest(BaseModel):
     klines: list[KlineBar]
 
 
-# 与 NoFx kernel.CZSCLabels 对齐的响应结构
 def empty_labels(timeframe: str) -> dict[str, Any]:
     return {
         "bi": [],
-        "xd": [],
         "zs": [],
-        "buy_sell_points": [],
+        "macd_signals": {},
         "timeframe": timeframe,
     }
 
 
-def _klines_to_bars(symbol: str, timeframe: str, klines: list[dict]) -> tuple[list, Any]:
-    from czsc.objects import RawBar
-    from czsc.analyze import CZSC
-    from czsc.enum import Freq
-
-    freq_map = {"1m": Freq.F1, "3m": Freq.F3, "5m": Freq.F5, "15m": Freq.F15, "30m": Freq.F30,
-                "1h": Freq.F60, "2h": Freq.F120, "4h": Freq.F240, "1d": Freq.D}
-    freq = freq_map.get(timeframe.lower(), Freq.F5)
-    bars: list[RawBar] = []
-    for i, k in enumerate(klines):
-        # Go 侧传入的是毫秒时间戳，这里按本地时区转换为 datetime，避免时区导致的序列错位
-        dt = datetime.fromtimestamp(k["time"] / 1000.0)
-        bar = RawBar(
-            symbol=symbol,
-            id=i,
-            freq=freq,
-            dt=dt,
-            open=float(k["open"]),
-            close=float(k["close"]),
-            high=float(k["high"]),
-            low=float(k["low"]),
-            vol=float(k.get("volume", 0)),
-            amount=0,
-        )
-        bars.append(bar)
-    return bars, freq
-
-
-def _czsc_to_output(c, timeframe: str) -> dict[str, Any]:
-    out = empty_labels(timeframe)
-    try:
-        # 调试：看 CZSC 实际识别出了多少笔
-        print(f"DEBUG: CZSC bi_list length = {len(getattr(c, 'bi_list', []))}")
-    except Exception:
-        pass
-    for bi in c.bi_list:
-        start_dt = bi.fx_a.elements[0].dt
-        end_dt = bi.fx_b.elements[-1].dt
-        direction = "up" if str(bi.direction).lower().startswith("up") else "down"
-        out["bi"].append({
-            "start_time": int(start_dt.timestamp() * 1000),
-            "end_time": int(end_dt.timestamp() * 1000),
-            "high": bi.high,
-            "low": bi.low,
-            "direction": direction,
-        })
-    return out
+def _get_freq(timeframe: str):
+    """将 timeframe 字符串映射为 czsc 的 Freq 枚举"""
+    from czsc import Freq
+    freq_map = {
+        "1m": Freq.F1,
+        "3m": Freq.F3,
+        "5m": Freq.F5,
+        "15m": Freq.F15,
+        "30m": Freq.F30,
+        "1h": Freq.F60,
+        "2h": Freq.F120,
+        "4h": Freq.F240,
+        "1d": Freq.D,
+    }
+    return freq_map.get(timeframe.lower(), Freq.F60)
 
 
 def run_czsc_analyze(symbol: str, timeframe: str, klines: list[dict]) -> dict[str, Any]:
-    """使用 czsc 库进行缠论分析；解析 K 线时做强制类型转换并显式打印调试信息。"""
+    """使用 czsc 进行客观数据提取"""
     try:
-        from czsc.objects import RawBar
-        from czsc.analyze import CZSC
-        from czsc.enum import Freq
+        from czsc import CZSC, RawBar
     except ImportError:
         return empty_labels(timeframe)
 
     try:
-        # 强制类型转换，确保所有数值字段为 float，时间为 datetime，freq 为有效周期，id 唯一递增
+        freq = _get_freq(timeframe)
+
+        # 构建 K 线数据
         bars: list[RawBar] = []
         for i, k in enumerate(klines):
-            open_price = float(k["open"])
-            high_price = float(k["high"])
-            low_price = float(k["low"])
-            close_price = float(k["close"])
-            vol = float(k.get("volume", 0) or 0.0)
             rb = RawBar(
                 symbol=symbol,
-                id=i,  # 唯一自增 ID
+                id=i,
                 dt=datetime.fromtimestamp(float(k["time"]) / 1000.0),
-                open=open_price,
-                high=high_price,
-                low=low_price,
-                close=close_price,
-                vol=vol,
-                freq=Freq.F60,  # 当前约定按 1h 级别分析，必须提供有效 freq
-                amount=vol * close_price,  # 简单成交额估算：vol * close
+                open=float(k["open"]),
+                high=float(k["high"]),
+                low=float(k["low"]),
+                close=float(k["close"]),
+                vol=float(k.get("volume", 0) or 0.0),
+                freq=freq,
+                amount=float(k.get("volume", 0) or 0) * float(k["close"]),
             )
             bars.append(rb)
 
-        if len(bars) < 50:
-            print(f"DEBUG: {symbol} bars too few ({len(bars)}), skipping analysis.")
+        if len(bars) < 30:
             return empty_labels(timeframe)
 
-        # 初始化分析器
+        # 初始化 CZSC
         c = CZSC(bars)
 
-        # 显式打印笔的数量，方便确认 CZSC 是否正常工作
-        bi_len = len(c.bi_list) if getattr(c, "bi_list", None) else 0
-        print(f"DEBUG: {symbol} analysis done. bi_list length = {bi_len}")
-
-        # 复用统一输出结构，将笔写入 JSON
         out = empty_labels(timeframe)
-        for bi in getattr(c, "bi_list", []):
-            start_dt = bi.fx_a.elements[0].dt
-            end_dt = bi.fx_b.elements[-1].dt
-            direction = "up" if str(bi.direction).lower().startswith("up") else "down"
+
+        # ========== 1. 笔 (bi) ==========
+        for bi in c.bi_list:
             out["bi"].append({
-                "start_time": int(start_dt.timestamp() * 1000),
-                "end_time": int(end_dt.timestamp() * 1000),
-                "high": bi.high,
-                "low": bi.low,
+                "start_time": int(bi.sdt.timestamp() * 1000),
+                "end_time": int(bi.edt.timestamp() * 1000),
+                "high": float(bi.high),
+                "low": float(bi.low),
+                "direction": "up" if "向上" in str(bi.direction) else "down",
+            })
+
+        # ========== 2. 笔中枢 (zs) - 使用 czsc 库的 ZS 类 ==========
+        try:
+            from czsc import ZS
+            zs_objs = []
+            for i in range(len(c.bi_list) - 2):
+                bis = c.bi_list[i:i+3]
+                zs = ZS(bis)
+                if zs.is_valid():
+                    zs_objs.append(zs)
+
+            for zs in zs_objs:
+                out["zs"].append({
+                    "start_time": int(zs.sdt.timestamp() * 1000),
+                    "end_time": int(zs.edt.timestamp() * 1000),
+                    "zg": float(zs.zg),
+                    "zd": float(zs.zd),
+                    "gg": float(zs.gg),
+                    "dd": float(zs.dd),
+                    "direction": "up" if "上" in str(zs.sdir) else "down",
+                })
+        except ImportError:
+            # 如果导入失败，使用备用方法
+            zs_list = _build_zones_from_bis(c.bi_list)
+            for zs in zs_list:
+                out["zs"].append({
+                    "start_time": int(zs["start_time"]),
+                    "end_time": int(zs["end_time"]),
+                    "zg": float(zs["zg"]),
+                    "zd": float(zs["zd"]),
+                    "direction": zs["direction"],
+                })
+
+        # ========== 3. MACD 动力学数据 ==========
+        out["macd_signals"] = _analyze_macd(bars)
+
+        return out
+
+    except Exception as e:
+        print(f"CRITICAL ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return empty_labels(timeframe)
+
+
+def _build_zones_from_bis(bi_list: list) -> list:
+    """从笔序列构建笔中枢
+
+    笔中枢：连续三笔有重叠区域
+    """
+    if not bi_list or len(bi_list) < 3:
+        return []
+
+    def has_overlap(b1, b2, b3) -> bool:
+        high_min = min(b1.high, b2.high, b3.high)
+        low_max = max(b1.low, b2.low, b3.low)
+        return high_min > low_max
+
+    zones = []
+    n = len(bi_list)
+
+    for i in range(n - 2):
+        b1, b2, b3 = bi_list[i], bi_list[i+1], bi_list[i+2]
+
+        if has_overlap(b1, b2, b3):
+            high_min = min(b1.high, b2.high, b3.high)
+            low_max = max(b1.low, b2.low, b3.low)
+
+            direction = "up" if "向上" in str(b1.direction) else "down"
+
+            zones.append({
+                "start_time": int(b1.sdt.timestamp() * 1000),
+                "end_time": int(b3.edt.timestamp() * 1000),
+                "high": high_min,
+                "low": low_max,
+                "zg": high_min,
+                "zd": low_max,
                 "direction": direction,
             })
-        return out
+
+    # 合并重叠的中枢
+    if not zones:
+        return []
+
+    merged = [zones[0]]
+    for z in zones[1:]:
+        last = merged[-1]
+        if z["low"] <= last["high"] and z["high"] >= last["low"]:
+            merged[-1] = {
+                "start_time": min(last["start_time"], z["start_time"]),
+                "end_time": max(last["end_time"], z["end_time"]),
+                "high": max(last["high"], z["high"]),
+                "low": min(last["low"], z["low"]),
+                "zg": max(last["zg"], z["zg"]),
+                "zd": min(last["zd"], z["zd"]),
+                "direction": last["direction"],
+            }
+        else:
+            merged.append(z)
+
+    return merged
+
+
+def _analyze_macd(bars: list, di: int = 1, n: int = 20) -> dict:
+    """MACD 动力学数据提取
+
+    直接计算 MACD 指标值，不依赖 czsc 信号生成 API（兼容新版本）。
+    返回客观物理数值，不包含任何主观判断。
+    """
+    try:
+        import pandas as pd
+
+        if len(bars) < 30:
+            return {"bc_signals": [], "error": f"数据不足({len(bars)}根)"}
+
+        # 提取收盘价
+        closes = [bar.close for bar in bars]
+        if not closes:
+            return {"bc_signals": [], "error": "无收盘价数据"}
+
+        # 计算 EMA
+        series = pd.Series(closes)
+        ema_fast = series.ewm(span=12, adjust=False).mean()
+        ema_slow = series.ewm(span=26, adjust=False).mean()
+        diff = ema_fast - ema_slow
+        dea = diff.ewm(span=9, adjust=False).mean()
+        histogram = (diff - dea) * 2
+
+        result = {
+            "bc_signals": [],
+            "histogram": float(histogram.iloc[-1]) if len(histogram) > 0 else 0.0,
+            "diff": float(diff.iloc[-1]) if len(diff) > 0 else 0.0,
+            "dea": float(dea.iloc[-1]) if len(dea) > 0 else 0.0,
+            "zero_cross": None,
+        }
+
+        # 零轴位置（客观物理状态）
+        last_diff = result["diff"]
+        if abs(last_diff) < 0.5:
+            result["zero_cross"] = "near_zero"
+        elif last_diff > 0:
+            result["zero_cross"] = "above_zero"
+        else:
+            result["zero_cross"] = "below_zero"
+
+        # 检测背驰：比较最近价格创新高/新低与 MACD 创新高/新低
+        if len(closes) >= 20 and len(diff) >= 20:
+            recent_closes = closes[-20:]
+            recent_diffs = diff.values[-20:]
+
+            # 检查最近价格是否创新高但 MACD 没有创新高（顶背驰）
+            price_high = max(recent_closes)
+            diff_high = max(recent_diffs)
+
+            # 检查最近价格是否创新低但 MACD 没有创新低（底背驰）
+            price_low = min(recent_closes)
+            diff_low = min(recent_diffs)
+
+            # 简单背驰判断
+            if recent_closes[-1] >= price_high * 0.98 and recent_diffs[-1] < diff_high * 0.8:
+                result["bc_signals"].append({
+                    "signal": "顶背驰",
+                    "time": int(bars[-1].dt.timestamp() * 1000),
+                })
+            elif recent_closes[-1] <= price_low * 1.02 and recent_diffs[-1] > diff_low * 1.2:
+                result["bc_signals"].append({
+                    "signal": "底背驰",
+                    "time": int(bars[-1].dt.timestamp() * 1000),
+                })
+
+        print(f"DEBUG MACD: diff={result['diff']:.6f}, dea={result['dea']:.6f}, histogram={result['histogram']:.6f}")
+        return result
+
     except Exception as e:
-        # 任何错误都打印出来，避免“静默失败 + 空结果”
-        print(f"CRITICAL ERROR during analysis for {symbol}: {str(e)}")
-        try:
-            import traceback
-            traceback.print_exc()
-        except Exception:
-            pass
-        return empty_labels(timeframe)
+        import traceback
+        traceback.print_exc()
+        return {"bc_signals": [], "error": str(e)}
 
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest) -> dict[str, Any]:
-    # Debug: 检查 Go 侧发送的 K 线数量与字段形态
-    try:
-        print(f"DEBUG: Symbol {req.symbol} sent {len(req.klines)} bars.")
-        if req.klines:
-            first = req.klines[0]
-            first_dict = first.model_dump()
-            print(f"DEBUG: First bar keys: {list(first_dict.keys())}")
-            print(f"DEBUG: First bar time: {first_dict.get('time')}")
-    except Exception as debug_err:
-        print(f"DEBUG: analyze inspect error: {debug_err}")
+    print(f"DEBUG: {req.symbol} {req.timeframe} {len(req.klines)} bars")
 
     if len(req.klines) < 20:
         raise HTTPException(status_code=400, detail="Need at least 20 klines")
+
     klist = [k.model_dump() for k in req.klines]
     try:
         return run_czsc_analyze(req.symbol, req.timeframe, klist)
@@ -187,16 +302,17 @@ def analyze(req: AnalyzeRequest) -> dict[str, Any]:
 
 @app.on_event("startup")
 def warmup_czsc() -> None:
-    """预热：首次初始化 CZSC 会加载配置/策略，用 dummy 数据跑一遍避免首请求慢."""
     try:
-        from czsc.analyze import CZSC
-        from czsc.objects import RawBar
-        from czsc.enum import Freq
+        from czsc import CZSC, RawBar, Freq
         base = datetime.utcnow().replace(second=0, microsecond=0)
         bars = []
-        for i in range(30):
+        for i in range(50):
             dt = base + timedelta(minutes=i * 5)
-            bars.append(RawBar(symbol="WARMUP", id=i, freq=Freq.F5, dt=dt, open=100.0, close=100.0, high=100.0, low=100.0, vol=0.0, amount=0))
+            bars.append(RawBar(
+                symbol="WARMUP", id=i, freq=Freq.F5, dt=dt,
+                open=100.0, close=100.0, high=100.0, low=100.0,
+                vol=0.0, amount=0
+            ))
         CZSC(bars)
     except Exception:
         pass
@@ -204,4 +320,4 @@ def warmup_czsc() -> None:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "service": "nofx-czsc"}
+    return {"status": "ok", "service": "nofx-czsc-v0.3-data-only"}

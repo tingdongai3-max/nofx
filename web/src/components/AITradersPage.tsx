@@ -14,6 +14,8 @@ import { useAuth } from '../contexts/AuthContext'
 import { getExchangeIcon } from './ExchangeIcons'
 import { getModelIcon } from './ModelIcons'
 import { TraderConfigModal } from './TraderConfigModal'
+import { TraderAdminList } from './TraderAdminList'
+import { TraderAdminAnalysisView } from './TraderAdminAnalysis'
 import { DeepVoidBackground } from './DeepVoidBackground'
 import { ExchangeConfigModal } from './traders/ExchangeConfigModal'
 import { PunkAvatar, getTraderAvatar } from './PunkAvatar'
@@ -31,6 +33,7 @@ import {
   ExternalLink,
   Copy,
   Check,
+  X,
 } from 'lucide-react'
 import { confirmToast } from '../lib/notify'
 import { toast } from 'sonner'
@@ -164,6 +167,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const [visibleTraderAddresses, setVisibleTraderAddresses] = useState<Set<string>>(new Set())
   const [visibleExchangeAddresses, setVisibleExchangeAddresses] = useState<Set<string>>(new Set())
   const [copiedId, setCopiedId] = useState<string | null>(null)
+  const [showAdminList, setShowAdminList] = useState(false)
+  const [viewingAdminId, setViewingAdminId] = useState<string | null>(null)
 
   // Toggle wallet address visibility for a trader
   const toggleTraderAddressVisibility = (traderId: string) => {
@@ -835,7 +840,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
             </div>
           </div>
 
-          <div className="flex gap-2 w-full md:w-auto overflow-x-auto pb-1 md:pb-0 hide-scrollbar">
+          <div className="flex flex-wrap gap-2 w-full md:w-auto">
             <button
               onClick={handleAddModel}
               className="px-4 py-2 rounded text-xs font-mono uppercase tracking-wider transition-all border border-zinc-700 bg-black/20 text-zinc-400 hover:text-white hover:border-zinc-500 whitespace-nowrap backdrop-blur-sm"
@@ -866,6 +871,16 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                 {t('createTrader', language)}
               </span>
               <div className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>
+            </button>
+
+            <button
+              onClick={() => setShowAdminList(true)}
+              className="px-4 py-2 rounded text-xs font-bold font-mono uppercase tracking-wider transition-all whitespace-nowrap overflow-hidden bg-purple-600 text-white hover:bg-purple-500"
+            >
+              <span className="flex items-center gap-2">
+                <Bot className="w-4 h-4" />
+                {t('createAdmin', language) || 'Admin'}
+              </span>
             </button>
           </div>
         </div>
@@ -1395,6 +1410,47 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
               setEditingExchange(null)
             }}
             language={language}
+          />
+        )}
+
+        {/* Trader Admin List Modal */}
+        {showAdminList && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center">
+            <div
+              className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+              onClick={() => setShowAdminList(false)}
+            />
+            <div className="relative w-full max-w-4xl mx-4 bg-[#1E2329] rounded-lg border border-white/10 shadow-2xl max-h-[80vh] overflow-hidden">
+              <div className="flex items-center justify-between px-6 py-4 border-b border-white/10 bg-black/20">
+                <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                  <Bot className="w-5 h-5 text-purple-400" />
+                  {t('traderAdmins', language) || 'Trader Administrators'}
+                </h2>
+                <button
+                  onClick={() => setShowAdminList(false)}
+                  className="p-1 rounded hover:bg-white/10 transition-colors"
+                >
+                  <X className="w-5 h-5 text-zinc-400" />
+                </button>
+              </div>
+              <div className="p-6 overflow-y-auto max-h-[calc(80vh-80px)]">
+                <TraderAdminList
+                  availableModels={enabledModels}
+                  onViewAnalysis={(adminId) => {
+                    setViewingAdminId(adminId)
+                    setShowAdminList(false)
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Trader Admin Analysis View */}
+        {viewingAdminId && (
+          <TraderAdminAnalysisView
+            adminId={viewingAdminId}
+            onClose={() => setViewingAdminId(null)}
           />
         )}
       </div>

@@ -219,6 +219,11 @@ type KlineConfig struct {
 	SelectedTimeframes   []string       `json:"selected_timeframes,omitempty"`
 	// 各周期 K 线数量（如 {"1m": 200, "15m": 50, "1d": 10}），未设置的周期使用默认梯队
 	TimeframeCounts map[string]int `json:"timeframe_counts,omitempty"`
+	// CZSC 专用：分析缠论数据时需要的 K 线数量（默认 300，确保 MACD 预热 + 中枢构成）
+	CZSCKlineCount int `json:"czsc_kline_count,omitempty"`
+
+	// 辅助周期：仅发送指标趋势判断，不发送K线数据，用于减少上下文长度
+	AuxiliaryTimeframe string `json:"auxiliary_timeframe,omitempty"` // 辅助周期，如 "15m", "1h"
 }
 
 // ExternalDataSource external data source configuration
@@ -354,7 +359,7 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 			EnableATRTrailing:       false,
 			EnableStagedTakeProfit:  true,
 			EnableCZSC:              false,
-			CZSCServiceURL:          "http://127.0.0.1:8765",
+			CZSCServiceURL:          "http://czsc_service:8765",
 			BIASPeriods:             []int{6, 12, 24},
 		},
 		RiskControl: RiskControlConfig{

@@ -29,6 +29,8 @@ type Store struct {
 	equity   *EquityStore
 	order    *OrderStore
 	grid     *GridStore
+	traderAdmin         *TraderAdminStore
+	traderAdminAnalysis *TraderAdminAnalysisStore
 
 	mu sync.RWMutex
 }
@@ -159,6 +161,12 @@ func (s *Store) initTables() error {
 	}
 	if err := s.Grid().InitTables(); err != nil {
 		return fmt.Errorf("failed to initialize grid tables: %w", err)
+	}
+	if err := s.TraderAdmin().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize trader admin tables: %w", err)
+	}
+	if err := s.TraderAdminAnalysis().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize trader admin analysis tables: %w", err)
 	}
 	return nil
 }
@@ -291,6 +299,26 @@ func (s *Store) Grid() *GridStore {
 		s.grid = NewGridStore(s.gdb)
 	}
 	return s.grid
+}
+
+// TraderAdmin gets trader admin storage
+func (s *Store) TraderAdmin() *TraderAdminStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.traderAdmin == nil {
+		s.traderAdmin = NewTraderAdminStore(s.gdb)
+	}
+	return s.traderAdmin
+}
+
+// TraderAdminAnalysis gets trader admin analysis storage
+func (s *Store) TraderAdminAnalysis() *TraderAdminAnalysisStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.traderAdminAnalysis == nil {
+		s.traderAdminAnalysis = NewTraderAdminAnalysisStore(s.gdb)
+	}
+	return s.traderAdminAnalysis
 }
 
 // Close closes database connection

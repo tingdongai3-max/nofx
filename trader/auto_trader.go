@@ -489,7 +489,8 @@ func (at *AutoTrader) Run() error {
 	}
 
 	// Start Binance order sync and cache self-healing if using Binance exchange
-	if at.exchange == "binance" {
+	// 强制隔离：模拟盘(IsDryRun=true)禁止启动实盘订单同步
+	if at.exchange == "binance" && !at.config.IsDryRun {
 		if binanceTrader, ok := at.trader.(*binance.FuturesTrader); ok {
 			if at.store != nil {
 				binanceTrader.StartOrderSync(at.id, at.exchangeID, at.exchange, at.store, 30*time.Second)
@@ -513,6 +514,8 @@ func (at *AutoTrader) Run() error {
 			}()
 			logger.Infof("🔄 [%s] Cache self-healing enabled (every 5 min REST reconciliation)", at.name)
 		}
+	} else if at.exchange == "binance" && at.config.IsDryRun {
+		logger.Infof("🔄 [%s] Skipping Binance order sync (dry run mode)", at.name)
 	}
 
 	// Start Gate order sync if using Gate exchange
@@ -991,7 +994,8 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 	}
 
 	if at.store != nil {
-		tradesWithReasoning, _ := at.store.Position().GetRecentTradesWithReasoningBySource(at.id, 10, "dry_run")
+		// 获取所有交易（实盘 sync + 模拟盘 dry_run）
+		tradesWithReasoning, _ := at.store.Position().GetRecentTradesWithReasoning(at.id, 10)
 		for _, tr := range tradesWithReasoning {
 			trade := tr.RecentTrade
 			entryTimeStr := ""
@@ -1135,13 +1139,19 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 			if dbPos, err := at.store.Position().GetOpenPositionBySymbol(at.id, symbol, side); err == nil && dbPos != nil {
 				if dbPos.EntryTime > 0 {
 					updateTime = dbPos.EntryTime
+					logger.Infof("  📊 [%s] Position %s %s: using DB EntryTime=%d (priority 1)", at.name, symbol, side, dbPos.EntryTime)
 				}
+			} else if err != nil {
+				logger.Infof("  ⚠️ [%s] Position %s %s: DB query error: %v", at.name, symbol, side, err)
+			} else {
+				logger.Infof("  ⚠️ [%s] Position %s %s: DB returned nil (position not found in DB)", at.name, symbol, side)
 			}
 		}
 		// Priority 2: Get from exchange API (Bybit: createdTime, OKX: createdTime)
 		if updateTime == 0 {
 			if createdTime, ok := pos["createdTime"].(int64); ok && createdTime > 0 {
 				updateTime = createdTime
+				logger.Infof("  📊 [%s] Position %s %s: using exchange createdTime=%d (priority 2)", at.name, symbol, side, createdTime)
 			}
 		}
 		// Priority 3: Fallback to local tracking
@@ -1150,6 +1160,7 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 				at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 			}
 			updateTime = at.positionFirstSeenTime[posKey]
+			logger.Infof("  ⚠️ [%s] Position %s %s: using local tracking time=%d (priority 3 fallback)", at.name, symbol, side, updateTime)
 		}
 
 		// Get peak profit rate for this position
@@ -3104,8 +3115,18 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 	var actualQty = quantity
 	var fee float64
 
-	// Exchanges with OrderSync: Skip immediate order recording, let OrderSync handle it
-	// This ensures accurate data from GetTrades API and avoids duplicate records
+	// 【核心修复】所有交易所都必须先记录订单（即使有OrderSync）
+	// 原因：多trader共享同一API时，必须在下单时立即绑定TraderID和OrderID
+	// 否则OrderSync无法知道成交记录属于哪个trader
+	orderRecord := at.createOrderRecord(orderID, symbol, action, positionSide, quantity, price, leverage)
+	if err := at.store.Order().CreateOrder(orderRecord); err != nil {
+		logger.Infof("  ⚠️ Failed to record order: %v", err)
+	} else {
+		logger.Infof("  📝 Order recorded: %s [%s] %s (TraderID: %s)", orderID, action, symbol, at.id)
+	}
+
+	// 对于没有 OrderSync 的交易所，继续轮询成交状态
+	// 有 OrderSync 的交易所则直接返回，让 OrderSync 负责后续同步
 	switch at.exchange {
 	case "binance", "lighter", "hyperliquid", "bybit", "okx", "bitget", "aster", "kucoin", "gate":
 		logger.Infof("  📝 Order submitted (id: %s), will be synced by OrderSync", orderID)

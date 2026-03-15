@@ -1,41 +1,71 @@
-# Stage 1: 真正编译你的定制前端
+# ═══════════════════════════════════════════════════════════════
+# NOFX All-in-One Dockerfile (Frontend + Backend)
+# 优化：多阶段构建，高效缓存，防止服务器资源耗尽
+# ═══════════════════════════════════════════════════════════════
+
+# 阶段 1: 前端构建
 FROM node:20-alpine AS frontend-builder
 WORKDIR /app/web
 COPY web/package*.json ./
-RUN npm install
+RUN npm ci --prefer-offline --no-audit
 COPY web/ ./
 RUN npm run build
 
-# Stage 2: 真正编译你的定制后端 (带 TA-Lib)
+# 阶段 2: 后端构建 (Go + TA-Lib)
 FROM golang:bookworm AS backend-builder
 WORKDIR /app
-RUN apt-get update && apt-get install -y gcc make wget \
-    && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz \
+
+# 安装 TA-Lib 编译依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc make wget curl \
+    && wget -q http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz \
     && tar -xzf ta-lib-0.4.0-src.tar.gz \
-    && cd ta-lib && ./configure --prefix=/usr && make && make install
+    && cd ta-lib && ./configure --prefix=/usr && make -j$(nproc) && make install \
+    && cd / && rm -rf ta-lib ta-lib-0.4.0-src.tar.gz
+
+# 先复制 go.mod/go.sum，利用缓存
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
-RUN CGO_ENABLED=1 GOOS=linux go build -o nofx main.go
 
-# Stage 3: 最终运行环境 (改用 Debian 确保兼容性)
+# 复制源码并构建
+COPY . .
+RUN CGO_ENABLED=1 GOOS=linux go build -trimpath -ldflags="-s -w" -o nofx main.go
+
+# 阶段 3: 最终运行环境
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates tzdata sqlite3 nginx curl \
-    && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates tzdata sqlite3 nginx curl libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
 WORKDIR /app
 RUN mkdir -p /app/data /data/config /data/db /etc/nginx/conf.d
-VOLUME /data
-# 复制你亲手改的代码产物
+
+# 复制前端构建产物
 COPY --from=frontend-builder /app/web/dist /usr/share/nginx/html
+
+# 复制 TA-Lib 库
 COPY --from=backend-builder /usr/lib/libta_lib.so* /usr/lib/
 RUN ldconfig
+
+# 复制后端二进制
 COPY --from=backend-builder /app/nofx /app/nofx
+
+# 复制启动脚本
 COPY railway/start.sh /app/start.sh
-# 彻底解决 Windows 换行符导致脚本打不开的问题
 RUN sed -i 's/\r$//' /app/start.sh && chmod +x /app/start.sh
+
+# 环境变量
 ENV DB_PATH=/data/db/data.db
+
 EXPOSE 8080
-# 修正健康检查路径
+
+# 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
   CMD curl -f http://localhost:8080/api/health || exit 1
+
+# 使用非 root 用户
+USER app
+
 CMD ["/app/start.sh"]

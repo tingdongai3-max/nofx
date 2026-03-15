@@ -616,6 +616,8 @@ export interface KlineConfig {
   selected_timeframes?: string[];
   /** 各周期 K 线数量，如 { "1m": 200, "5m": 100, "1h": 50 }，未设置则用默认梯队 */
   timeframe_counts?: Record<string, number>;
+  /** 辅助周期：仅发送指标趋势判断，不发送K线数据，用于减少上下文长度 */
+  auxiliary_timeframe?: string;
 }
 
 export interface ExternalDataSource {
@@ -909,4 +911,93 @@ export interface GridRiskInfo {
   // Breakout state
   breakout_level: string
   breakout_direction: string
+}
+
+// Trader Admin Types
+export interface TraderAdmin {
+  id: string
+  user_id: string
+  name: string
+  ai_model_id: string
+  managed_trader_ids: string[]
+  scan_interval_mins: number
+  is_running: boolean
+  last_scan_time: string
+  created_at: string
+  updated_at: string
+}
+
+export interface CreateTraderAdminRequest {
+  name: string
+  ai_model_id: string
+  managed_trader_ids: string[]
+  scan_interval_mins?: number
+}
+
+export interface TraderListItem {
+  trader_id: string
+  trader_name: string
+  user_id: string
+  ai_model_id: string
+  is_running: boolean
+}
+
+export interface HallucinationIssue {
+  type: string
+  severity: 'low' | 'medium' | 'high'
+  description: string
+}
+
+export interface HallucinationDetection {
+  decision_id: string
+  timestamp: string
+  trader_id: string
+  cycle_number: number
+  has_hallucination: boolean
+  severity: string
+  issues: HallucinationIssue[]
+}
+
+export interface HallucinationReport {
+  has_hallucination: boolean
+  severity: string
+  total_issues: number
+  detections: HallucinationDetection[]
+}
+
+export interface OptimizationSuggestions {
+  trader_id: string
+  general: string[]
+  specific: string[]
+}
+
+export interface TraderAnalysisResult {
+  trader_id: string
+  trader_name: string
+  trader_model_id: string
+  total_decisions: number
+  successful_decisions: number
+  total_pnl: number
+  cot_traces: string[]
+  hallucination_report: HallucinationReport | null
+  optimizations: OptimizationSuggestions | null
+  error?: string
+}
+
+export interface AnalysisResult {
+  admin_id: string
+  admin_name: string
+  scan_time: string
+  trader_results: TraderAnalysisResult[]
+}
+
+export interface TraderAdminAnalysis {
+  id: string
+  admin_id: string
+  trader_id: string
+  scan_time: string
+  analysis_data: any
+  hallucination_data: any
+  optimizations: any
+  created_at: string
 }

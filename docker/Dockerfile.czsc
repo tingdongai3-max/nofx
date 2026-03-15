@@ -1,0 +1,16 @@
+# NoFx CZSC 缠论数据中间件
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install curl for healthcheck
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+COPY czsc_service/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY czsc_service/ .
+
+EXPOSE 8765
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8765", "--workers", "4"]
