@@ -20,6 +20,7 @@ import (
 	"nofx/provider/hyperliquid"
 	"nofx/provider/twelvedata"
 	"nofx/store"
+	"nofx/ta"
 	"nofx/trader"
 	"nofx/trader/aster"
 	"nofx/trader/binance"
@@ -66,6 +67,12 @@ type Server struct {
 	debateHandler   *DebateHandler
 	httpServer      *http.Server
 	port            int
+	signalPool      *ta.SignalPool
+}
+
+// GetSignalPool 实现 SignalPoolHolder 接口
+func (s *Server) GetSignalPool() *ta.SignalPool {
+	return s.signalPool
 }
 
 // NewServer Creates API server
@@ -99,8 +106,17 @@ func NewServer(traderManager *manager.TraderManager, st *store.Store, cryptoServ
 		port:            port,
 	}
 
+	// 创建 SignalPool（如果数据库支持）
+	s.signalPool = ta.NewSignalPool(st.GormDB(), nil)
+	if err := s.signalPool.InitTable(); err != nil {
+		logger.Warnf("Failed to init signal pool table: %v", err)
+	}
+
 	// Setup routes
 	s.setupRoutes()
+
+	// 注册信号路由
+	RegisterSignalRoutes(router, s)
 
 	return s
 }
@@ -187,6 +203,19 @@ func (s *Server) setupRoutes() {
 			protected.POST("/traders/:id/close-position", s.handleClosePosition)
 			protected.PUT("/traders/:id/competition", s.handleToggleCompetition)
 			protected.GET("/traders/:id/grid-risk", s.handleGetGridRiskInfo)
+
+			// Trader admin (strategy optimizer / hallucination detector)
+			protected.GET("/trader-admins", s.handleListTraderAdmins)
+			protected.GET("/trader-admins/:id", s.handleGetTraderAdmin)
+			protected.POST("/trader-admins", s.handleCreateTraderAdmin)
+			protected.PUT("/trader-admins/:id", s.handleUpdateTraderAdmin)
+			protected.DELETE("/trader-admins/:id", s.handleDeleteTraderAdmin)
+			protected.POST("/trader-admins/:id/start", s.handleStartTraderAdmin)
+			protected.POST("/trader-admins/:id/stop", s.handleStopTraderAdmin)
+			protected.GET("/trader-admins/:id/analysis", s.handleGetTraderAdminAnalysis)
+			protected.GET("/trader-admins/:id/analysis/latest", s.handleGetTraderAdminLatestAnalysis)
+			protected.POST("/trader-admins/:id/scan", s.handleTriggerTraderAdminScan)
+			protected.GET("/traders/all", s.handleGetAllTraders)
 
 			// AI model configuration
 			protected.GET("/models", s.handleGetModelConfigs)
@@ -2505,7 +2534,7 @@ func (s *Server) handlePositionHistory(c *gin.Context) {
 			return
 		}
 		stats, _ := s.store.Position().GetFullStatsBySource(traderID, "dry_run")
-		symbolStats, _ := s.store.Position().GetSymbolStatsBySource(traderID, 10, "dry_run")
+		symbolStats, _ := s.store.Position().GetSymbolStatsBySource(traderID, 0, "dry_run")
 		directionStats, _ := s.store.Position().GetDirectionStatsBySource(traderID, "dry_run")
 		c.JSON(http.StatusOK, gin.H{
 			"positions":       positions,
@@ -2532,7 +2561,7 @@ func (s *Server) handlePositionHistory(c *gin.Context) {
 		return
 	}
 	stats, _ := store.Position().GetFullStats(trader.GetID())
-	symbolStats, _ := store.Position().GetSymbolStats(trader.GetID(), 10)
+	symbolStats, _ := store.Position().GetSymbolStats(trader.GetID(), 0)
 	directionStats, _ := store.Position().GetDirectionStats(trader.GetID())
 	c.JSON(http.StatusOK, gin.H{
 		"positions":       positions,

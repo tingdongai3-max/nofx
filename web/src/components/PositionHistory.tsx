@@ -375,6 +375,9 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
   const [sortBy, setSortBy] = useState<'time' | 'pnl' | 'pnl_pct'>('time')
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc')
 
+  // Symbol stats expand state
+  const [symbolStatsExpanded, setSymbolStatsExpanded] = useState(false)
+
   useEffect(() => {
     const fetchData = async () => {
       try {
@@ -663,10 +666,27 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
             </span>
           </div>
           <div className="space-y-1">
-            {symbolStats.slice(0, 10).map((stat) => (
+            {(symbolStatsExpanded ? symbolStats : symbolStats.slice(0, 10)).map((stat) => (
               <SymbolStatsRow key={stat.symbol} stat={stat} />
             ))}
           </div>
+          {symbolStats.length > 10 && (
+            <div className="flex justify-center mt-4">
+              <button
+                onClick={() => setSymbolStatsExpanded(!symbolStatsExpanded)}
+                className="px-4 py-2 text-sm transition-colors rounded border"
+                style={{
+                  color: '#848E9C',
+                  borderColor: '#2B3139',
+                  background: 'transparent',
+                }}
+              >
+                {symbolStatsExpanded
+                  ? (language === 'zh' ? '收起' : 'Collapse')
+                  : (language === 'zh' ? `展开全部 (共 ${symbolStats.length} 个)` : `Expand All (${symbolStats.length} total)`)}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
