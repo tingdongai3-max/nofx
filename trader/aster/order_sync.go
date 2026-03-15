@@ -44,6 +44,24 @@ func (t *AsterTrader) SyncOrdersFromAster(traderID string, exchangeID string, ex
 	syncedCount := 0
 
 	for _, trade := range trades {
+		// 【归属权过滤】查找原始挂单的TraderID
+		// 注意：TradeID 是成交ID，OrderID 是订单ID，需要用 OrderID 去查找原始订单
+		originalOrder, _ := orderStore.GetOrderByExchangeID(exchangeID, trade.OrderID)
+		if originalOrder == nil {
+			// 找不到原始挂单记录，说明是外部手动操作，禁止同步
+			logger.Infof("  🔒 Skipping external trade %s (orderID=%s) - no original order found, likely manual trading",
+				trade.TradeID, trade.OrderID)
+			continue
+		}
+		// 如果原始订单的TraderID与当前同步的交易员不符，禁止同步
+		if originalOrder.TraderID != traderID {
+			logger.Infof("  🔒 Skipping trade %s (orderID=%s) - belongs to trader %s, not %s",
+				trade.TradeID, trade.OrderID, originalOrder.TraderID, traderID)
+			continue
+		}
+		logger.Infof("  ✅ Trade %s (orderID=%s) belongs to trader %s, syncing...",
+			trade.TradeID, trade.OrderID, traderID)
+
 		// Check if trade already exists (use exchangeID which is UUID, not exchange type)
 		existing, err := orderStore.GetOrderByExchangeID(exchangeID, trade.TradeID)
 		if err == nil && existing != nil {

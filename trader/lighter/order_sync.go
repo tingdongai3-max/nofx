@@ -44,6 +44,24 @@ func (t *LighterTraderV2) SyncOrdersFromLighter(traderID string, exchangeID stri
 
 	syncedCount := 0
 	for _, trade := range trades {
+		// 【归属权过滤】Lighter API 不返回 OrderID，使用 TradeID 查找原始订单
+		// 如果找不到原始订单记录，说明是外部手动操作，禁止同步
+		originalOrder, _ := orderStore.GetOrderByExchangeID(exchangeID, trade.TradeID)
+		if originalOrder == nil {
+			// 找不到原始订单记录，说明是外部手动操作，禁止同步
+			logger.Infof("  🔒 Skipping external trade %s - no original order found, likely manual trading",
+				trade.TradeID)
+			continue
+		}
+		// 如果原始订单的TraderID与当前同步的交易员不符，禁止同步
+		if originalOrder.TraderID != traderID {
+			logger.Infof("  🔒 Skipping trade %s - belongs to trader %s, not %s",
+				trade.TradeID, originalOrder.TraderID, traderID)
+			continue
+		}
+		logger.Infof("  ✅ Trade %s belongs to trader %s, syncing...",
+			trade.TradeID, traderID)
+
 		// Check if trade already exists (use exchangeID which is UUID, not exchange type)
 		existing, err := orderStore.GetOrderByExchangeID(exchangeID, trade.TradeID)
 		if err == nil && existing != nil {
