@@ -419,6 +419,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
         scan_interval_minutes: data.scan_interval_minutes,
         is_cross_margin: data.is_cross_margin,
         show_in_competition: data.show_in_competition,
+        is_dry_run: data.is_dry_run,
+        virtual_equity: data.virtual_equity,
       }
 
       console.log('🔥 handleSaveEditTrader - data:', data)

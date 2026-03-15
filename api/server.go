@@ -809,8 +809,8 @@ type UpdateTraderRequest struct {
 	CustomPrompt         string `json:"custom_prompt"`
 	OverrideBasePrompt   bool   `json:"override_base_prompt"`
 	SystemPromptTemplate string  `json:"system_prompt_template"`
-	IsDryRun             bool    `json:"is_dry_run"`
-	VirtualEquity        float64 `json:"virtual_equity"`
+	IsDryRun             *bool   `json:"is_dry_run"`
+	VirtualEquity        *float64 `json:"virtual_equity"`
 }
 
 // handleUpdateTrader Update trader configuration
@@ -887,13 +887,69 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		strategyID = existingTrader.StrategyID
 	}
 
-	isDryRun := req.IsDryRun
-	virtualEquity := req.VirtualEquity
+	isDryRun := existingTrader.IsDryRun
+	if req.IsDryRun != nil {
+		isDryRun = *req.IsDryRun
+	}
+
+	virtualEquity := existingTrader.VirtualEquity
+	if req.VirtualEquity != nil {
+		virtualEquity = *req.VirtualEquity
+	}
 	if isDryRun && virtualEquity <= 0 {
 		virtualEquity = 10000
 	}
 	if !isDryRun {
 		virtualEquity = 0
+	}
+
+	initialBalance := req.InitialBalance
+	if initialBalance <= 0 {
+		initialBalance = existingTrader.InitialBalance
+	}
+
+	// Mode switch: re-anchor initial balance to current equity
+	if req.IsDryRun != nil && isDryRun != existingTrader.IsDryRun {
+		if isDryRun {
+			exchangeType := "binance"
+			if ex, err := s.store.Exchange().GetByID(userID, req.ExchangeID); err == nil && ex != nil {
+				exchangeType = ex.ExchangeType
+			}
+			totalUnrealizedProfit := 0.0
+			openPositions, errPos := s.store.Position().GetOpenPositionsBySource(traderID, "dry_run")
+			if errPos == nil {
+				for _, pos := range openPositions {
+					markPrice := pos.EntryPrice
+					if data, errMarket := market.GetWithExchange(pos.Symbol, exchangeType, nil); errMarket == nil && data != nil {
+						if data.CurrentPrice > 0 {
+							markPrice = data.CurrentPrice
+						}
+					}
+					if pos.Side == "LONG" {
+						totalUnrealizedProfit += (markPrice - pos.EntryPrice) * pos.Quantity
+					} else {
+						totalUnrealizedProfit += (pos.EntryPrice - markPrice) * pos.Quantity
+					}
+				}
+			}
+			initialBalance = virtualEquity + totalUnrealizedProfit
+		} else {
+			if exCfg, exErr := s.store.Exchange().GetByID(userID, req.ExchangeID); exErr == nil && exCfg != nil && exCfg.Enabled {
+				if tempTrader, createErr := s.createTempTraderFromExchangeConfig(exCfg, userID); createErr == nil && tempTrader != nil {
+					if balance, errBal := tempTrader.GetBalance(); errBal == nil {
+						totalWalletBalance, _ := balance["totalWalletBalance"].(float64)
+						totalUnrealizedProfit, _ := balance["totalUnrealizedProfit"].(float64)
+						totalEquity, _ := balance["totalEquity"].(float64)
+						if totalEquity <= 0 {
+							totalEquity = totalWalletBalance + totalUnrealizedProfit
+						}
+						if totalEquity > 0 {
+							initialBalance = totalEquity
+						}
+					}
+				}
+			}
+		}
 	}
 
 	// Update trader configuration
@@ -904,7 +960,7 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		AIModelID:            req.AIModelID,
 		ExchangeID:           req.ExchangeID,
 		StrategyID:           strategyID, // Associated strategy ID
-		InitialBalance:       req.InitialBalance,
+		InitialBalance:       initialBalance,
 		BTCETHLeverage:       btcEthLeverage,
 		AltcoinLeverage:      altcoinLeverage,
 		TradingSymbols:       req.TradingSymbols,
@@ -2269,77 +2325,17 @@ func (s *Server) handleAccount(c *gin.Context) {
 		return
 	}
 
-	if exchangeCfg == nil || !exchangeCfg.Enabled {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Exchange not configured or not enabled"})
-		return
-	}
-
-	tempTrader, createErr := s.createTempTraderFromExchangeConfig(exchangeCfg, userID)
-	if createErr != nil || tempTrader == nil {
-		logger.Infof("⚠️ handleAccount create temp trader failed: %v", createErr)
-		SafeInternalError(c, "Failed to connect to exchange", createErr)
-		return
-	}
-
-	balance, err := tempTrader.GetBalance()
+	memTrader, err := s.traderManager.GetTrader(traderID)
 	if err != nil {
-		SafeInternalError(c, "Get account info", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Account cache not ready"})
 		return
 	}
-	positions, err := tempTrader.GetPositions()
+	accountInfo, err := memTrader.GetAccountInfo()
 	if err != nil {
-		SafeInternalError(c, "Get positions for account", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Account cache not ready"})
 		return
 	}
-
-	// 与 AutoTrader.GetAccountInfo 一致的字段构建
-	totalWalletBalance, _ := balance["totalWalletBalance"].(float64)
-	totalUnrealizedProfit, _ := balance["totalUnrealizedProfit"].(float64)
-	availableBalance, _ := balance["availableBalance"].(float64)
-	totalEquity, _ := balance["totalEquity"].(float64)
-	if totalEquity <= 0 {
-		totalEquity = totalWalletBalance + totalUnrealizedProfit
-	}
-	initialBalance := fullConfig.Trader.InitialBalance
-	totalPnL := totalEquity - initialBalance
-	totalPnLPct := 0.0
-	if initialBalance > 0 {
-		totalPnLPct = (totalPnL / initialBalance) * 100
-	}
-	totalMarginUsed := 0.0
-	for _, pos := range positions {
-		markPrice, _ := pos["markPrice"].(float64)
-		quantity, _ := pos["positionAmt"].(float64)
-		if quantity < 0 {
-			quantity = -quantity
-		}
-		leverage := 10.0
-		if lev, ok := pos["leverage"].(float64); ok && lev > 0 {
-			leverage = lev
-		}
-		totalMarginUsed += (quantity * markPrice) / leverage
-	}
-	marginUsedPct := 0.0
-	if totalEquity > 0 {
-		marginUsedPct = (totalMarginUsed / totalEquity) * 100
-	}
-
-	account := map[string]interface{}{
-		"total_equity":      totalEquity,
-		"wallet_balance":    totalWalletBalance,
-		"unrealized_profit": totalUnrealizedProfit,
-		"available_balance": availableBalance,
-		"total_pnl":         totalPnL,
-		"total_pnl_pct":     totalPnLPct,
-		"initial_balance":   initialBalance,
-		"daily_pnl":         0.0,
-		"position_count":    len(positions),
-		"margin_used":       totalMarginUsed,
-		"margin_used_pct":   marginUsedPct,
-	}
-	logger.Infof("✓ Returning account info [%s]: equity=%.2f, available=%.2f, pnl=%.2f (%.2f%%)",
-		fullConfig.Trader.Name, totalEquity, availableBalance, totalPnL, totalPnLPct)
-	body, _ := json.Marshal(account)
+	body, _ := json.Marshal(accountInfo)
 	accountCache.Store(cacheKey, &ttlCacheEntry{Body: body, Until: time.Now().Add(accountPositionsCacheTTL)})
 	c.Data(http.StatusOK, "application/json", body)
 }
@@ -2424,21 +2420,14 @@ func (s *Server) handlePositions(c *gin.Context) {
 		return
 	}
 
-	if exchangeCfg == nil || !exchangeCfg.Enabled {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Exchange not configured or not enabled"})
-		return
-	}
-
-	tempTrader, createErr := s.createTempTraderFromExchangeConfig(exchangeCfg, userID)
-	if createErr != nil || tempTrader == nil {
-		logger.Infof("⚠️ handlePositions create temp trader failed: %v", createErr)
-		SafeInternalError(c, "Failed to connect to exchange", createErr)
-		return
-	}
-
-	positions, err := tempTrader.GetPositions()
+	memTrader, err := s.traderManager.GetTrader(traderID)
 	if err != nil {
-		SafeInternalError(c, "Get positions", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Positions cache not ready"})
+		return
+	}
+	positions, err := memTrader.GetPositions()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Positions cache not ready"})
 		return
 	}
 	// 统一映射为前端期望的 snake_case 且数值类型，避免 OKX 等返回 string 或 camelCase 导致前端崩溃

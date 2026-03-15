@@ -145,6 +145,8 @@ type AutoTrader struct {
 	callCount             int                // AI call count
 	positionFirstSeenTime map[string]int64   // Position first seen time (symbol_side -> timestamp in milliseconds)
 	stopMonitorCh         chan struct{}      // Used to stop monitoring goroutine
+	stopMonitorClosed     bool
+	stopMonitorMu         sync.Mutex
 	monitorWg             sync.WaitGroup     // Used to wait for monitoring goroutine to finish
 	peakPnLCache          map[string]float64 // Peak profit (MFE) cache: symbol_side -> max P&L %
 	peakPnLCacheMutex     sync.RWMutex
@@ -335,6 +337,13 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		return nil, fmt.Errorf("unsupported trading platform: %s", config.Exchange)
 	}
 
+	// Bind exchange account key for shared caches/sync (Binance only for now)
+	if binanceTrader, ok := trader.(*binance.FuturesTrader); ok {
+		if config.ExchangeID != "" {
+			binanceTrader.SetAccountKey(fmt.Sprintf("binance:%s:%t", config.ExchangeID, config.BinanceTestnet))
+		}
+	}
+
 	// Validate initial balance configuration (实盘：为 0 时从交易所拉取；模拟盘不拉取，使用 VirtualEquity)
 	if !config.IsDryRun && config.InitialBalance <= 0 {
 		logger.Infof("📊 [%s] Initial balance not set, attempting to fetch current balance from exchange...", config.Name)
@@ -409,6 +418,7 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		bottomPnLCacheMutex:   sync.RWMutex{},
 		peakBottomCh:          make(chan peakBottomUpdate, 256),
 		lastBalanceSyncTime:   time.Now(),
+		stopMonitorClosed:     false,
 		userID:                userID,
 	}, nil
 }
@@ -420,6 +430,9 @@ func (at *AutoTrader) Run() error {
 	at.isRunningMutex.Unlock()
 
 	at.stopMonitorCh = make(chan struct{})
+	at.stopMonitorMu.Lock()
+	at.stopMonitorClosed = false
+	at.stopMonitorMu.Unlock()
 	at.startTime = time.Now()
 
 	logger.Info("🚀 AI-driven automatic trading system started")
@@ -496,23 +509,27 @@ func (at *AutoTrader) Run() error {
 				binanceTrader.StartOrderSync(at.id, at.exchangeID, at.exchange, at.store, 30*time.Second)
 				logger.Infof("🔄 [%s] Binance order+position sync enabled (every 30s)", at.name)
 			}
-			// 定时全局对账：每 5 分钟 REST 全量覆盖缓存，应对 WS 漏接或手机端手动操作
+			// 定时全局对账：REST 全量覆盖缓存（限频：每 10 分钟）
 			at.monitorWg.Add(1)
 			go func() {
 				defer at.monitorWg.Done()
-				ticker := time.NewTicker(5 * time.Minute)
+				ticker := time.NewTicker(10 * time.Minute)
 				defer ticker.Stop()
 				for {
 					select {
 					case <-at.stopMonitorCh:
 						return
 					case <-ticker.C:
+						if time.Since(at.lastBalanceSyncTime) < 10*time.Minute {
+							continue
+						}
 						binanceTrader.ReconcileFromREST()
-						logger.Infof("🔄 [%s] Cache self-healing: 5-min REST reconciliation done", at.name)
+						at.lastBalanceSyncTime = time.Now()
+						logger.Infof("🔄 [%s] Cache self-healing: 10-min REST reconciliation done", at.name)
 					}
 				}
 			}()
-			logger.Infof("🔄 [%s] Cache self-healing enabled (every 5 min REST reconciliation)", at.name)
+			logger.Infof("🔄 [%s] Cache self-healing enabled (every 10 min REST reconciliation)", at.name)
 		}
 	} else if at.exchange == "binance" && at.config.IsDryRun {
 		logger.Infof("🔄 [%s] Skipping Binance order sync (dry run mode)", at.name)
@@ -659,7 +676,12 @@ func (at *AutoTrader) Stop() {
 		at.atrTrailingCancel()
 		at.atrTrailingCancel = nil
 	}
-	close(at.stopMonitorCh) // Notify monitoring goroutine to stop
+	at.stopMonitorMu.Lock()
+	if !at.stopMonitorClosed {
+		close(at.stopMonitorCh) // Notify monitoring goroutine to stop
+		at.stopMonitorClosed = true
+	}
+	at.stopMonitorMu.Unlock()
 	at.monitorWg.Wait()     // Wait for monitoring goroutine to finish
 	logger.Info("⏹ Automatic trading system stopped")
 }
@@ -1089,10 +1111,40 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 
 // buildTradingContext builds trading context（仅实盘：从交易所拉取余额与持仓，模拟盘勿调用）
 func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
-	// 1. Get account information (exchange API)
-	balance, err := at.trader.GetBalance()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get account balance: %w", err)
+	// 1. Get account information (prefer WS cache; REST only if necessary and rate-limited)
+	var balance map[string]interface{}
+	var positions []map[string]interface{}
+	var err error
+	if binanceTrader, ok := at.trader.(*binance.FuturesTrader); ok {
+		balance, _ = binanceTrader.GetBalanceFromCache()
+		positions, _ = binanceTrader.GetPositionsFromCache()
+
+		if (balance == nil || positions == nil) && time.Since(at.lastBalanceSyncTime) >= 10*time.Minute {
+			binanceTrader.ReconcileFromREST()
+			at.lastBalanceSyncTime = time.Now()
+			if balance == nil {
+				balance, _ = binanceTrader.GetBalanceFromCache()
+			}
+			if positions == nil {
+				positions, _ = binanceTrader.GetPositionsFromCache()
+			}
+		}
+
+		if balance == nil {
+			return nil, fmt.Errorf("balance cache not ready")
+		}
+		if positions == nil {
+			return nil, fmt.Errorf("positions cache not ready")
+		}
+	} else {
+		balance, err = at.trader.GetBalance()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get account balance: %w", err)
+		}
+		positions, err = at.trader.GetPositions()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get positions: %w", err)
+		}
 	}
 
 	// Get account fields
@@ -1119,11 +1171,7 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 		totalEquity = totalWalletBalance + totalUnrealizedProfit
 	}
 
-	// 2. Get position information
-	positions, err := at.trader.GetPositions()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get positions: %w", err)
-	}
+	// 2. Get position information (already loaded above)
 
 	var positionInfos []kernel.PositionInfo
 	totalMarginUsed := 0.0
@@ -2435,9 +2483,19 @@ func (at *AutoTrader) GetStatus() map[string]interface{} {
 
 // GetAccountInfo gets account information (for API)
 func (at *AutoTrader) GetAccountInfo() (map[string]interface{}, error) {
-	balance, err := at.trader.GetBalance()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get balance: %w", err)
+	var balance map[string]interface{}
+	var err error
+	if binanceTrader, ok := at.trader.(*binance.FuturesTrader); ok {
+		if cached, ok := binanceTrader.GetBalanceFromCache(); ok {
+			balance = cached
+		} else {
+			return nil, fmt.Errorf("balance cache not ready")
+		}
+	} else {
+		balance, err = at.trader.GetBalance()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get balance: %w", err)
+		}
 	}
 
 	// Get account fields
@@ -2465,9 +2523,18 @@ func (at *AutoTrader) GetAccountInfo() (map[string]interface{}, error) {
 	}
 
 	// Get positions to calculate total margin
-	positions, err := at.trader.GetPositions()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get positions: %w", err)
+	var positions []map[string]interface{}
+	if binanceTrader, ok := at.trader.(*binance.FuturesTrader); ok {
+		if cached, ok := binanceTrader.GetPositionsFromCache(); ok {
+			positions = cached
+		} else {
+			return nil, fmt.Errorf("positions cache not ready")
+		}
+	} else {
+		positions, err = at.trader.GetPositions()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get positions: %w", err)
+		}
 	}
 
 	totalMarginUsed := 0.0
@@ -2532,9 +2599,19 @@ func (at *AutoTrader) GetAccountInfo() (map[string]interface{}, error) {
 
 // GetPositions gets position list (for API)
 func (at *AutoTrader) GetPositions() ([]map[string]interface{}, error) {
-	positions, err := at.trader.GetPositions()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get positions: %w", err)
+	var positions []map[string]interface{}
+	var err error
+	if binanceTrader, ok := at.trader.(*binance.FuturesTrader); ok {
+		if cached, ok := binanceTrader.GetPositionsFromCache(); ok {
+			positions = cached
+		} else {
+			return nil, fmt.Errorf("positions cache not ready")
+		}
+	} else {
+		positions, err = at.trader.GetPositions()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get positions: %w", err)
+		}
 	}
 
 	var result []map[string]interface{}
@@ -3263,15 +3340,28 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 		// MFE/MAE: 平仓前从内存极值缓存取出，赋给落盘对象，确保存库的是真实极值
 		var mfe, mae float64
 		if openPos, err := at.store.Position().GetOpenPositionBySymbol(at.id, symbol, side); err == nil && openPos != nil {
-			notional := openPos.EntryPrice * openPos.Quantity
-			posKey := symbol + "_" + strings.ToLower(side)
-			peakCache := at.GetPeakPnLCache()
-			if peakPct, ok := peakCache[posKey]; ok {
-				mfe = notional * (peakPct / 100)
+			// Sync one last time with exit price to avoid stale 0 MFE/MAE when async worker lags
+			_ = at.store.Position().UpdateMaxExcursionsFromPrice(openPos, price)
+			if refreshed, err := at.store.Position().GetOpenPositionBySymbol(at.id, symbol, side); err == nil && refreshed != nil {
+				if refreshed.MaxFavorableExcursion != 0 || refreshed.MaxAdverseExcursion != 0 {
+					mfe = refreshed.MaxFavorableExcursion
+					mae = refreshed.MaxAdverseExcursion
+				}
+				openPos = refreshed
 			}
-			bottomCache := at.GetBottomPnLCache()
-			if bottomPct, ok := bottomCache[posKey]; ok {
-				mae = notional * (bottomPct / 100)
+
+			// Fallback to in-memory peak/bottom cache (P&L %) if DB has no extremes
+			if mfe == 0 && mae == 0 {
+				notional := openPos.EntryPrice * openPos.Quantity
+				posKey := symbol + "_" + strings.ToLower(side)
+				peakCache := at.GetPeakPnLCache()
+				if peakPct, ok := peakCache[posKey]; ok {
+					mfe = notional * (peakPct / 100)
+				}
+				bottomCache := at.GetBottomPnLCache()
+				if bottomPct, ok := bottomCache[posKey]; ok {
+					mae = notional * (bottomPct / 100)
+				}
 			}
 		}
 		posBuilder := store.NewPositionBuilder(at.store.Position())
@@ -3504,4 +3594,3 @@ func getSideFromAction(action string) string {
 func (at *AutoTrader) GetOpenOrders(symbol string) ([]OpenOrder, error) {
 	return at.trader.GetOpenOrders(symbol)
 }
-

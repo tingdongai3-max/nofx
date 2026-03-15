@@ -433,6 +433,7 @@ func (t *FuturesTrader) applyAccountUpdate(ev *wsAccountUpdate) {
 	t.cachedBalance = newBal
 	t.balanceCacheTime = time.Now()
 	t.balanceCacheMutex.Unlock()
+	t.publishBalanceCache(newBal)
 
 	// Merge positions delta
 	t.positionsCacheMutex.Lock()
@@ -585,6 +586,7 @@ func (t *FuturesTrader) refreshAccountFromAPI() {
 	t.cachedBalance = bal
 	t.balanceCacheTime = time.Now()
 	t.balanceCacheMutex.Unlock()
+	t.publishBalanceCache(bal)
 
 	positions, err := t.client.NewGetPositionRiskService().Do(context.Background())
 	if err != nil {

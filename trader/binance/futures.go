@@ -8,6 +8,7 @@ import (
 	"math"
 	"nofx/hook"
 	"nofx/logger"
+	"nofx/syncer"
 	"nofx/trader/types"
 	"strconv"
 	"strings"
@@ -67,9 +68,12 @@ type FuturesTrader struct {
 	// User Data Stream control
 	userDataStop chan struct{}
 
-	// OrderSync control
-	orderSyncStopChan chan struct{}
-	orderSyncTicker   *time.Ticker
+	// Global account key for shared sync/cache
+	accountKey string
+
+	// Global OrderSync subscription info
+	orderSyncExchangeID string
+	orderSyncTraderID   string
 }
 
 const binanceFuturesTestnetURL = "https://testnet.binancefuture.com"
@@ -129,6 +133,29 @@ func newFuturesTrader(apiKey, secretKey string, userId string, isTestnet bool, s
 	return trader
 }
 
+// SetAccountKey sets the global account key (exchange account UUID preferred).
+func (t *FuturesTrader) SetAccountKey(key string) {
+	t.accountKey = key
+}
+
+func (t *FuturesTrader) accountCacheKey() string {
+	if t.accountKey != "" {
+		return t.accountKey
+	}
+	if t.apiKey != "" {
+		return fmt.Sprintf("binance:%s:%t", t.apiKey, t.isTestnet)
+	}
+	return ""
+}
+
+func (t *FuturesTrader) publishBalanceCache(balance map[string]interface{}) {
+	key := t.accountCacheKey()
+	if key == "" {
+		return
+	}
+	syncer.GetGlobalSyncManager().SetBalance(key, balance)
+}
+
 // setDualSidePosition sets dual-side position mode (called during initialization)
 func (t *FuturesTrader) setDualSidePosition() error {
 	// Try to set dual-side position mode
@@ -182,6 +209,26 @@ func (t *FuturesTrader) ensureTimeSync() {
 // without HTTP. Falls back to HTTP only when cache is empty.
 // Returns a copy to avoid race: reader holds copy while WS may replace cache.
 func (t *FuturesTrader) GetBalance() (map[string]interface{}, error) {
+	if key := t.accountCacheKey(); key != "" {
+		if cached, ok := syncer.GetGlobalSyncManager().GetBalance(key); ok {
+			return cached, nil
+		}
+	}
+
+	if err := CheckCircuitBreaker(); err != nil {
+		t.balanceCacheMutex.RLock()
+		if t.cachedBalance != nil {
+			snapshot := make(map[string]interface{}, len(t.cachedBalance))
+			for k, v := range t.cachedBalance {
+				snapshot[k] = v
+			}
+			t.balanceCacheMutex.RUnlock()
+			return snapshot, nil
+		}
+		t.balanceCacheMutex.RUnlock()
+		return nil, err
+	}
+
 	t.balanceCacheMutex.RLock()
 	if t.cachedBalance != nil {
 		snapshot := make(map[string]interface{}, len(t.cachedBalance))
@@ -189,6 +236,7 @@ func (t *FuturesTrader) GetBalance() (map[string]interface{}, error) {
 			snapshot[k] = v
 		}
 		t.balanceCacheMutex.RUnlock()
+		t.publishBalanceCache(snapshot)
 		return snapshot, nil
 	}
 	t.balanceCacheMutex.RUnlock()
@@ -197,10 +245,34 @@ func (t *FuturesTrader) GetBalance() (map[string]interface{}, error) {
 	return t.fetchAndCacheBalance()
 }
 
+// GetBalanceFromCache returns cached balance only (no REST).
+func (t *FuturesTrader) GetBalanceFromCache() (map[string]interface{}, bool) {
+	if key := t.accountCacheKey(); key != "" {
+		if cached, ok := syncer.GetGlobalSyncManager().GetBalance(key); ok {
+			return cached, true
+		}
+	}
+	t.balanceCacheMutex.RLock()
+	if t.cachedBalance != nil {
+		snapshot := make(map[string]interface{}, len(t.cachedBalance))
+		for k, v := range t.cachedBalance {
+			snapshot[k] = v
+		}
+		t.balanceCacheMutex.RUnlock()
+		return snapshot, true
+	}
+	t.balanceCacheMutex.RUnlock()
+	return nil, false
+}
+
 // fetchAndCacheBalance fetches balance via REST API and updates cache
 func (t *FuturesTrader) fetchAndCacheBalance() (map[string]interface{}, error) {
+	if err := CheckCircuitBreaker(); err != nil {
+		return nil, err
+	}
 	account, err := t.client.NewGetAccountService().Do(context.Background())
 	if err != nil {
+		SetCircuitBreakerFromError(err)
 		return nil, fmt.Errorf("failed to get account info: %w", err)
 	}
 
@@ -213,6 +285,7 @@ func (t *FuturesTrader) fetchAndCacheBalance() (map[string]interface{}, error) {
 	t.cachedBalance = result
 	t.balanceCacheTime = time.Now()
 	t.balanceCacheMutex.Unlock()
+	t.publishBalanceCache(result)
 
 	return result, nil
 }
@@ -238,6 +311,25 @@ func (t *FuturesTrader) GetPositions() ([]map[string]interface{}, error) {
 
 	// Cache empty: force HTTP fetch and update cache
 	return t.fetchAndCachePositions()
+}
+
+// GetPositionsFromCache returns cached positions only (no REST).
+func (t *FuturesTrader) GetPositionsFromCache() ([]map[string]interface{}, bool) {
+	t.positionsCacheMutex.RLock()
+	if t.cachedPositions != nil {
+		snapshot := make([]map[string]interface{}, len(t.cachedPositions))
+		for i, p := range t.cachedPositions {
+			pm := make(map[string]interface{}, len(p))
+			for k, v := range p {
+				pm[k] = v
+			}
+			snapshot[i] = pm
+		}
+		t.positionsCacheMutex.RUnlock()
+		return snapshot, true
+	}
+	t.positionsCacheMutex.RUnlock()
+	return nil, false
 }
 
 // fetchAndCachePositions fetches positions via REST API and updates cache

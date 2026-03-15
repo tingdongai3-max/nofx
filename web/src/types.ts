@@ -862,6 +862,9 @@ export interface SymbolStats {
   total_pnl: number;
   avg_pnl: number;
   avg_hold_mins: number;
+  pl_ratio: number;
+  sharpe_ratio: number;
+  calmar_ratio: number;
 }
 
 // Matches Go DirectionStats struct exactly

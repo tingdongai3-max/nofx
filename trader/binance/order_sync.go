@@ -6,6 +6,7 @@ import (
 	"nofx/logger"
 	"nofx/market"
 	"nofx/store"
+	"nofx/syncer"
 	"nofx/trader/types"
 	"sort"
 	"strings"
@@ -205,17 +206,40 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 		// 注意：TradeID 是成交ID，OrderID 是订单ID，需要用 OrderID 去查找原始订单
 		originalOrder, _ := orderStore.GetOrderByExchangeID(exchangeID, trade.OrderID)
 		actualTraderID := traderID
+		symbol := market.Normalize(trade.Symbol)
 		if originalOrder == nil {
-			// 【核心修复】找不到原始挂单记录，说明是外部手动操作（如ESP），禁止同步
-			logger.Infof("  🔒 Skipping external trade %s (orderID=%s) - no original order found, likely manual trading",
-				trade.TradeID, trade.OrderID)
-			skippedCount++
-			continue
+			// Fallback: infer trader by unique open position (TP/SL may create a new order ID)
+			posStore := st.Position()
+			openPositions, err := posStore.GetOpenPositionsBySymbolAndExchangeType(symbol, exchangeType)
+			if err == nil {
+				var candidates []*store.TraderPosition
+				posSide := strings.ToUpper(strings.TrimSpace(trade.PositionSide))
+				for _, pos := range openPositions {
+					if posSide == "" || posSide == "BOTH" {
+						candidates = append(candidates, pos)
+						continue
+					}
+					if strings.EqualFold(pos.Side, posSide) {
+						candidates = append(candidates, pos)
+					}
+				}
+				if len(candidates) == 1 {
+					actualTraderID = candidates[0].TraderID
+				}
+			}
+			if actualTraderID == "" {
+				// 找不到原始挂单记录，且无法唯一归属，跳过
+				logger.Infof("  🔒 Skipping trade %s (orderID=%s) - no original order and no unique open position",
+					trade.TradeID, trade.OrderID)
+				skippedCount++
+				continue
+			}
+		} else {
+			// 找到了原始挂单，用原始挂单的TraderID
+			actualTraderID = originalOrder.TraderID
 		}
-		// 找到了原始挂单，用原始挂单的TraderID
-		actualTraderID = originalOrder.TraderID
-		// 如果原始订单的TraderID与当前同步的交易员不符，禁止同步（防止跨交易员数据污染）
-		if actualTraderID != traderID {
+		// 如果指定 traderID，则仅同步该 trader，避免跨交易员数据污染
+		if traderID != "" && actualTraderID != traderID {
 			logger.Infof("  🔒 Skipping trade %s (orderID=%s) - belongs to trader %s, not %s",
 				trade.TradeID, trade.OrderID, actualTraderID, traderID)
 			skippedCount++
@@ -223,6 +247,7 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 		}
 		logger.Infof("  ✅ Trade %s (orderID=%s) belongs to trader %s, syncing...",
 			trade.TradeID, trade.OrderID, actualTraderID)
+		effectiveTraderID := actualTraderID
 
 		// Check if trade already exists
 		existing, err := orderStore.GetOrderByExchangeID(exchangeID, trade.TradeID)
@@ -230,9 +255,6 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 			skippedCount++
 			continue // Trade already exists, skip
 		}
-
-		// Normalize symbol
-		symbol := market.Normalize(trade.Symbol)
 
 		// Determine order action based on side and position side
 		orderAction := t.determineOrderAction(trade.Side, trade.PositionSide, trade.RealizedPnL)
@@ -306,7 +328,7 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 
 		// 1. 先快速落盘核心交易数据（indicators 暂存为空，绝不阻塞）
 		if err := posBuilder.ProcessTrade(
-			traderID, exchangeID, exchangeType,
+			effectiveTraderID, exchangeID, exchangeType,
 			symbol, positionSide, orderAction,
 			trade.Quantity, trade.Price, trade.Fee, trade.RealizedPnL,
 			tradeTimeMs, trade.TradeID,
@@ -478,48 +500,37 @@ func (t *FuturesTrader) determineOrderAction(side, positionSide string, realized
 
 // StartOrderSync starts background order sync task for Binance
 func (t *FuturesTrader) StartOrderSync(traderID string, exchangeID string, exchangeType string, st *store.Store, interval time.Duration) {
-	// Stop any existing OrderSync first
+	// Unsubscribe previous if any
 	t.StopOrderSync()
 
-	// Initialize stop channel and ticker
-	t.orderSyncStopChan = make(chan struct{})
-	t.orderSyncTicker = time.NewTicker(interval)
+	if st == nil {
+		logger.Infof("⚠️  Binance order sync skipped: store is nil")
+		return
+	}
+	if interval < 2*time.Minute {
+		interval = 2 * time.Minute
+	}
 
-	// Run first sync immediately
-	go func() {
-		logger.Infof("🔄 Running initial Binance order sync...")
-		if err := t.SyncOrdersFromBinance(traderID, exchangeID, exchangeType, st); err != nil {
-			logger.Infof("⚠️  Initial Binance order sync failed: %v", err)
-		}
-	}()
+	gsm := syncer.GetGlobalSyncManager()
+	if err := gsm.StartExchangeSync(exchangeID, exchangeType, st, interval, func() error {
+		return t.SyncOrdersFromBinance("", exchangeID, exchangeType, st)
+	}); err != nil {
+		logger.Infof("⚠️  Binance global order sync failed to start: %v", err)
+		return
+	}
 
-	// Then run periodically
-	go func() {
-		for {
-			select {
-			case <-t.orderSyncStopChan:
-				t.orderSyncTicker.Stop()
-				logger.Infof("🔄 Binance order sync stopped for trader %s", traderID)
-				return
-			case <-t.orderSyncTicker.C:
-				if err := t.SyncOrdersFromBinance(traderID, exchangeID, exchangeType, st); err != nil {
-					logger.Infof("⚠️  Binance order sync failed: %v (sleep 30s before retry)", err)
-					time.Sleep(30 * time.Second) // 失败后至少 30 秒再重试，避免死亡循环
-				}
-			}
-		}
-	}()
-	logger.Infof("🔄 Binance order sync started (interval: %v)", interval)
+	gsm.SubscribeTrader(exchangeID, traderID)
+	t.orderSyncExchangeID = exchangeID
+	t.orderSyncTraderID = traderID
+	logger.Infof("🔄 Binance global order sync ensured (interval: %v)", interval)
 }
 
 // StopOrderSync stops the background order sync task
 func (t *FuturesTrader) StopOrderSync() {
-	if t.orderSyncStopChan != nil {
-		close(t.orderSyncStopChan)
-		t.orderSyncStopChan = nil
+	if t.orderSyncExchangeID == "" || t.orderSyncTraderID == "" {
+		return
 	}
-	if t.orderSyncTicker != nil {
-		t.orderSyncTicker.Stop()
-		t.orderSyncTicker = nil
-	}
+	syncer.GetGlobalSyncManager().UnsubscribeTrader(t.orderSyncExchangeID, t.orderSyncTraderID)
+	t.orderSyncExchangeID = ""
+	t.orderSyncTraderID = ""
 }

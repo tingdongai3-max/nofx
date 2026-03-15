@@ -114,6 +114,14 @@ function SymbolStatsRow({ stat }: { stat: SymbolStats }) {
   const pnlColor = totalPnl >= 0 ? '#0ECB81' : '#F6465D'
   const winRateColor =
     winRate >= 60 ? '#0ECB81' : winRate >= 40 ? '#F0B90B' : '#F6465D'
+  const plRatio = stat.pl_ratio || 0
+  const sharpe = stat.sharpe_ratio || 0
+  const calmar = stat.calmar_ratio || 0
+  const plRatioColor = plRatio < 1 ? '#848E9C' : '#EAECEF'
+  const sharpeStyle =
+    sharpe > 2
+      ? { color: '#F0B90B', fontWeight: 700 }
+      : { color: '#EAECEF', fontWeight: 600 }
 
   return (
     <div
@@ -144,6 +152,20 @@ function SymbolStatsRow({ stat }: { stat: SymbolStats }) {
           <div className="font-mono font-semibold" style={{ color: pnlColor }}>
             {totalPnl >= 0 ? '+' : ''}
             {formatNumber(totalPnl)}
+          </div>
+        </div>
+        <div className="text-right min-w-[110px]">
+          <div className="text-xs" style={{ color: '#848E9C' }}>
+            PL / Sharpe / Calmar
+          </div>
+          <div className="font-mono text-xs">
+            <span style={{ color: plRatioColor }}>
+              {plRatio.toFixed(2)}
+            </span>
+            <span style={{ color: '#848E9C' }}> / </span>
+            <span style={sharpeStyle}>{sharpe.toFixed(2)}</span>
+            <span style={{ color: '#848E9C' }}> / </span>
+            <span style={{ color: '#EAECEF' }}>{calmar.toFixed(2)}</span>
           </div>
         </div>
       </div>
@@ -374,6 +396,8 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
   const [filterSide, setFilterSide] = useState<string>('all')
   const [sortBy, setSortBy] = useState<'time' | 'pnl' | 'pnl_pct'>('time')
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc')
+  const [symbolSortBy, setSymbolSortBy] = useState<'pnl' | 'pl_ratio' | 'sharpe'>('pnl')
+  const [symbolSortOrder, setSymbolSortOrder] = useState<'asc' | 'desc'>('desc')
 
   // Symbol stats expand state
   const [symbolStatsExpanded, setSymbolStatsExpanded] = useState(false)
@@ -400,6 +424,39 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
       fetchData()
     }
   }, [traderId, pageSize])
+
+  const sortedSymbolStats = (() => {
+    const list = [...symbolStats]
+    list.sort((a, b) => {
+      let av = 0
+      let bv = 0
+      switch (symbolSortBy) {
+        case 'pl_ratio':
+          av = a.pl_ratio || 0
+          bv = b.pl_ratio || 0
+          break
+        case 'sharpe':
+          av = a.sharpe_ratio || 0
+          bv = b.sharpe_ratio || 0
+          break
+        default:
+          av = a.total_pnl || 0
+          bv = b.total_pnl || 0
+          break
+      }
+      return symbolSortOrder === 'asc' ? av - bv : bv - av
+    })
+    return list
+  })()
+
+  const toggleSymbolSort = (next: 'pnl' | 'pl_ratio' | 'sharpe') => {
+    if (symbolSortBy === next) {
+      setSymbolSortOrder(symbolSortOrder === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSymbolSortBy(next)
+      setSymbolSortOrder('desc')
+    }
+  }
 
   // Get unique symbols for filter
   const uniqueSymbols = useMemo(() => {
@@ -665,8 +722,41 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
               {t('positionHistory.symbolPerformance', language)}
             </span>
           </div>
+          <div className="flex items-center gap-3 mb-2 text-xs">
+            <span style={{ color: '#848E9C' }}>Sort:</span>
+            <button
+              className="px-2 py-1 rounded border"
+              style={{
+                color: symbolSortBy === 'pnl' ? '#EAECEF' : '#848E9C',
+                borderColor: symbolSortBy === 'pnl' ? '#3C434D' : '#2B3139',
+              }}
+              onClick={() => toggleSymbolSort('pnl')}
+            >
+              P&amp;L {symbolSortBy === 'pnl' ? (symbolSortOrder === 'asc' ? '↑' : '↓') : ''}
+            </button>
+            <button
+              className="px-2 py-1 rounded border"
+              style={{
+                color: symbolSortBy === 'sharpe' ? '#EAECEF' : '#848E9C',
+                borderColor: symbolSortBy === 'sharpe' ? '#3C434D' : '#2B3139',
+              }}
+              onClick={() => toggleSymbolSort('sharpe')}
+            >
+              Sharpe {symbolSortBy === 'sharpe' ? (symbolSortOrder === 'asc' ? '↑' : '↓') : ''}
+            </button>
+            <button
+              className="px-2 py-1 rounded border"
+              style={{
+                color: symbolSortBy === 'pl_ratio' ? '#EAECEF' : '#848E9C',
+                borderColor: symbolSortBy === 'pl_ratio' ? '#3C434D' : '#2B3139',
+              }}
+              onClick={() => toggleSymbolSort('pl_ratio')}
+            >
+              P/L {symbolSortBy === 'pl_ratio' ? (symbolSortOrder === 'asc' ? '↑' : '↓') : ''}
+            </button>
+          </div>
           <div className="space-y-1">
-            {(symbolStatsExpanded ? symbolStats : symbolStats.slice(0, 10)).map((stat) => (
+            {(symbolStatsExpanded ? sortedSymbolStats : sortedSymbolStats.slice(0, 10)).map((stat) => (
               <SymbolStatsRow key={stat.symbol} stat={stat} />
             ))}
           </div>

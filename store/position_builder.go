@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"nofx/logger"
+	"nofx/market"
 	"strings"
 	"time"
 )
@@ -191,6 +192,20 @@ func (pb *PositionBuilder) handleCloseWithPosition(
 	totalFee := position.Fee + fee
 	logger.Infof("  ✅ Full close: %s %s %.6f @ %.2f (avg exit: %.2f, entry: %.2f, PnL: %.2f)",
 		symbol, side, closeQty, price, finalExitPrice, position.EntryPrice, totalPnL)
+
+	mfeFinal := position.MaxFavorableExcursion
+	maeFinal := position.MaxAdverseExcursion
+	if mfeFinal == 0 && maeFinal == 0 {
+		if computedMFE, computedMAE, ok := computeExcursionsFromKlines(
+			symbol, side, position.EntryPrice, position.EntryQuantity, position.EntryTime, tradeTimeMs,
+		); ok {
+			mfeFinal = computedMFE
+			maeFinal = computedMAE
+		} else {
+			mfeFinal, maeFinal = estimateExcursionsFromPrice(position, finalExitPrice)
+		}
+	}
+
 	return pb.positionStore.ClosePositionFully(
 		position.ID,
 		finalExitPrice,
@@ -199,10 +214,86 @@ func (pb *PositionBuilder) handleCloseWithPosition(
 		totalPnL,
 		totalFee,
 		closeReason,
-		position.MaxFavorableExcursion,
-		position.MaxAdverseExcursion,
+		mfeFinal,
+		maeFinal,
 		exitIndicatorsJSON,
 	)
+}
+
+func estimateExcursionsFromPrice(pos *TraderPosition, price float64) (float64, float64) {
+	if pos == nil || pos.EntryPrice <= 0 {
+		return 0, 0
+	}
+	qty := pos.EntryQuantity
+	if qty <= 0 {
+		qty = pos.Quantity
+	}
+	if qty <= 0 {
+		return 0, 0
+	}
+	diff := price - pos.EntryPrice
+	side := strings.ToUpper(strings.TrimSpace(pos.Side))
+	var mfe, mae float64
+	if side == "SHORT" {
+		mfe = -diff * qty
+		mae = -diff * qty
+	} else {
+		mfe = diff * qty
+		mae = diff * qty
+	}
+	if mfe < 0 {
+		mfe = 0
+	}
+	if mae > 0 {
+		mae = 0
+	}
+	return mfe, mae
+}
+
+func computeExcursionsFromKlines(symbol, side string, entryPrice, qty float64, entryTimeMs, exitTimeMs int64) (float64, float64, bool) {
+	if entryPrice <= 0 || qty <= 0 || entryTimeMs <= 0 || exitTimeMs <= 0 {
+		return 0, 0, false
+	}
+	if exitTimeMs < entryTimeMs {
+		return 0, 0, false
+	}
+	duration := time.Duration(exitTimeMs-entryTimeMs) * time.Millisecond
+	timeframe := "1m"
+	if duration > 48*time.Hour {
+		timeframe = "15m"
+	} else if duration > 6*time.Hour {
+		timeframe = "5m"
+	}
+	klines, err := market.GetKlinesRange(symbol, timeframe, time.UnixMilli(entryTimeMs), time.UnixMilli(exitTimeMs))
+	if err != nil || len(klines) == 0 {
+		return 0, 0, false
+	}
+	maxHigh := klines[0].High
+	minLow := klines[0].Low
+	for _, k := range klines {
+		if k.High > maxHigh {
+			maxHigh = k.High
+		}
+		if k.Low < minLow {
+			minLow = k.Low
+		}
+	}
+	sideUpper := strings.ToUpper(strings.TrimSpace(side))
+	var mfe, mae float64
+	if sideUpper == "SHORT" {
+		mfe = (entryPrice - minLow) * qty
+		mae = (entryPrice - maxHigh) * qty
+	} else {
+		mfe = (maxHigh - entryPrice) * qty
+		mae = (minLow - entryPrice) * qty
+	}
+	if mfe < 0 {
+		mfe = 0
+	}
+	if mae > 0 {
+		mae = 0
+	}
+	return mfe, mae, true
 }
 
 // quantitiesMatch checks if two quantities are close enough (within tolerance)

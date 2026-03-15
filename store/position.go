@@ -517,9 +517,29 @@ func (s *PositionStore) GetClosedPositions(traderID string, limit int) ([]*Trade
 		return nil, fmt.Errorf("failed to query closed positions: %w", err)
 	}
 
+	mfeBackfillCount := 0
 	for _, pos := range positions {
 		if pos.EntryQuantity == 0 {
 			pos.EntryQuantity = pos.Quantity
+		}
+		if mfeBackfillCount < 5 && pos.MaxFavorableExcursion == 0 && pos.MaxAdverseExcursion == 0 &&
+			pos.EntryTime > 0 && pos.ExitTime > 0 && pos.EntryPrice > 0 {
+			qty := pos.EntryQuantity
+			if qty <= 0 {
+				qty = pos.Quantity
+			}
+			if qty > 0 {
+				if mfe, mae, ok := computeExcursionsFromKlines(pos.Symbol, pos.Side, pos.EntryPrice, qty, pos.EntryTime, pos.ExitTime); ok {
+					pos.MaxFavorableExcursion = mfe
+					pos.MaxAdverseExcursion = mae
+					_ = s.db.Model(&TraderPosition{}).Where("id = ?", pos.ID).Updates(map[string]interface{}{
+						"max_favorable_excursion": mfe,
+						"max_adverse_excursion":   mae,
+						"updated_at":              time.Now().UTC().UnixMilli(),
+					}).Error
+					mfeBackfillCount++
+				}
+			}
 		}
 	}
 	return positions, nil
@@ -536,9 +556,29 @@ func (s *PositionStore) GetClosedPositionsBySource(traderID string, limit int, s
 	if err != nil {
 		return nil, fmt.Errorf("failed to query closed positions: %w", err)
 	}
+	mfeBackfillCount := 0
 	for _, pos := range positions {
 		if pos.EntryQuantity == 0 {
 			pos.EntryQuantity = pos.Quantity
+		}
+		if mfeBackfillCount < 5 && pos.MaxFavorableExcursion == 0 && pos.MaxAdverseExcursion == 0 &&
+			pos.EntryTime > 0 && pos.ExitTime > 0 && pos.EntryPrice > 0 {
+			qty := pos.EntryQuantity
+			if qty <= 0 {
+				qty = pos.Quantity
+			}
+			if qty > 0 {
+				if mfe, mae, ok := computeExcursionsFromKlines(pos.Symbol, pos.Side, pos.EntryPrice, qty, pos.EntryTime, pos.ExitTime); ok {
+					pos.MaxFavorableExcursion = mfe
+					pos.MaxAdverseExcursion = mae
+					_ = s.db.Model(&TraderPosition{}).Where("id = ?", pos.ID).Updates(map[string]interface{}{
+						"max_favorable_excursion": mfe,
+						"max_adverse_excursion":   mae,
+						"updated_at":              time.Now().UTC().UnixMilli(),
+					}).Error
+					mfeBackfillCount++
+				}
+			}
 		}
 	}
 	return positions, nil
@@ -1003,57 +1043,129 @@ func calculateMaxDrawdownFromPnls(pnls []float64) float64 {
 
 // SymbolStats per-symbol trading statistics
 type SymbolStats struct {
-	Symbol      string  `json:"symbol"`
-	TotalTrades int     `json:"total_trades"`
-	WinTrades   int     `json:"win_trades"`
-	WinRate     float64 `json:"win_rate"`
-	TotalPnL    float64 `json:"total_pnl"`
-	AvgPnL      float64 `json:"avg_pnl"`
-	AvgHoldMins float64 `json:"avg_hold_mins"`
+	Symbol       string  `json:"symbol"`
+	TotalTrades  int     `json:"total_trades"`
+	WinTrades    int     `json:"win_trades"`
+	WinRate      float64 `json:"win_rate"`
+	TotalPnL     float64 `json:"total_pnl"`
+	AvgPnL       float64 `json:"avg_pnl"`
+	AvgHoldMins  float64 `json:"avg_hold_mins"`
+	PLRatio      float64 `json:"pl_ratio"`
+	SharpeRatio  float64 `json:"sharpe_ratio"`
+	CalmarRatio  float64 `json:"calmar_ratio"`
 }
 
 // GetSymbolStats gets per-symbol trading statistics
 func (s *PositionStore) GetSymbolStats(traderID string, limit int) ([]SymbolStats, error) {
 	var positions []TraderPosition
-	err := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED").Find(&positions).Error
+	err := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED").
+		Order("exit_time ASC").Find(&positions).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to query symbol stats: %w", err)
 	}
 
 	// Group by symbol
-	symbolMap := make(map[string]*SymbolStats)
-	symbolHoldMins := make(map[string][]float64)
+	type symbolAcc struct {
+		stats           *SymbolStats
+		holdMinsSum     float64
+		holdMinsCount   int
+		winPnLSum       float64
+		winCount        int
+		lossAbsSum      float64
+		lossCount       int
+		retCount        int
+		retMean         float64
+		retM2           float64
+		cumReturn       float64
+		peakReturn      float64
+		maxDrawdown     float64
+		firstEntryTime  int64
+		lastExitTime    int64
+	}
+	symbolMap := make(map[string]*symbolAcc)
 
 	for _, pos := range positions {
-		if _, ok := symbolMap[pos.Symbol]; !ok {
-			symbolMap[pos.Symbol] = &SymbolStats{Symbol: pos.Symbol}
-			symbolHoldMins[pos.Symbol] = []float64{}
+		acc, ok := symbolMap[pos.Symbol]
+		if !ok {
+			acc = &symbolAcc{stats: &SymbolStats{Symbol: pos.Symbol}}
+			symbolMap[pos.Symbol] = acc
 		}
-		s := symbolMap[pos.Symbol]
+		s := acc.stats
 		s.TotalTrades++
 		s.TotalPnL += pos.RealizedPnL
 		if pos.RealizedPnL > 0 {
 			s.WinTrades++
+			acc.winPnLSum += pos.RealizedPnL
+			acc.winCount++
+		} else if pos.RealizedPnL < 0 {
+			acc.lossAbsSum += -pos.RealizedPnL
+			acc.lossCount++
 		}
 
-		if pos.ExitTime > 0 {
-			holdMins := float64(pos.ExitTime-pos.EntryTime) / 60000.0 // ms to minutes
-			symbolHoldMins[pos.Symbol] = append(symbolHoldMins[pos.Symbol], holdMins)
+		if pos.ExitTime > 0 && pos.EntryTime > 0 && pos.ExitTime >= pos.EntryTime {
+			holdMins := float64(pos.ExitTime-pos.EntryTime) / 60000.0
+			acc.holdMinsSum += holdMins
+			acc.holdMinsCount++
+		}
+
+		if acc.firstEntryTime == 0 || (pos.EntryTime > 0 && pos.EntryTime < acc.firstEntryTime) {
+			acc.firstEntryTime = pos.EntryTime
+		}
+		if pos.ExitTime > acc.lastExitTime {
+			acc.lastExitTime = pos.ExitTime
+		}
+
+		// Per-trade return based on notional
+		notional := pos.EntryPrice * pos.Quantity
+		if notional > 0 {
+			ret := pos.RealizedPnL / notional
+			acc.retCount++
+			delta := ret - acc.retMean
+			acc.retMean += delta / float64(acc.retCount)
+			acc.retM2 += delta * (ret - acc.retMean)
+
+			acc.cumReturn += ret
+			if acc.cumReturn > acc.peakReturn {
+				acc.peakReturn = acc.cumReturn
+			}
+			drawdown := acc.peakReturn - acc.cumReturn
+			if drawdown > acc.maxDrawdown {
+				acc.maxDrawdown = drawdown
+			}
 		}
 	}
 
 	var stats []SymbolStats
-	for symbol, s := range symbolMap {
+	for _, acc := range symbolMap {
+		s := acc.stats
 		if s.TotalTrades > 0 {
 			s.WinRate = float64(s.WinTrades) / float64(s.TotalTrades) * 100
 			s.AvgPnL = s.TotalPnL / float64(s.TotalTrades)
 		}
-		if len(symbolHoldMins[symbol]) > 0 {
-			var totalMins float64
-			for _, m := range symbolHoldMins[symbol] {
-				totalMins += m
+		if acc.holdMinsCount > 0 {
+			s.AvgHoldMins = acc.holdMinsSum / float64(acc.holdMinsCount)
+		}
+		if acc.winCount > 0 && acc.lossCount > 0 && acc.lossAbsSum > 0 {
+			avgWin := acc.winPnLSum / float64(acc.winCount)
+			avgLoss := acc.lossAbsSum / float64(acc.lossCount)
+			if avgLoss > 0 {
+				s.PLRatio = avgWin / avgLoss
 			}
-			s.AvgHoldMins = totalMins / float64(len(symbolHoldMins[symbol]))
+		}
+		if acc.retCount > 1 {
+			variance := acc.retM2 / float64(acc.retCount-1)
+			if variance > 0 {
+				std := math.Sqrt(variance)
+				s.SharpeRatio = (acc.retMean / std) * math.Sqrt(float64(acc.retCount))
+			}
+		}
+		durationYears := 0.0
+		if acc.firstEntryTime > 0 && acc.lastExitTime > acc.firstEntryTime {
+			durationYears = float64(acc.lastExitTime-acc.firstEntryTime) / (365.0 * 24.0 * 60.0 * 60.0 * 1000.0)
+		}
+		if durationYears > 0 && acc.maxDrawdown > 0 {
+			annualReturn := acc.cumReturn / durationYears
+			s.CalmarRatio = annualReturn / acc.maxDrawdown
 		}
 		stats = append(stats, *s)
 	}
@@ -1192,39 +1304,104 @@ func (s *PositionStore) GetSymbolStatsBySource(traderID string, limit int, sourc
 		q = q.Where("source = ?", source)
 	}
 	var positions []TraderPosition
-	if err := q.Find(&positions).Error; err != nil {
+	if err := q.Order("exit_time ASC").Find(&positions).Error; err != nil {
 		return nil, fmt.Errorf("failed to query symbol stats: %w", err)
 	}
-	symbolMap := make(map[string]*SymbolStats)
-	symbolHoldMins := make(map[string][]float64)
+	type symbolAcc struct {
+		stats           *SymbolStats
+		holdMinsSum     float64
+		holdMinsCount   int
+		winPnLSum       float64
+		winCount        int
+		lossAbsSum      float64
+		lossCount       int
+		retCount        int
+		retMean         float64
+		retM2           float64
+		cumReturn       float64
+		peakReturn      float64
+		maxDrawdown     float64
+		firstEntryTime  int64
+		lastExitTime    int64
+	}
+	symbolMap := make(map[string]*symbolAcc)
 	for _, pos := range positions {
-		if _, ok := symbolMap[pos.Symbol]; !ok {
-			symbolMap[pos.Symbol] = &SymbolStats{Symbol: pos.Symbol}
-			symbolHoldMins[pos.Symbol] = []float64{}
+		acc, ok := symbolMap[pos.Symbol]
+		if !ok {
+			acc = &symbolAcc{stats: &SymbolStats{Symbol: pos.Symbol}}
+			symbolMap[pos.Symbol] = acc
 		}
-		st := symbolMap[pos.Symbol]
+		st := acc.stats
 		st.TotalTrades++
 		st.TotalPnL += pos.RealizedPnL
 		if pos.RealizedPnL > 0 {
 			st.WinTrades++
+			acc.winPnLSum += pos.RealizedPnL
+			acc.winCount++
+		} else if pos.RealizedPnL < 0 {
+			acc.lossAbsSum += -pos.RealizedPnL
+			acc.lossCount++
 		}
-		if pos.ExitTime > 0 {
+		if pos.ExitTime > 0 && pos.EntryTime > 0 && pos.ExitTime >= pos.EntryTime {
 			holdMins := float64(pos.ExitTime-pos.EntryTime) / 60000.0
-			symbolHoldMins[pos.Symbol] = append(symbolHoldMins[pos.Symbol], holdMins)
+			acc.holdMinsSum += holdMins
+			acc.holdMinsCount++
+		}
+		if acc.firstEntryTime == 0 || (pos.EntryTime > 0 && pos.EntryTime < acc.firstEntryTime) {
+			acc.firstEntryTime = pos.EntryTime
+		}
+		if pos.ExitTime > acc.lastExitTime {
+			acc.lastExitTime = pos.ExitTime
+		}
+		notional := pos.EntryPrice * pos.Quantity
+		if notional > 0 {
+			ret := pos.RealizedPnL / notional
+			acc.retCount++
+			delta := ret - acc.retMean
+			acc.retMean += delta / float64(acc.retCount)
+			acc.retM2 += delta * (ret - acc.retMean)
+
+			acc.cumReturn += ret
+			if acc.cumReturn > acc.peakReturn {
+				acc.peakReturn = acc.cumReturn
+			}
+			drawdown := acc.peakReturn - acc.cumReturn
+			if drawdown > acc.maxDrawdown {
+				acc.maxDrawdown = drawdown
+			}
 		}
 	}
 	var stats []SymbolStats
-	for symbol, st := range symbolMap {
+	for _, acc := range symbolMap {
+		st := acc.stats
 		if st.TotalTrades > 0 {
 			st.WinRate = float64(st.WinTrades) / float64(st.TotalTrades) * 100
 			st.AvgPnL = st.TotalPnL / float64(st.TotalTrades)
 		}
-		if len(symbolHoldMins[symbol]) > 0 {
-			var total float64
-			for _, m := range symbolHoldMins[symbol] {
-				total += m
+		if acc.holdMinsCount > 0 {
+			st.AvgHoldMins = acc.holdMinsSum / float64(acc.holdMinsCount)
+		}
+		if acc.winCount > 0 && acc.lossCount > 0 && acc.lossAbsSum > 0 {
+			avgWin := acc.winPnLSum / float64(acc.winCount)
+			avgLoss := acc.lossAbsSum / float64(acc.lossCount)
+			if avgLoss > 0 {
+				st.PLRatio = avgWin / avgLoss
 			}
-			st.AvgHoldMins = total / float64(len(symbolHoldMins[symbol]))
+		}
+		if acc.retCount > 1 {
+			variance := acc.retM2 / float64(acc.retCount-1)
+			if variance > 0 {
+				std := math.Sqrt(variance)
+				st.SharpeRatio = (acc.retMean / std) * math.Sqrt(float64(acc.retCount))
+			}
+		}
+		durationYears := 0.0
+		if acc.firstEntryTime > 0 && acc.lastExitTime > acc.firstEntryTime {
+			durationYears = float64(acc.lastExitTime-acc.firstEntryTime) / (365.0 * 24.0 * 60.0 * 60.0 * 1000.0)
+		}
+		if durationYears > 0 && acc.maxDrawdown > 0 {
+			annualReturn := acc.cumReturn / durationYears
+			st.CalmarRatio = annualReturn / acc.maxDrawdown
 		}
 		stats = append(stats, *st)
 	}
