@@ -922,6 +922,11 @@ func getRealtimeKlines(symbol, interval, exchange string, count int) ([]Kline, b
 	return data, true
 }
 
+// GetRealtimeKlines returns a snapshot of the in-memory kline ring for the stream, if available.
+func GetRealtimeKlines(symbol, interval, exchange string, count int) ([]Kline, bool) {
+	return getRealtimeKlines(symbol, interval, exchange, count)
+}
+
 func coinankResultToKline(k coinank.KlineResult) Kline {
 	return Kline{
 		OpenTime:  k.StartTime,
@@ -991,4 +996,3 @@ func mapIntervalToEnum(interval string) (coinank_enum.Interval, bool) {
 		return "", false
 	}
 }
-

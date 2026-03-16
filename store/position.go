@@ -67,7 +67,9 @@ type TraderStats struct {
 	LossTrades     int     `json:"loss_trades"`
 	WinRate        float64 `json:"win_rate"`
 	ProfitFactor   float64 `json:"profit_factor"`
+	PLRatio        float64 `json:"pl_ratio"`
 	SharpeRatio    float64 `json:"sharpe_ratio"`
+	CalmarRatio    float64 `json:"calmar_ratio"`
 	TotalPnL       float64 `json:"total_pnl"`
 	TotalFee       float64 `json:"total_fee"`
 	AvgWin         float64 `json:"avg_win"`
@@ -123,9 +125,34 @@ func NewPositionStore(db *gorm.DB) *PositionStore {
 	return &PositionStore{db: db}
 }
 
+func (s *PositionStore) withResetCutoff(q *gorm.DB, resetAt time.Time) *gorm.DB {
+	if resetAt.IsZero() {
+		return q
+	}
+	return q.Where("entry_time >= ?", resetAt.UTC().UnixMilli())
+}
+
+func (s *PositionStore) closedPositionsQuery(traderID, source string, resetAt time.Time) *gorm.DB {
+	q := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED")
+	if source != "" {
+		q = q.Where("source = ?", source)
+	}
+	return s.withResetCutoff(q, resetAt)
+}
+
 // isPostgres checks if the database is PostgreSQL
 func (s *PositionStore) isPostgres() bool {
 	return s.db.Dialector.Name() == "postgres"
+}
+
+func (s *PositionStore) ensureCommonIndexes() {
+	// Accelerates history/stat queries that repeatedly filter by trader + status
+	// and often sort by exit time or further filter by source.
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_positions_trader_status_exit ON trader_positions(trader_id, status, exit_time DESC)`)
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_positions_trader_status_source_exit ON trader_positions(trader_id, status, source, exit_time DESC)`)
+	// Accelerates logical-reset queries that filter by entry_time >= reset_timestamp.
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_positions_trader_status_entry ON trader_positions(trader_id, status, entry_time DESC)`)
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_positions_trader_status_source_entry ON trader_positions(trader_id, status, source, entry_time DESC)`)
 }
 
 // InitTables initializes position tables
@@ -167,6 +194,7 @@ func (s *PositionStore) InitTables() error {
 
 			// Just ensure index exists
 			s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_exchange_pos_unique ON trader_positions(exchange_id, exchange_position_id) WHERE exchange_position_id != ''`)
+			s.ensureCommonIndexes()
 			// 实盘 PendingReasoning：确保表存在
 			_ = s.db.AutoMigrate(&PendingReasoning{})
 			return nil
@@ -212,6 +240,8 @@ func (s *PositionStore) InitTables() error {
 			return fmt.Errorf("failed to create unique index: %w", err)
 		}
 	}
+
+	s.ensureCommonIndexes()
 
 	return nil
 }
@@ -370,14 +400,35 @@ func (s *PositionStore) DeleteAllOpenPositions(traderID string) error {
 	return s.db.Where("trader_id = ? AND status = ?", traderID, "OPEN").Delete(&TraderPosition{}).Error
 }
 
+// DeleteAllRecordsByTrader deletes all persisted runtime data for a trader so it can restart from a blank state.
+func (s *PositionStore) DeleteAllRecordsByTrader(traderID string) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("trader_id = ?", traderID).Delete(&TraderPosition{}).Error; err != nil {
+			return fmt.Errorf("failed to delete trader positions: %w", err)
+		}
+		if err := tx.Where("trader_id = ?", traderID).Delete(&DecisionRecordDB{}).Error; err != nil {
+			return fmt.Errorf("failed to delete trader decision records: %w", err)
+		}
+		if err := tx.Where("trader_id = ?", traderID).Delete(&EquitySnapshot{}).Error; err != nil {
+			return fmt.Errorf("failed to delete trader equity snapshots: %w", err)
+		}
+		return nil
+	})
+}
+
 // GetOpenPositions gets all open positions
 func (s *PositionStore) GetOpenPositions(traderID string) ([]*TraderPosition, error) {
-	return s.GetOpenPositionsBySource(traderID, "")
+	return s.GetOpenPositionsBySourceSince(traderID, "", time.Time{})
 }
 
 // GetOpenPositionsBySource gets open positions optionally filtered by source (e.g. "dry_run" for paper trading)
 func (s *PositionStore) GetOpenPositionsBySource(traderID, source string) ([]*TraderPosition, error) {
-	q := s.db.Where("trader_id = ? AND status = ?", traderID, "OPEN")
+	return s.GetOpenPositionsBySourceSince(traderID, source, time.Time{})
+}
+
+// GetOpenPositionsBySourceSince gets open positions optionally filtered by source and reset timestamp.
+func (s *PositionStore) GetOpenPositionsBySourceSince(traderID, source string, resetAt time.Time) ([]*TraderPosition, error) {
+	q := s.withResetCutoff(s.db.Where("trader_id = ? AND status = ?", traderID, "OPEN"), resetAt)
 	if source != "" {
 		q = q.Where("source = ?", source)
 	}
@@ -508,11 +559,18 @@ func (s *PositionStore) GetClosedPositionByExitOrderID(exchangeID, exitOrderID s
 
 // GetClosedPositions gets closed positions
 func (s *PositionStore) GetClosedPositions(traderID string, limit int) ([]*TraderPosition, error) {
+	return s.GetClosedPositionsSince(traderID, limit, time.Time{})
+}
+
+// GetClosedPositionsSince gets closed positions created on/after resetAt.
+func (s *PositionStore) GetClosedPositionsSince(traderID string, limit int, resetAt time.Time) ([]*TraderPosition, error) {
+	return s.GetClosedPositionsBySourceSince(traderID, limit, "", resetAt)
+}
+
+// GetClosedPositions gets closed positions
+func (s *PositionStore) getClosedPositionsByQuery(q *gorm.DB, limit int) ([]*TraderPosition, error) {
 	var positions []*TraderPosition
-	err := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED").
-		Order("exit_time DESC").
-		Limit(limit).
-		Find(&positions).Error
+	err := q.Order("exit_time DESC").Limit(limit).Find(&positions).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to query closed positions: %w", err)
 	}
@@ -547,41 +605,12 @@ func (s *PositionStore) GetClosedPositions(traderID string, limit int) ([]*Trade
 
 // GetClosedPositionsBySource gets closed positions filtered by source (e.g. "dry_run")
 func (s *PositionStore) GetClosedPositionsBySource(traderID string, limit int, source string) ([]*TraderPosition, error) {
-	q := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED")
-	if source != "" {
-		q = q.Where("source = ?", source)
-	}
-	var positions []*TraderPosition
-	err := q.Order("exit_time DESC").Limit(limit).Find(&positions).Error
-	if err != nil {
-		return nil, fmt.Errorf("failed to query closed positions: %w", err)
-	}
-	mfeBackfillCount := 0
-	for _, pos := range positions {
-		if pos.EntryQuantity == 0 {
-			pos.EntryQuantity = pos.Quantity
-		}
-		if mfeBackfillCount < 5 && pos.MaxFavorableExcursion == 0 && pos.MaxAdverseExcursion == 0 &&
-			pos.EntryTime > 0 && pos.ExitTime > 0 && pos.EntryPrice > 0 {
-			qty := pos.EntryQuantity
-			if qty <= 0 {
-				qty = pos.Quantity
-			}
-			if qty > 0 {
-				if mfe, mae, ok := computeExcursionsFromKlines(pos.Symbol, pos.Side, pos.EntryPrice, qty, pos.EntryTime, pos.ExitTime); ok {
-					pos.MaxFavorableExcursion = mfe
-					pos.MaxAdverseExcursion = mae
-					_ = s.db.Model(&TraderPosition{}).Where("id = ?", pos.ID).Updates(map[string]interface{}{
-						"max_favorable_excursion": mfe,
-						"max_adverse_excursion":   mae,
-						"updated_at":              time.Now().UTC().UnixMilli(),
-					}).Error
-					mfeBackfillCount++
-				}
-			}
-		}
-	}
-	return positions, nil
+	return s.GetClosedPositionsBySourceSince(traderID, limit, source, time.Time{})
+}
+
+// GetClosedPositionsBySourceSince gets closed positions filtered by source and reset timestamp.
+func (s *PositionStore) GetClosedPositionsBySourceSince(traderID string, limit int, source string, resetAt time.Time) ([]*TraderPosition, error) {
+	return s.getClosedPositionsByQuery(s.closedPositionsQuery(traderID, source, resetAt), limit)
 }
 
 // GetAllOpenPositions gets all traders' open positions
@@ -604,6 +633,11 @@ func (s *PositionStore) GetAllOpenPositions() ([]*TraderPosition, error) {
 
 // GetPositionStats gets position statistics
 func (s *PositionStore) GetPositionStats(traderID string) (map[string]interface{}, error) {
+	return s.GetPositionStatsSince(traderID, time.Time{})
+}
+
+// GetPositionStatsSince gets position statistics on/after resetAt.
+func (s *PositionStore) GetPositionStatsSince(traderID string, resetAt time.Time) (map[string]interface{}, error) {
 	stats := make(map[string]interface{})
 
 	type result struct {
@@ -614,7 +648,7 @@ func (s *PositionStore) GetPositionStats(traderID string) (map[string]interface{
 	}
 	var r result
 
-	err := s.db.Model(&TraderPosition{}).
+	err := s.withResetCutoff(s.db.Model(&TraderPosition{}), resetAt).
 		Select("COUNT(*) as total, SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins, COALESCE(SUM(realized_pnl), 0) as total_pnl, COALESCE(SUM(fee), 0) as total_fee").
 		Where("trader_id = ? AND status = ?", traderID, "CLOSED").
 		Scan(&r).Error
@@ -637,10 +671,15 @@ func (s *PositionStore) GetPositionStats(traderID string) (map[string]interface{
 
 // GetFullStats gets complete trading statistics
 func (s *PositionStore) GetFullStats(traderID string) (*TraderStats, error) {
+	return s.GetFullStatsSince(traderID, time.Time{})
+}
+
+// GetFullStatsSince gets complete trading statistics on/after resetAt.
+func (s *PositionStore) GetFullStatsSince(traderID string, resetAt time.Time) (*TraderStats, error) {
 	stats := &TraderStats{}
 
 	var count int64
-	if err := s.db.Model(&TraderPosition{}).Where("trader_id = ? AND status = ?", traderID, "CLOSED").Count(&count).Error; err != nil {
+	if err := s.closedPositionsQuery(traderID, "", resetAt).Model(&TraderPosition{}).Count(&count).Error; err != nil {
 		return nil, err
 	}
 	if count == 0 {
@@ -648,15 +687,16 @@ func (s *PositionStore) GetFullStats(traderID string) (*TraderStats, error) {
 	}
 
 	var positions []TraderPosition
-	err := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED").
-		Order("exit_time ASC").
-		Find(&positions).Error
+	err := s.closedPositionsQuery(traderID, "", resetAt).Order("exit_time ASC").Find(&positions).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to query position statistics: %w", err)
 	}
 
 	var pnls []float64
 	var totalWin, totalLoss float64
+	var retCount int
+	var retMean, retM2, cumReturn, peakReturn, maxDrawdown float64
+	var firstEntryTime, lastExitTime int64
 
 	for _, pos := range positions {
 		stats.TotalTrades++
@@ -670,6 +710,31 @@ func (s *PositionStore) GetFullStats(traderID string) (*TraderStats, error) {
 		} else if pos.RealizedPnL < 0 {
 			stats.LossTrades++
 			totalLoss += -pos.RealizedPnL
+		}
+
+		if pos.EntryTime > 0 && (firstEntryTime == 0 || pos.EntryTime < firstEntryTime) {
+			firstEntryTime = pos.EntryTime
+		}
+		if pos.ExitTime > lastExitTime {
+			lastExitTime = pos.ExitTime
+		}
+
+		notional := pos.EntryPrice * pos.Quantity
+		if notional > 0 {
+			ret := pos.RealizedPnL / notional
+			retCount++
+			delta := ret - retMean
+			retMean += delta / float64(retCount)
+			retM2 += delta * (ret - retMean)
+
+			cumReturn += ret
+			if cumReturn > peakReturn {
+				peakReturn = cumReturn
+			}
+			drawdown := peakReturn - cumReturn
+			if drawdown > maxDrawdown {
+				maxDrawdown = drawdown
+			}
 		}
 	}
 
@@ -685,11 +750,22 @@ func (s *PositionStore) GetFullStats(traderID string) (*TraderStats, error) {
 	if stats.LossTrades > 0 {
 		stats.AvgLoss = totalLoss / float64(stats.LossTrades)
 	}
+	if stats.AvgLoss > 0 {
+		stats.PLRatio = stats.AvgWin / stats.AvgLoss
+	}
 	if len(pnls) > 1 {
 		stats.SharpeRatio = calculateSharpeRatioFromPnls(pnls)
 	}
 	if len(pnls) > 0 {
 		stats.MaxDrawdownPct = calculateMaxDrawdownFromPnls(pnls)
+	}
+	durationYears := 0.0
+	if firstEntryTime > 0 && lastExitTime > firstEntryTime {
+		durationYears = float64(lastExitTime-firstEntryTime) / (365.0 * 24.0 * 60.0 * 60.0 * 1000.0)
+	}
+	if durationYears > 0 && maxDrawdown > 0 {
+		annualReturn := cumReturn / durationYears
+		stats.CalmarRatio = annualReturn / maxDrawdown
 	}
 
 	return stats, nil
@@ -697,13 +773,14 @@ func (s *PositionStore) GetFullStats(traderID string) (*TraderStats, error) {
 
 // GetFullStatsBySource 按 source 过滤的统计（模拟盘仅统计 source='dry_run' 的已平仓订单）
 func (s *PositionStore) GetFullStatsBySource(traderID, source string) (*TraderStats, error) {
+	return s.GetFullStatsBySourceSince(traderID, source, time.Time{})
+}
+
+// GetFullStatsBySourceSince gets complete trading statistics filtered by source and reset timestamp.
+func (s *PositionStore) GetFullStatsBySourceSince(traderID, source string, resetAt time.Time) (*TraderStats, error) {
 	stats := &TraderStats{}
 	var positions []TraderPosition
-	q := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED")
-	if source != "" {
-		q = q.Where("source = ?", source)
-	}
-	err := q.Order("exit_time ASC").Find(&positions).Error
+	err := s.closedPositionsQuery(traderID, source, resetAt).Order("exit_time ASC").Find(&positions).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to query position statistics: %w", err)
 	}
@@ -712,6 +789,9 @@ func (s *PositionStore) GetFullStatsBySource(traderID, source string) (*TraderSt
 	}
 	var pnls []float64
 	var totalWin, totalLoss float64
+	var retCount int
+	var retMean, retM2, cumReturn, peakReturn, maxDrawdown float64
+	var firstEntryTime, lastExitTime int64
 	for _, pos := range positions {
 		stats.TotalTrades++
 		stats.TotalPnL += pos.RealizedPnL
@@ -723,6 +803,31 @@ func (s *PositionStore) GetFullStatsBySource(traderID, source string) (*TraderSt
 		} else if pos.RealizedPnL < 0 {
 			stats.LossTrades++
 			totalLoss += -pos.RealizedPnL
+		}
+
+		if pos.EntryTime > 0 && (firstEntryTime == 0 || pos.EntryTime < firstEntryTime) {
+			firstEntryTime = pos.EntryTime
+		}
+		if pos.ExitTime > lastExitTime {
+			lastExitTime = pos.ExitTime
+		}
+
+		notional := pos.EntryPrice * pos.Quantity
+		if notional > 0 {
+			ret := pos.RealizedPnL / notional
+			retCount++
+			delta := ret - retMean
+			retMean += delta / float64(retCount)
+			retM2 += delta * (ret - retMean)
+
+			cumReturn += ret
+			if cumReturn > peakReturn {
+				peakReturn = cumReturn
+			}
+			drawdown := peakReturn - cumReturn
+			if drawdown > maxDrawdown {
+				maxDrawdown = drawdown
+			}
 		}
 	}
 	if stats.TotalTrades > 0 {
@@ -737,11 +842,22 @@ func (s *PositionStore) GetFullStatsBySource(traderID, source string) (*TraderSt
 	if stats.LossTrades > 0 {
 		stats.AvgLoss = totalLoss / float64(stats.LossTrades)
 	}
+	if stats.AvgLoss > 0 {
+		stats.PLRatio = stats.AvgWin / stats.AvgLoss
+	}
 	if len(pnls) > 1 {
 		stats.SharpeRatio = calculateSharpeRatioFromPnls(pnls)
 	}
 	if len(pnls) > 0 {
 		stats.MaxDrawdownPct = calculateMaxDrawdownFromPnls(pnls)
+	}
+	durationYears := 0.0
+	if firstEntryTime > 0 && lastExitTime > firstEntryTime {
+		durationYears = float64(lastExitTime-firstEntryTime) / (365.0 * 24.0 * 60.0 * 60.0 * 1000.0)
+	}
+	if durationYears > 0 && maxDrawdown > 0 {
+		annualReturn := cumReturn / durationYears
+		stats.CalmarRatio = annualReturn / maxDrawdown
 	}
 	return stats, nil
 }
@@ -761,11 +877,13 @@ type RecentTrade struct {
 
 // GetRecentTrades gets recent closed trades
 func (s *PositionStore) GetRecentTrades(traderID string, limit int) ([]RecentTrade, error) {
+	return s.GetRecentTradesSince(traderID, limit, time.Time{})
+}
+
+// GetRecentTradesSince gets recent closed trades on/after resetAt.
+func (s *PositionStore) GetRecentTradesSince(traderID string, limit int, resetAt time.Time) ([]RecentTrade, error) {
 	var positions []TraderPosition
-	err := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED").
-		Order("exit_time DESC").
-		Limit(limit).
-		Find(&positions).Error
+	err := s.closedPositionsQuery(traderID, "", resetAt).Order("exit_time DESC").Limit(limit).Find(&positions).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to query recent trades: %w", err)
 	}
@@ -809,12 +927,13 @@ type RecentTradeWithSource struct {
 
 // GetRecentTradesBySource gets recent closed trades filtered by source (e.g. "dry_run")
 func (s *PositionStore) GetRecentTradesBySource(traderID string, limit int, source string) ([]RecentTradeWithSource, error) {
-	q := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED")
-	if source != "" {
-		q = q.Where("source = ?", source)
-	}
+	return s.GetRecentTradesBySourceSince(traderID, limit, source, time.Time{})
+}
+
+// GetRecentTradesBySourceSince gets recent closed trades filtered by source and reset timestamp.
+func (s *PositionStore) GetRecentTradesBySourceSince(traderID string, limit int, source string, resetAt time.Time) ([]RecentTradeWithSource, error) {
 	var positions []TraderPosition
-	err := q.Order("exit_time DESC").Limit(limit).Find(&positions).Error
+	err := s.closedPositionsQuery(traderID, source, resetAt).Order("exit_time DESC").Limit(limit).Find(&positions).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to query recent trades: %w", err)
 	}
@@ -853,6 +972,82 @@ type RecentTradeWithReasoning struct {
 	PositionID       int64  `json:"position_id"`        // 唯一仓位 ID，防串线
 	AiReasoningAtOpen string `json:"ai_reasoning_at_open"` // 开仓时原始思维链（仅来自 DB，禁止 AI 改写）
 	CloseReason      string `json:"close_reason"`       // 系统平仓触发点：StopLoss / TakeProfit / sync 等
+}
+
+// SymbolExcursionSummary aggregates historical MAE/MFE behavior for one symbol.
+type SymbolExcursionSummary struct {
+	Symbol           string  `json:"symbol"`
+	AvgMAEPct        float64 `json:"avg_mae_pct"`
+	AvgMFEPct        float64 `json:"avg_mfe_pct"`
+	LastTradeMAEPct  float64 `json:"last_trade_mae_pct"`
+	LastTradeMFEPct  float64 `json:"last_trade_mfe_pct"`
+	LastTradeSide    string  `json:"last_trade_side"`
+	LastTradeExitTime int64  `json:"last_trade_exit_time"`
+	TradeCount       int     `json:"trade_count"`
+}
+
+// GetSymbolExcursionSummaries gets average and last-trade MAE/MFE percentage stats for the given symbols.
+func (s *PositionStore) GetSymbolExcursionSummaries(traderID string, symbols []string, source string, resetAt time.Time) (map[string]*SymbolExcursionSummary, error) {
+	if len(symbols) == 0 {
+		return map[string]*SymbolExcursionSummary{}, nil
+	}
+
+	symbolSet := make(map[string]struct{}, len(symbols))
+	normalized := make([]string, 0, len(symbols))
+	for _, symbol := range symbols {
+		symbol = strings.TrimSpace(symbol)
+		if symbol == "" {
+			continue
+		}
+		if _, exists := symbolSet[symbol]; exists {
+			continue
+		}
+		symbolSet[symbol] = struct{}{}
+		normalized = append(normalized, symbol)
+	}
+	if len(normalized) == 0 {
+		return map[string]*SymbolExcursionSummary{}, nil
+	}
+
+	var positions []TraderPosition
+	q := s.closedPositionsQuery(traderID, source, resetAt).
+		Where("symbol IN ?", normalized).
+		Order("exit_time ASC")
+	if err := q.Find(&positions).Error; err != nil {
+		return nil, fmt.Errorf("failed to query symbol excursion summaries: %w", err)
+	}
+
+	out := make(map[string]*SymbolExcursionSummary, len(normalized))
+	for _, pos := range positions {
+		notional := pos.EntryPrice * pos.Quantity
+		if notional <= 0 {
+			continue
+		}
+		maePct := pos.MaxAdverseExcursion / notional * 100
+		mfePct := pos.MaxFavorableExcursion / notional * 100
+
+		summary, ok := out[pos.Symbol]
+		if !ok {
+			summary = &SymbolExcursionSummary{Symbol: pos.Symbol}
+			out[pos.Symbol] = summary
+		}
+		summary.TradeCount++
+		summary.AvgMAEPct += maePct
+		summary.AvgMFEPct += mfePct
+		summary.LastTradeMAEPct = maePct
+		summary.LastTradeMFEPct = mfePct
+		summary.LastTradeSide = strings.ToLower(pos.Side)
+		summary.LastTradeExitTime = pos.ExitTime
+	}
+
+	for _, summary := range out {
+		if summary.TradeCount > 0 {
+			summary.AvgMAEPct /= float64(summary.TradeCount)
+			summary.AvgMFEPct /= float64(summary.TradeCount)
+		}
+	}
+
+	return out, nil
 }
 
 // GetRecentTradesWithReasoning returns recent closed trades including AI reasoning at open for复盘
@@ -1053,13 +1248,19 @@ type SymbolStats struct {
 	PLRatio      float64 `json:"pl_ratio"`
 	SharpeRatio  float64 `json:"sharpe_ratio"`
 	CalmarRatio  float64 `json:"calmar_ratio"`
+	MAEAvg       float64 `json:"mae_avg"`
+	MAEMin       float64 `json:"mae_min"`
 }
 
 // GetSymbolStats gets per-symbol trading statistics
 func (s *PositionStore) GetSymbolStats(traderID string, limit int) ([]SymbolStats, error) {
+	return s.GetSymbolStatsSince(traderID, limit, time.Time{})
+}
+
+// GetSymbolStatsSince gets per-symbol trading statistics on/after resetAt.
+func (s *PositionStore) GetSymbolStatsSince(traderID string, limit int, resetAt time.Time) ([]SymbolStats, error) {
 	var positions []TraderPosition
-	err := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED").
-		Order("exit_time ASC").Find(&positions).Error
+	err := s.closedPositionsQuery(traderID, "", resetAt).Order("exit_time ASC").Find(&positions).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to query symbol stats: %w", err)
 	}
@@ -1073,6 +1274,10 @@ func (s *PositionStore) GetSymbolStats(traderID string, limit int) ([]SymbolStat
 		winCount        int
 		lossAbsSum      float64
 		lossCount       int
+		maePctMin       float64
+		maePctInit      bool
+		maePctSum       float64
+		maePctCount     int
 		retCount        int
 		retMean         float64
 		retM2           float64
@@ -1118,6 +1323,16 @@ func (s *PositionStore) GetSymbolStats(traderID string, limit int) ([]SymbolStat
 		// Per-trade return based on notional
 		notional := pos.EntryPrice * pos.Quantity
 		if notional > 0 {
+			maePct := pos.MaxAdverseExcursion / notional * 100
+			if !acc.maePctInit {
+				acc.maePctMin = maePct
+				acc.maePctInit = true
+			} else if maePct < acc.maePctMin {
+				acc.maePctMin = maePct
+			}
+			acc.maePctSum += maePct
+			acc.maePctCount++
+
 			ret := pos.RealizedPnL / notional
 			acc.retCount++
 			delta := ret - acc.retMean
@@ -1166,6 +1381,12 @@ func (s *PositionStore) GetSymbolStats(traderID string, limit int) ([]SymbolStat
 		if durationYears > 0 && acc.maxDrawdown > 0 {
 			annualReturn := acc.cumReturn / durationYears
 			s.CalmarRatio = annualReturn / acc.maxDrawdown
+		}
+		if acc.maePctInit {
+			s.MAEMin = acc.maePctMin
+		}
+		if acc.maePctCount > 0 {
+			s.MAEAvg = acc.maePctSum / float64(acc.maePctCount)
 		}
 		stats = append(stats, *s)
 	}
@@ -1266,8 +1487,13 @@ type DirectionStats struct {
 
 // GetDirectionStats analyzes long vs short performance
 func (s *PositionStore) GetDirectionStats(traderID string) ([]DirectionStats, error) {
+	return s.GetDirectionStatsSince(traderID, time.Time{})
+}
+
+// GetDirectionStatsSince analyzes long vs short performance on/after resetAt.
+func (s *PositionStore) GetDirectionStatsSince(traderID string, resetAt time.Time) ([]DirectionStats, error) {
 	var positions []TraderPosition
-	err := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED").Find(&positions).Error
+	err := s.closedPositionsQuery(traderID, "", resetAt).Find(&positions).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to query direction stats: %w", err)
 	}
@@ -1299,12 +1525,13 @@ func (s *PositionStore) GetDirectionStats(traderID string) ([]DirectionStats, er
 
 // GetSymbolStatsBySource gets per-symbol stats filtered by source (e.g. "dry_run")
 func (s *PositionStore) GetSymbolStatsBySource(traderID string, limit int, source string) ([]SymbolStats, error) {
-	q := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED")
-	if source != "" {
-		q = q.Where("source = ?", source)
-	}
+	return s.GetSymbolStatsBySourceSince(traderID, limit, source, time.Time{})
+}
+
+// GetSymbolStatsBySourceSince gets per-symbol stats filtered by source and reset timestamp.
+func (s *PositionStore) GetSymbolStatsBySourceSince(traderID string, limit int, source string, resetAt time.Time) ([]SymbolStats, error) {
 	var positions []TraderPosition
-	if err := q.Order("exit_time ASC").Find(&positions).Error; err != nil {
+	if err := s.closedPositionsQuery(traderID, source, resetAt).Order("exit_time ASC").Find(&positions).Error; err != nil {
 		return nil, fmt.Errorf("failed to query symbol stats: %w", err)
 	}
 	type symbolAcc struct {
@@ -1315,6 +1542,10 @@ func (s *PositionStore) GetSymbolStatsBySource(traderID string, limit int, sourc
 		winCount        int
 		lossAbsSum      float64
 		lossCount       int
+		maePctMin       float64
+		maePctInit      bool
+		maePctSum       float64
+		maePctCount     int
 		retCount        int
 		retMean         float64
 		retM2           float64
@@ -1355,6 +1586,16 @@ func (s *PositionStore) GetSymbolStatsBySource(traderID string, limit int, sourc
 		}
 		notional := pos.EntryPrice * pos.Quantity
 		if notional > 0 {
+			maePct := pos.MaxAdverseExcursion / notional * 100
+			if !acc.maePctInit {
+				acc.maePctMin = maePct
+				acc.maePctInit = true
+			} else if maePct < acc.maePctMin {
+				acc.maePctMin = maePct
+			}
+			acc.maePctSum += maePct
+			acc.maePctCount++
+
 			ret := pos.RealizedPnL / notional
 			acc.retCount++
 			delta := ret - acc.retMean
@@ -1403,6 +1644,12 @@ func (s *PositionStore) GetSymbolStatsBySource(traderID string, limit int, sourc
 			annualReturn := acc.cumReturn / durationYears
 			st.CalmarRatio = annualReturn / acc.maxDrawdown
 		}
+		if acc.maePctInit {
+			st.MAEMin = acc.maePctMin
+		}
+		if acc.maePctCount > 0 {
+			st.MAEAvg = acc.maePctSum / float64(acc.maePctCount)
+		}
 		stats = append(stats, *st)
 	}
 	for i := 0; i < len(stats)-1; i++ {
@@ -1420,12 +1667,13 @@ func (s *PositionStore) GetSymbolStatsBySource(traderID string, limit int, sourc
 
 // GetDirectionStatsBySource gets long/short stats filtered by source (e.g. "dry_run")
 func (s *PositionStore) GetDirectionStatsBySource(traderID, source string) ([]DirectionStats, error) {
-	q := s.db.Where("trader_id = ? AND status = ?", traderID, "CLOSED")
-	if source != "" {
-		q = q.Where("source = ?", source)
-	}
+	return s.GetDirectionStatsBySourceSince(traderID, source, time.Time{})
+}
+
+// GetDirectionStatsBySourceSince gets long/short stats filtered by source and reset timestamp.
+func (s *PositionStore) GetDirectionStatsBySourceSince(traderID, source string, resetAt time.Time) ([]DirectionStats, error) {
 	var positions []TraderPosition
-	if err := q.Find(&positions).Error; err != nil {
+	if err := s.closedPositionsQuery(traderID, source, resetAt).Find(&positions).Error; err != nil {
 		return nil, fmt.Errorf("failed to query direction stats: %w", err)
 	}
 	sideStats := make(map[string]*DirectionStats)

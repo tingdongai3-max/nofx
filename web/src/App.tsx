@@ -17,6 +17,7 @@ import { StrategyMarketPage } from './pages/StrategyMarketPage'
 import { DataPage } from './pages/DataPage'
 import { QuantDashboardPage } from './pages/QuantDashboardPage'
 import { LoginRequiredOverlay } from './components/LoginRequiredOverlay'
+import { OpenClawWidget } from './components/OpenClawWidget'
 import HeaderBar from './components/HeaderBar'
 import { LanguageProvider, useLanguage } from './contexts/LanguageContext'
 import { AuthProvider, useAuth } from './contexts/AuthContext'
@@ -526,6 +527,7 @@ function App() {
           </motion.div>
         </AnimatePresence>
       </main>
+      <OpenClawWidget />
 
       {/* Footer - Hidden on debate page */}
       {currentPage !== 'debate' && (

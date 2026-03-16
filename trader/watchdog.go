@@ -13,7 +13,9 @@ import (
 	"time"
 )
 
-const watchdogInterval = 5 * time.Second  // 仅用于指标追踪狗
+const watchdogInterval = 5 * time.Second
+const defenseTimeframe = "15m"
+const defenseBars = 60
 const atrWatchdogFallbackInterval = 60 * time.Second // ATR 狗兜底：数据流无推送时最多 60s 检查一次，避免轮询封禁
 
 // ATRTrailingState 单仓位 ATR 移动止盈止损状态（由 AI 输出，机器狗按价格监控触发）
@@ -32,6 +34,29 @@ type ATRTrailingState struct {
 	FirstBatchClosed bool    // 是否已执行 1R 首批 40% 止盈
 	TrailingSLPrice  float64 // 1R 后追踪止损价（仅向有利方向移动）
 	AIStopLoss       float64 // AI 通过 hold/wait 下发的 stop_loss 价；与 TrailingSLPrice 取并集（谁先触发听谁的）
+}
+
+// StagedTakeProfitState is the watchdog-owned two-stage TP and defense state.
+type StagedTakeProfitState struct {
+	Symbol               string
+	Side                 string
+	EntryPrice           float64
+	OriginalQty          float64
+	StopLoss             float64
+	Target1Price         float64
+	Target2Price         float64
+	TP1Triggered         bool
+	TP2Triggered         bool
+	BreakEvenStopPrice   float64
+	TrailActivationPrice float64
+	TrailingActive       bool
+	TrailingStopPrice    float64
+}
+
+type WatchdogHooks struct {
+	GetStagedTakeProfitStates func() map[string]*StagedTakeProfitState
+	OnStagedPartialClose      func(symbol, side string, closedQty float64, stageIndex int)
+	OnStagedFullClose         func(symbol, side string)
 }
 
 var (
@@ -68,19 +93,25 @@ func normalizeATRStages(stages []kernel.ATRTrailingStage) []kernel.ATRTrailingSt
 // symbol, action (close_long/close_short), orderResult from exchange, quantity, exitPrice, entryPrice.
 type OnWatchdogClose func(symbol, action string, orderResult map[string]interface{}, quantity, exitPrice, entryPrice float64)
 
-// RunRiskWatchdog starts the indicator-trailing risk watchdog goroutine.
-// When EnableIndicatorTrailing is true, it periodically checks positions and closes them
-// when price breaks the configured TrailingIndicator (e.g. long: price < EMA20 → close; short: price > EMA20 → close).
-// getExchange must return the trader's connected exchange (okx, binance, etc.) - K-line data is fetched from that exchange
-// to avoid cross-exchange data pollution. ctx.Done() stops the loop.
+// RunRiskWatchdog starts the system defense watchdog goroutine.
+// It listens to the exchange-bound kline stream and latest price feed, then force-closes
+// positions immediately when enabled hard defense conditions are hit.
 func RunRiskWatchdog(
 	ctx context.Context,
 	trader Trader,
 	getConfig func() *store.StrategyConfig,
 	getExchange func() string,
 	onClose OnWatchdogClose,
+	hooks *WatchdogHooks,
 ) {
-	go runRiskWatchdogLoop(ctx, trader, getConfig, getExchange, onClose)
+	go runRiskWatchdogLoop(ctx, trader, getConfig, getExchange, onClose, hooks)
+}
+
+type watchdogPosition struct {
+	Symbol     string
+	Side       string
+	Quantity   float64
+	EntryPrice float64
 }
 
 func runRiskWatchdogLoop(
@@ -89,17 +120,32 @@ func runRiskWatchdogLoop(
 	getConfig func() *store.StrategyConfig,
 	getExchange func() string,
 	onClose OnWatchdogClose,
+	hooks *WatchdogHooks,
 ) {
+	klineCh := market.SubscribeKlineUpdates()
 	ticker := time.NewTicker(watchdogInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Infof("🛡️ Risk Watchdog stopped")
+			logger.Infof("🛡️ System Risk Watchdog stopped")
 			return
+		case ev, ok := <-klineCh:
+			if !ok {
+				return
+			}
+			cfg := getConfig()
+			if cfg == nil || !watchdogEnabled(cfg) {
+				continue
+			}
+			exchange := getWatchdogExchange(getExchange)
+			if !strings.EqualFold(ev.Exchange, exchange) || ev.Interval != defenseTimeframe {
+				continue
+			}
+			runWatchdogCycle(ctx, trader, getConfig, getExchange, onClose, hooks)
 		case <-ticker.C:
-			runWatchdogCycle(ctx, trader, getConfig, getExchange, onClose)
+			runWatchdogCycle(ctx, trader, getConfig, getExchange, onClose, hooks)
 		}
 	}
 }
@@ -110,147 +156,476 @@ func runWatchdogCycle(
 	getConfig func() *store.StrategyConfig,
 	getExchange func() string,
 	onClose OnWatchdogClose,
+	hooks *WatchdogHooks,
 ) {
 	cfg := getConfig()
-	if cfg == nil || !cfg.Indicators.EnableIndicatorTrailing {
+	if cfg == nil || !watchdogEnabled(cfg) {
 		return
 	}
-	indicatorKey := strings.TrimSpace(cfg.Indicators.TrailingIndicator)
-	if indicatorKey == "" {
-		indicatorKey = "ema_20"
-	}
-	trailingTf := strings.TrimSpace(cfg.Indicators.TrailingTimeframe)
-	if trailingTf == "" {
-		trailingTf = "5m"
-	}
-	// 原样使用偏移量，支持正数（跌破后延迟平仓）与负数（未触及提前抢跑），严禁使用 math.Abs
-	offsetPct := cfg.Indicators.TrailingOffsetPercent
-	// 加锁读取持仓，避免与主循环并发写
+	exchange := getWatchdogExchange(getExchange)
+	tryLogWatchdogParams(cfg, exchange)
+
 	positions, err := trader.GetPositions()
 	if err != nil {
-		logger.Warnf("🛡️ Risk Watchdog: GetPositions failed: %v", err)
+		logger.Warnf("🛡️ [系统风控] GetPositions failed: %v", err)
 		return
 	}
 	if len(positions) == 0 {
 		return
 	}
-	exchange := "binance"
-	if getExchange != nil {
-		if ex := getExchange(); ex != "" {
-			exchange = ex
-		}
-	}
-	tryLogWatchdogParams(indicatorKey, trailingTf, offsetPct, exchange)
 
-	opts := kernel.IndicatorParamsFromConfig(cfg.Indicators)
 	for _, posMap := range positions {
 		if ctx.Err() != nil {
 			return
 		}
-		rawSymbol, _ := posMap["symbol"].(string)
-		symbol := market.Normalize(rawSymbol)
-		sideStr, _ := posMap["side"].(string)
-		positionAmt, _ := posMap["positionAmt"].(float64)
-		entryPrice, _ := posMap["entryPrice"].(float64)
-		markPrice, _ := posMap["markPrice"].(float64)
-		if entryPrice == 0 {
-			entryPrice = markPrice
-		}
-
-		var quantity float64
-		var isLong bool
-		switch strings.ToLower(sideStr) {
-		case "long":
-			if positionAmt > 0 {
-				quantity = positionAmt
-				isLong = true
-			} else {
-				quantity = -positionAmt
-				isLong = false
-			}
-		case "short":
-			if positionAmt < 0 {
-				quantity = -positionAmt
-				isLong = false
-			} else {
-				quantity = positionAmt
-				isLong = true
-			}
-		default:
-			if positionAmt > 0 {
-				quantity = positionAmt
-				isLong = true
-			} else {
-				quantity = -positionAmt
-				isLong = false
-			}
-		}
-		if quantity <= 0 {
-			continue
-		}
-
-		// 使用 Trader 绑定的交易所拉取 K 线与指标，严禁用 Binance 数据平 OKX 仓位
-		data, err := market.GetWithTimeframesWithExchange(symbol, []string{trailingTf}, trailingTf, nil, opts, exchange)
-		if err != nil {
-			logger.Warnf("🛡️ Risk Watchdog: market.GetWithTimeframes %s %s failed: %v", symbol, trailingTf, err)
-			continue
-		}
-		if data.DynamicIndicators == nil {
-			continue
-		}
-		indicatorValue, ok := data.DynamicIndicators[indicatorKey]
+		pos, ok := parseWatchdogPosition(posMap)
 		if !ok {
-			// 兼容前端可能传的 "EMA20" -> ema_20
-			indicatorValue, ok = data.DynamicIndicators[normalizeIndicatorKey(indicatorKey)]
-		}
-		if !ok || indicatorValue <= 0 {
 			continue
 		}
 
-		// 触发线 = 指标值 ± 偏移%；多单：价格 < 指标*(1 - offset%) 才平；空单：价格 > 指标*(1 + offset%) 才平
-		var triggerLine float64
-		if isLong {
-			triggerLine = indicatorValue * (1 - offsetPct/100)
-		} else {
-			triggerLine = indicatorValue * (1 + offsetPct/100)
+		klines, ok := market.GetRealtimeKlines(pos.Symbol, defenseTimeframe, exchange, defenseBars)
+		if !ok || len(klines) < 25 {
+			_, _ = market.GetWithTimeframesWithExchange(pos.Symbol, []string{defenseTimeframe}, defenseTimeframe, nil, nil, exchange)
+			klines, ok = market.GetRealtimeKlines(pos.Symbol, defenseTimeframe, exchange, defenseBars)
+		}
+		if !ok || len(klines) < 25 {
+			logger.Warnf("🛡️ [系统风控] %s %s kline snapshot unavailable for %s", pos.Symbol, pos.Side, defenseTimeframe)
+			continue
+		}
+		currentPrice, _, ok := market.GetLatestPrice(pos.Symbol, exchange, int64(2*watchdogInterval/time.Millisecond))
+		if !ok || currentPrice <= 0 {
+			currentPrice = klines[len(klines)-1].Close
 		}
 
-		price := data.CurrentPrice
-		shouldCloseLong := isLong && price < triggerLine
-		shouldCloseShort := !isLong && price > triggerLine
-		if !shouldCloseLong && !shouldCloseShort {
+		if handleStagedTakeProfit(trader, pos, currentPrice, onClose, hooks) {
+			continue
+		}
+
+		reason := evaluateDefenseTrigger(cfg, pos, klines, currentPrice)
+		if reason == "" {
 			continue
 		}
 
 		var order map[string]interface{}
-		var action string
-		if shouldCloseLong {
-			action = "close_long"
-			order, err = trader.CloseLong(symbol, 0)
+		action := "close_long"
+		if pos.Side == "long" {
+			order, err = trader.CloseLong(pos.Symbol, 0)
 		} else {
 			action = "close_short"
-			order, err = trader.CloseShort(symbol, 0)
+			order, err = trader.CloseShort(pos.Symbol, 0)
 		}
 		if err != nil {
-			logger.Warnf("🛡️ Risk Watchdog (Trailing Indicator): close %s %s failed: %v", symbol, action, err)
+			logger.Warnf("🛡️ [系统风控] %s 触发后平仓失败: %s %s: %v", reason, pos.Symbol, action, err)
 			continue
 		}
-		if shouldCloseLong {
-			logger.Infof("🛡️ Risk Watchdog (Trailing Indicator): closed %s %s | Price %.4f < Trigger %.4f (%s %.4f - %.2f%%)",
-				symbol, action, price, triggerLine, indicatorKey, indicatorValue, offsetPct)
-		} else {
-			logger.Infof("🛡️ Risk Watchdog (Trailing Indicator): closed %s %s | Price %.4f > Trigger %.4f (%s %.4f + %.2f%%)",
-				symbol, action, price, triggerLine, indicatorKey, indicatorValue, offsetPct)
-		}
+		logger.Infof("🛡️ [系统风控] 触发 %s，强制平%s单！symbol=%s price=%.4f tf=%s",
+			reason, ternary(pos.Side == "long", "多", "空"), pos.Symbol, currentPrice, defenseTimeframe)
 		if onClose != nil {
-			onClose(symbol, action, order, quantity, price, entryPrice)
+			onClose(pos.Symbol, action, order, pos.Quantity, currentPrice, pos.EntryPrice)
 		}
 	}
 }
 
-// tryLogWatchdogParams 仅首次检测到持仓或配置参数变更时打印，避免每 5 秒刷屏
-func tryLogWatchdogParams(indicator, timeframe string, offsetPct float64, exchange string) {
-	fp := fmt.Sprintf("%s|%s|%.2f|%s", indicator, timeframe, offsetPct, exchange)
+func watchdogEnabled(cfg *store.StrategyConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	return cfg.Indicators.EnableFractalDefense || cfg.Indicators.EnableEMA20GapDefense || cfg.Indicators.Enable3BarTrailing || cfg.Indicators.EnableStagedTakeProfit
+}
+
+func getWatchdogExchange(getExchange func() string) string {
+	if getExchange != nil {
+		if ex := strings.TrimSpace(getExchange()); ex != "" {
+			return ex
+		}
+	}
+	return "binance"
+}
+
+func parseWatchdogPosition(posMap map[string]interface{}) (watchdogPosition, bool) {
+	rawSymbol, _ := posMap["symbol"].(string)
+	symbol := market.Normalize(rawSymbol)
+	if symbol == "" {
+		return watchdogPosition{}, false
+	}
+	sideStr, _ := posMap["side"].(string)
+	positionAmt, _ := posMap["positionAmt"].(float64)
+	entryPrice, _ := posMap["entryPrice"].(float64)
+	markPrice, _ := posMap["markPrice"].(float64)
+	if entryPrice == 0 {
+		entryPrice = markPrice
+	}
+
+	side := "short"
+	quantity := -positionAmt
+	switch strings.ToLower(strings.TrimSpace(sideStr)) {
+	case "long":
+		side = "long"
+		if positionAmt > 0 {
+			quantity = positionAmt
+		}
+	case "short":
+		side = "short"
+		if positionAmt < 0 {
+			quantity = -positionAmt
+		} else {
+			quantity = positionAmt
+		}
+	default:
+		if positionAmt >= 0 {
+			side = "long"
+			quantity = positionAmt
+		}
+	}
+	if quantity <= 0 {
+		return watchdogPosition{}, false
+	}
+	return watchdogPosition{
+		Symbol:     symbol,
+		Side:       side,
+		Quantity:   quantity,
+		EntryPrice: entryPrice,
+	}, true
+}
+
+func handleStagedTakeProfit(
+	trader Trader,
+	pos watchdogPosition,
+	currentPrice float64,
+	onClose OnWatchdogClose,
+	hooks *WatchdogHooks,
+) bool {
+	if hooks == nil || hooks.GetStagedTakeProfitStates == nil {
+		return false
+	}
+	states := hooks.GetStagedTakeProfitStates()
+	if len(states) == 0 {
+		return false
+	}
+	state := states[pos.Symbol+"_"+strings.ToLower(pos.Side)]
+	if state == nil {
+		return false
+	}
+
+	isLong := pos.Side == "long"
+	remainingQty := pos.Quantity
+	if remainingQty <= 0 {
+		if hooks.OnStagedFullClose != nil {
+			hooks.OnStagedFullClose(pos.Symbol, pos.Side)
+		}
+		return true
+	}
+
+	if !state.TP1Triggered && targetHit(isLong, currentPrice, state.Target1Price) {
+		closeQty := state.OriginalQty * 0.5
+		if closeQty > remainingQty {
+			closeQty = remainingQty
+		}
+		if closeQty > 0 {
+			order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, closeQty)
+			if err != nil {
+				logger.Warnf("🛡️ [系统防御] %s 触达 TP1 但分批止盈失败: %v", pos.Symbol, err)
+				return true
+			}
+			if onClose != nil {
+				onClose(pos.Symbol, closeAction(pos.Side), order, closeQty, currentPrice, pos.EntryPrice)
+			}
+			if hooks.OnStagedPartialClose != nil {
+				hooks.OnStagedPartialClose(pos.Symbol, pos.Side, closeQty, 0)
+			}
+		}
+
+		state.TP1Triggered = true
+		state.BreakEvenStopPrice = breakEvenStopPrice(isLong, pos.EntryPrice)
+		remainingQty -= closeQty
+		if remainingQty > 0 {
+			if err := replaceStopLoss(trader, pos.Symbol, pos.Side, remainingQty, state.BreakEvenStopPrice); err != nil {
+				logger.Warnf("🛡️ [系统防御] %s TP1 后保本止损设置失败: %v", pos.Symbol, err)
+			} else {
+				logger.Infof("🛡️ [系统防御] 触达 TP1，止损已锁定保本价。symbol=%s side=%s stop=%.6f", pos.Symbol, pos.Side, state.BreakEvenStopPrice)
+			}
+		}
+	}
+
+	if !state.TrailingActive && targetHit(isLong, currentPrice, trailingActivationPrice(isLong, pos.EntryPrice, state.Target2Price)) {
+		state.TrailingActive = true
+		state.TrailActivationPrice = trailingActivationPrice(isLong, pos.EntryPrice, state.Target2Price)
+		state.TrailingStopPrice = trailingStopPrice(isLong, currentPrice)
+		if err := replaceStopLoss(trader, pos.Symbol, pos.Side, remainingQty, maxStopForState(isLong, state.BreakEvenStopPrice, state.TrailingStopPrice)); err != nil {
+			logger.Warnf("🛡️ [系统防御] %s 启动 80%% 追踪止损失败: %v", pos.Symbol, err)
+		} else {
+			logger.Infof("🛡️ [系统防御] 已到 TP2 80%% 区间，10%% 动态追踪止损启动。symbol=%s side=%s stop=%.6f", pos.Symbol, pos.Side, maxStopForState(isLong, state.BreakEvenStopPrice, state.TrailingStopPrice))
+		}
+	}
+
+	if state.TrailingActive {
+		nextStop := trailingStopPrice(isLong, currentPrice)
+		if isLong {
+			if nextStop > state.TrailingStopPrice {
+				state.TrailingStopPrice = nextStop
+			}
+		} else if state.TrailingStopPrice == 0 || nextStop < state.TrailingStopPrice {
+			state.TrailingStopPrice = nextStop
+		}
+
+		effectiveStop := maxStopForState(isLong, state.BreakEvenStopPrice, state.TrailingStopPrice)
+		if effectiveStop > 0 {
+			if err := replaceStopLoss(trader, pos.Symbol, pos.Side, remainingQty, effectiveStop); err != nil {
+				logger.Warnf("🛡️ [系统防御] %s 更新追踪止损失败: %v", pos.Symbol, err)
+			}
+			if stopHit(isLong, currentPrice, effectiveStop) {
+				order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0)
+				if err != nil {
+					logger.Warnf("🛡️ [系统防御] %s 追踪止损触发但平仓失败: %v", pos.Symbol, err)
+					return true
+				}
+				logger.Infof("🛡️ [系统防御] 10%% 动态追踪止损触发。symbol=%s side=%s price=%.6f stop=%.6f", pos.Symbol, pos.Side, currentPrice, effectiveStop)
+				if onClose != nil {
+					onClose(pos.Symbol, closeAction(pos.Side), order, remainingQty, currentPrice, pos.EntryPrice)
+				}
+				if hooks.OnStagedFullClose != nil {
+					hooks.OnStagedFullClose(pos.Symbol, pos.Side)
+				}
+				return true
+			}
+		}
+	}
+
+	if !state.TP2Triggered && targetHit(isLong, currentPrice, state.Target2Price) {
+		order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0)
+		if err != nil {
+			logger.Warnf("🛡️ [系统防御] %s 触达 TP2 但平仓失败: %v", pos.Symbol, err)
+			return true
+		}
+		state.TP2Triggered = true
+		logger.Infof("🛡️ [系统防御] 触达 TP2，剩余仓位已全部止盈。symbol=%s side=%s price=%.6f", pos.Symbol, pos.Side, currentPrice)
+		if onClose != nil {
+			onClose(pos.Symbol, closeAction(pos.Side), order, remainingQty, currentPrice, pos.EntryPrice)
+		}
+		if hooks.OnStagedFullClose != nil {
+			hooks.OnStagedFullClose(pos.Symbol, pos.Side)
+		}
+		return true
+	}
+
+	return false
+}
+
+func targetHit(isLong bool, price, target float64) bool {
+	if target <= 0 {
+		return false
+	}
+	if isLong {
+		return price >= target
+	}
+	return price <= target
+}
+
+func stopHit(isLong bool, price, stop float64) bool {
+	if stop <= 0 {
+		return false
+	}
+	if isLong {
+		return price <= stop
+	}
+	return price >= stop
+}
+
+func breakEvenStopPrice(isLong bool, entry float64) float64 {
+	if isLong {
+		return entry * 1.0015
+	}
+	return entry * 0.9985
+}
+
+func trailingActivationPrice(isLong bool, entry, target2 float64) float64 {
+	distance := target2 - entry
+	if isLong {
+		return entry + distance*0.8
+	}
+	return entry + distance*0.8
+}
+
+func trailingStopPrice(isLong bool, current float64) float64 {
+	if isLong {
+		return current * 0.9
+	}
+	return current * 1.1
+}
+
+func maxStopForState(isLong bool, a, b float64) float64 {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 {
+		return a
+	}
+	if isLong {
+		if a > b {
+			return a
+		}
+		return b
+	}
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func replaceStopLoss(trader Trader, symbol, side string, quantity, stopPrice float64) error {
+	if quantity <= 0 || stopPrice <= 0 {
+		return nil
+	}
+	if err := trader.CancelStopLossOrders(symbol); err != nil {
+		return err
+	}
+	return trader.SetStopLoss(symbol, strings.ToUpper(side), quantity, stopPrice)
+}
+
+func closeWatchdogPosition(trader Trader, symbol, side string, quantity float64) (map[string]interface{}, error) {
+	if side == "long" {
+		return trader.CloseLong(symbol, quantity)
+	}
+	return trader.CloseShort(symbol, quantity)
+}
+
+func closeAction(side string) string {
+	if side == "long" {
+		return "close_long"
+	}
+	return "close_short"
+}
+
+func evaluateDefenseTrigger(cfg *store.StrategyConfig, pos watchdogPosition, klines []market.Kline, currentPrice float64) string {
+	if len(klines) < 25 {
+		return ""
+	}
+	last := klines[len(klines)-1]
+
+	if cfg.Indicators.Enable3BarTrailing && len(klines) >= 4 {
+		low3, high3 := trailingWindowExtremes(klines[len(klines)-4 : len(klines)-1])
+		if pos.Side == "long" && currentPrice < low3 {
+			return fmt.Sprintf("3K线动量追踪防守(现价 %.4f 跌破近3K低点 %.4f)", currentPrice, low3)
+		}
+		if pos.Side == "short" && currentPrice > high3 {
+			return fmt.Sprintf("3K线动量追踪防守(现价 %.4f 突破近3K高点 %.4f)", currentPrice, high3)
+		}
+	}
+
+	if cfg.Indicators.EnableEMA20GapDefense {
+		ema20 := market.ExportCalculateEMA(klines, 20)
+		if ema20 > 0 {
+			if pos.Side == "long" && last.High < ema20 {
+				return fmt.Sprintf("EMA20 缺口防守(High %.4f < EMA20 %.4f)", last.High, ema20)
+			}
+			if pos.Side == "short" && last.Low > ema20 {
+				return fmt.Sprintf("EMA20 缺口防守(Low %.4f > EMA20 %.4f)", last.Low, ema20)
+			}
+		}
+	}
+
+	if cfg.Indicators.EnableFractalDefense && len(klines) >= 5 {
+		if pos.Side == "long" {
+			if trigger, ref := detectLongFractalDefense(klines); trigger {
+				return fmt.Sprintf("2B 假突破防守(最高 %.4f 刺破前高 %.4f 后收回)", last.High, ref)
+			}
+		} else {
+			if trigger, ref := detectShortFractalDefense(klines); trigger {
+				return fmt.Sprintf("2B 假突破防守(最低 %.4f 跌破前低 %.4f 后收回)", last.Low, ref)
+			}
+		}
+	}
+
+	return ""
+}
+
+func trailingWindowExtremes(klines []market.Kline) (low float64, high float64) {
+	if len(klines) == 0 {
+		return 0, 0
+	}
+	low = klines[0].Low
+	high = klines[0].High
+	for _, k := range klines[1:] {
+		if k.Low < low {
+			low = k.Low
+		}
+		if k.High > high {
+			high = k.High
+		}
+	}
+	return low, high
+}
+
+func detectLongFractalDefense(klines []market.Kline) (bool, float64) {
+	last := klines[len(klines)-1]
+	refHigh := 0.0
+	for i := 1; i <= 3 && len(klines)-1-i >= 0; i++ {
+		h := klines[len(klines)-1-i].High
+		if h > refHigh {
+			refHigh = h
+		}
+	}
+	if refHigh <= 0 || last.High <= refHigh || last.Close >= refHigh {
+		return false, 0
+	}
+	body := absFloat(last.Close - last.Open)
+	upperWick := last.High - maxFloat(last.Open, last.Close)
+	if upperWick <= 0 || upperWick < body {
+		return false, 0
+	}
+	return true, refHigh
+}
+
+func detectShortFractalDefense(klines []market.Kline) (bool, float64) {
+	last := klines[len(klines)-1]
+	refLow := 0.0
+	for i := 1; i <= 3 && len(klines)-1-i >= 0; i++ {
+		l := klines[len(klines)-1-i].Low
+		if i == 1 || l < refLow {
+			refLow = l
+		}
+	}
+	if refLow <= 0 || last.Low >= refLow || last.Close <= refLow {
+		return false, 0
+	}
+	body := absFloat(last.Close - last.Open)
+	lowerWick := minFloat(last.Open, last.Close) - last.Low
+	if lowerWick <= 0 || lowerWick < body {
+		return false, 0
+	}
+	return true, refLow
+}
+
+func absFloat(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func minFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// tryLogWatchdogParams 仅首次检测到持仓或配置参数变更时打印，避免刷屏
+func tryLogWatchdogParams(cfg *store.StrategyConfig, exchange string) {
+	fp := fmt.Sprintf("fractal=%t|ema_gap=%t|bar3=%t|tf=%s|ex=%s",
+		cfg.Indicators.EnableFractalDefense,
+		cfg.Indicators.EnableEMA20GapDefense,
+		cfg.Indicators.Enable3BarTrailing,
+		defenseTimeframe,
+		exchange,
+	)
 	watchdogLogMu.Lock()
 	if watchdogLastPrint == fp {
 		watchdogLogMu.Unlock()
@@ -258,25 +633,13 @@ func tryLogWatchdogParams(indicator, timeframe string, offsetPct float64, exchan
 	}
 	watchdogLastPrint = fp
 	watchdogLogMu.Unlock()
-	logger.Infof("🛡️ Risk Watchdog: TrailingOffsetPercent=%.2f%% (positive=delay, negative=early) | indicator=%s | tf=%s | exchange=%s",
-		offsetPct, indicator, timeframe, exchange)
-}
-
-func normalizeIndicatorKey(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "ema_20"
-	}
-	s = strings.ToLower(s)
-	s = strings.ReplaceAll(s, " ", "_")
-	// "ema20" -> "ema_20", "middleband" -> "boll_middle_20"
-	if strings.HasPrefix(s, "ema") && len(s) > 3 && s[3] != '_' {
-		return "ema_" + s[3:]
-	}
-	if strings.Contains(s, "middle") || s == "middleband" {
-		return "boll_middle_20"
-	}
-	return s
+	logger.Infof("🛡️ System Risk Watchdog armed | fractal=%t | ema20_gap=%t | 3bar=%t | tf=%s | exchange=%s",
+		cfg.Indicators.EnableFractalDefense,
+		cfg.Indicators.EnableEMA20GapDefense,
+		cfg.Indicators.Enable3BarTrailing,
+		defenseTimeframe,
+		exchange,
+	)
 }
 
 func ternary(cond bool, a, b string) string {

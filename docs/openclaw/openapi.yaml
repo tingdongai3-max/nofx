@@ -1,0 +1,311 @@
+openapi: 3.1.0
+info:
+  title: NOFX OpenClaw Control API
+  version: 1.0.0
+  description: |
+    A focused control-plane spec for OpenClaw. It exposes the NOFX routes
+    that are useful for natural-language operations such as creating traders,
+    updating config, and hot reloading runtimes.
+servers:
+  - url: http://localhost:8080
+    description: Local NOFX API server
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+    CreateTraderRequest:
+      type: object
+      required: [name, ai_model_id, exchange_id]
+      properties:
+        name:
+          type: string
+        ai_model_id:
+          type: string
+        exchange_id:
+          type: string
+        strategy_id:
+          type: string
+        initial_balance:
+          type: number
+        scan_interval_minutes:
+          type: integer
+          minimum: 3
+        is_cross_margin:
+          type: boolean
+        show_in_competition:
+          type: boolean
+        btc_eth_leverage:
+          type: integer
+        altcoin_leverage:
+          type: integer
+        trading_symbols:
+          type: string
+        custom_prompt:
+          type: string
+        override_base_prompt:
+          type: boolean
+        system_prompt_template:
+          type: string
+        use_ai500:
+          type: boolean
+        use_oi_top:
+          type: boolean
+        is_dry_run:
+          type: boolean
+        virtual_equity:
+          type: number
+    UpdateTraderRequest:
+      allOf:
+        - $ref: '#/components/schemas/CreateTraderRequest'
+        - type: object
+          required: [name, ai_model_id, exchange_id]
+    UpdateModelConfigsRequest:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              enabled:
+                type: boolean
+              api_key:
+                type: string
+              custom_api_url:
+                type: string
+              custom_model_name:
+                type: string
+    CreateExchangeRequest:
+      type: object
+      required: [exchange_type]
+      properties:
+        exchange_type:
+          type: string
+          enum: [binance, bybit, okx, bitget, hyperliquid, aster, lighter, gate, kucoin]
+        account_name:
+          type: string
+        enabled:
+          type: boolean
+        api_key:
+          type: string
+        secret_key:
+          type: string
+        passphrase:
+          type: string
+        testnet:
+          type: boolean
+        hyperliquid_wallet_addr:
+          type: string
+        aster_user:
+          type: string
+        aster_signer:
+          type: string
+        aster_private_key:
+          type: string
+        lighter_wallet_addr:
+          type: string
+        lighter_private_key:
+          type: string
+        lighter_api_key_private_key:
+          type: string
+        lighter_api_key_index:
+          type: integer
+    UpdateExchangeConfigsRequest:
+      type: object
+      required: [exchanges]
+      properties:
+        exchanges:
+          type: object
+          additionalProperties:
+            type: object
+    UpdatePromptRequest:
+      type: object
+      required: [custom_prompt]
+      properties:
+        custom_prompt:
+          type: string
+paths:
+  /api/models:
+    get:
+      operationId: listModels
+      summary: List configured AI models
+      responses:
+        '200':
+          description: OK
+    put:
+      operationId: updateModels
+      summary: Update model configuration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateModelConfigsRequest'
+      responses:
+        '200':
+          description: Updated
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/exchanges:
+    get:
+      operationId: listExchanges
+      summary: List exchange accounts
+      responses:
+        '200':
+          description: OK
+    post:
+      operationId: createExchange
+      summary: Create exchange account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateExchangeRequest'
+      responses:
+        '200':
+          description: Created
+        '400':
+          description: Bad request
+  /api/exchanges/{id}:
+    delete:
+      operationId: deleteExchange
+      summary: Delete exchange account
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deleted
+  /api/traders:
+    post:
+      operationId: createTrader
+      summary: Create trader
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTraderRequest'
+      responses:
+        '200':
+          description: Created
+        '400':
+          description: Bad request
+  /api/traders/{id}:
+    put:
+      operationId: updateTrader
+      summary: Update trader config
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTraderRequest'
+      responses:
+        '200':
+          description: Updated
+        '404':
+          description: Trader not found
+  /api/traders/{id}/start:
+    post:
+      operationId: startTrader
+      summary: Start trader runtime
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Started
+  /api/traders/{id}/stop:
+    post:
+      operationId: stopTrader
+      summary: Stop trader runtime
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Stopped
+  /api/traders/{id}/reload:
+    post:
+      operationId: reloadTrader
+      summary: Hot reload trader runtime
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Reloaded
+  /api/traders/{id}/reset_data:
+    post:
+      operationId: resetTraderData
+      summary: Clear trader history and rebuild runtime
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Reset
+  /api/traders/{id}/prompt:
+    put:
+      operationId: updateTraderPrompt
+      summary: Update trader custom prompt
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePromptRequest'
+      responses:
+        '200':
+          description: Updated
+  /api/strategies:
+    get:
+      operationId: listStrategies
+      summary: List strategy definitions
+      responses:
+        '200':
+          description: OK

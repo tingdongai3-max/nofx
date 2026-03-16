@@ -14,8 +14,6 @@ import { useAuth } from '../contexts/AuthContext'
 import { getExchangeIcon } from './ExchangeIcons'
 import { getModelIcon } from './ModelIcons'
 import { TraderConfigModal } from './TraderConfigModal'
-import { TraderAdminList } from './TraderAdminList'
-import { TraderAdminAnalysisView } from './TraderAdminAnalysis'
 import { DeepVoidBackground } from './DeepVoidBackground'
 import { ExchangeConfigModal } from './traders/ExchangeConfigModal'
 import { PunkAvatar, getTraderAvatar } from './PunkAvatar'
@@ -33,7 +31,6 @@ import {
   ExternalLink,
   Copy,
   Check,
-  X,
 } from 'lucide-react'
 import { confirmToast } from '../lib/notify'
 import { toast } from 'sonner'
@@ -154,6 +151,7 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const { language } = useLanguage()
   const { user, token } = useAuth()
   const navigate = useNavigate()
+  const filterModeStorageKey = 'nofx_trader_filter_mode'
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [showEditModal, setShowEditModal] = useState(false)
   const [showModelModal, setShowModelModal] = useState(false)
@@ -167,9 +165,16 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const [visibleTraderAddresses, setVisibleTraderAddresses] = useState<Set<string>>(new Set())
   const [visibleExchangeAddresses, setVisibleExchangeAddresses] = useState<Set<string>>(new Set())
   const [copiedId, setCopiedId] = useState<string | null>(null)
-  const [showAdminList, setShowAdminList] = useState(false)
-  const [viewingAdminId, setViewingAdminId] = useState<string | null>(null)
-  const [filterMode, setFilterMode] = useState<'all' | 'live' | 'paper'>('all')
+  const [filterMode, setFilterMode] = useState<'all' | 'live' | 'paper'>(() => {
+    if (typeof window === 'undefined') return 'all'
+    try {
+      const stored = window.localStorage.getItem(filterModeStorageKey)
+      if (stored === 'all' || stored === 'live' || stored === 'paper') return stored
+    } catch (err) {
+      console.warn('Failed to read trader filter mode from localStorage:', err)
+    }
+    return 'all'
+  })
 
   // Toggle wallet address visibility for a trader
   const toggleTraderAddressVisibility = (traderId: string) => {
@@ -221,6 +226,16 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
     if (filterMode === 'live') return traders.filter(t => !t.is_dry_run)
     return traders.filter(t => t.is_dry_run)
   }, [traders, filterMode])
+
+  // Persist filter mode selection for return/refresh
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      window.localStorage.setItem(filterModeStorageKey, filterMode)
+    } catch (err) {
+      console.warn('Failed to persist trader filter mode to localStorage:', err)
+    }
+  }, [filterMode, filterModeStorageKey])
 
   const filteredTradersCount = filteredTraders.length
 
@@ -887,12 +902,12 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
             </button>
 
             <button
-              onClick={() => setShowAdminList(true)}
-              className="px-4 py-2 rounded text-xs font-bold font-mono uppercase tracking-wider transition-all whitespace-nowrap overflow-hidden bg-purple-600 text-white hover:bg-purple-500"
+              onClick={() => window.dispatchEvent(new Event('open-openclaw-widget'))}
+              className="px-4 py-2 rounded text-xs font-bold font-mono uppercase tracking-wider transition-all whitespace-nowrap overflow-hidden border border-[#d0ff71]/30 bg-[#d0ff71]/12 text-[#d0ff71] hover:border-[#d0ff71]/60 hover:bg-[#d0ff71]/18"
             >
               <span className="flex items-center gap-2">
                 <Bot className="w-4 h-4" />
-                {t('createAdmin', language) || 'Admin'}
+                OPENCLAW_CONSOLE
               </span>
             </button>
           </div>
@@ -1459,47 +1474,6 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
               setEditingExchange(null)
             }}
             language={language}
-          />
-        )}
-
-        {/* Trader Admin List Modal */}
-        {showAdminList && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center">
-            <div
-              className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-              onClick={() => setShowAdminList(false)}
-            />
-            <div className="relative w-full max-w-4xl mx-4 bg-[#1E2329] rounded-lg border border-white/10 shadow-2xl max-h-[80vh] overflow-hidden">
-              <div className="flex items-center justify-between px-6 py-4 border-b border-white/10 bg-black/20">
-                <h2 className="text-lg font-semibold text-white flex items-center gap-2">
-                  <Bot className="w-5 h-5 text-purple-400" />
-                  {t('traderAdmins', language) || 'Trader Administrators'}
-                </h2>
-                <button
-                  onClick={() => setShowAdminList(false)}
-                  className="p-1 rounded hover:bg-white/10 transition-colors"
-                >
-                  <X className="w-5 h-5 text-zinc-400" />
-                </button>
-              </div>
-              <div className="p-6 overflow-y-auto max-h-[calc(80vh-80px)]">
-                <TraderAdminList
-                  availableModels={enabledModels}
-                  onViewAnalysis={(adminId) => {
-                    setViewingAdminId(adminId)
-                    setShowAdminList(false)
-                  }}
-                />
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Trader Admin Analysis View */}
-        {viewingAdminId && (
-          <TraderAdminAnalysisView
-            adminId={viewingAdminId}
-            onClose={() => setViewingAdminId(null)}
           />
         )}
       </div>

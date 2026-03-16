@@ -1786,14 +1786,14 @@ export function BacktestPage() {
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                   <StatCard
                     icon={Target}
-                    label={language === 'zh' ? '当前净值' : 'Equity'}
+                    label={t('currentEquity', language)}
                     value={(status?.equity ?? 0).toFixed(2)}
                     suffix="USDT"
                     language={language}
                   />
                   <StatCard
                     icon={TrendingUp}
-                    label={language === 'zh' ? '总收益率' : 'Return'}
+                    label={t('backtestPage.metrics.totalReturn', language)}
                     value={`${(metrics?.total_return_pct ?? 0).toFixed(2)}%`}
                     trend={(metrics?.total_return_pct ?? 0) >= 0 ? 'up' : 'down'}
                     color={(metrics?.total_return_pct ?? 0) >= 0 ? '#0ECB81' : '#F6465D'}
@@ -1802,7 +1802,7 @@ export function BacktestPage() {
                   />
                   <StatCard
                     icon={AlertTriangle}
-                    label={language === 'zh' ? '最大回撤' : 'Max DD'}
+                    label={t('backtestPage.metrics.maxDrawdown', language)}
                     value={`${(metrics?.max_drawdown_pct ?? 0).toFixed(2)}%`}
                     color="#F6465D"
                     metricKey="max_drawdown"
@@ -1810,7 +1810,7 @@ export function BacktestPage() {
                   />
                   <StatCard
                     icon={BarChart3}
-                    label={language === 'zh' ? '夏普比率' : 'Sharpe'}
+                    label={t('backtestPage.metrics.sharpe', language)}
                     value={(metrics?.sharpe_ratio ?? 0).toFixed(2)}
                     metricKey="sharpe_ratio"
                     language={language}
@@ -1874,7 +1874,7 @@ export function BacktestPage() {
                             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
                               <div className="p-3 rounded-lg" style={{ background: '#1E2329' }}>
                                 <div className="flex items-center gap-1 text-xs" style={{ color: '#848E9C' }}>
-                                  {language === 'zh' ? '胜率' : 'Win Rate'}
+                                  {t('positionHistory.winRate', language)}
                                   <MetricTooltip metricKey="win_rate" language={language} size={11} />
                                 </div>
                                 <div className="text-lg font-bold" style={{ color: '#EAECEF' }}>
@@ -1883,7 +1883,7 @@ export function BacktestPage() {
                               </div>
                               <div className="p-3 rounded-lg" style={{ background: '#1E2329' }}>
                                 <div className="flex items-center gap-1 text-xs" style={{ color: '#848E9C' }}>
-                                  {language === 'zh' ? '盈亏因子' : 'Profit Factor'}
+                                  {t('backtestPage.metrics.profitFactor', language)}
                                   <MetricTooltip metricKey="profit_factor" language={language} size={11} />
                                 </div>
                                 <div className="text-lg font-bold" style={{ color: '#EAECEF' }}>
@@ -1892,7 +1892,7 @@ export function BacktestPage() {
                               </div>
                               <div className="p-3 rounded-lg" style={{ background: '#1E2329' }}>
                                 <div className="text-xs" style={{ color: '#848E9C' }}>
-                                  {language === 'zh' ? '总交易数' : 'Total Trades'}
+                                  {t('positionHistory.totalTrades', language)}
                                 </div>
                                 <div className="text-lg font-bold" style={{ color: '#EAECEF' }}>
                                   {metrics.trades ?? 0}

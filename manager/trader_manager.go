@@ -430,6 +430,50 @@ func (tm *TraderManager) RemoveTrader(traderID string) {
 	}
 }
 
+// LoadTraderFromStore loads exactly one trader for a specific user into memory.
+func (tm *TraderManager) LoadTraderFromStore(st *store.Store, userID, traderID string) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	fullCfg, err := st.Trader().GetFullConfig(userID, traderID)
+	if err != nil {
+		return fmt.Errorf("failed to get trader full config: %w", err)
+	}
+	if fullCfg == nil || fullCfg.Trader == nil {
+		return fmt.Errorf("trader %s config is missing", traderID)
+	}
+
+	traderCfg := fullCfg.Trader
+	if _, exists := tm.traders[traderCfg.ID]; exists {
+		return fmt.Errorf("trader ID '%s' already exists", traderCfg.ID)
+	}
+
+	if fullCfg.AIModel == nil {
+		return fmt.Errorf("AI model %s for trader %s does not exist", traderCfg.AIModelID, traderCfg.Name)
+	}
+	if !fullCfg.AIModel.Enabled {
+		return fmt.Errorf("AI model %s for trader %s is not enabled", traderCfg.AIModelID, traderCfg.Name)
+	}
+
+	if fullCfg.Exchange == nil {
+		return fmt.Errorf("exchange %s for trader %s does not exist", traderCfg.ExchangeID, traderCfg.Name)
+	}
+	if !fullCfg.Exchange.Enabled {
+		return fmt.Errorf("exchange %s for trader %s is not enabled", traderCfg.ExchangeID, traderCfg.Name)
+	}
+
+	logger.Infof("📦 Reloading single trader %s (AI Model: %s, Exchange: %s/%s, Strategy ID: %s)",
+		traderCfg.Name, fullCfg.AIModel.Provider, fullCfg.Exchange.ExchangeType, fullCfg.Exchange.AccountName, traderCfg.StrategyID)
+
+	if err := tm.addTraderFromStore(traderCfg, fullCfg.AIModel, fullCfg.Exchange, st); err != nil {
+		tm.loadErrors[traderCfg.ID] = err
+		return err
+	}
+
+	delete(tm.loadErrors, traderCfg.ID)
+	return nil
+}
+
 // LoadUserTradersFromStore loads traders from store for a specific user to memory
 func (tm *TraderManager) LoadUserTradersFromStore(st *store.Store, userID string) error {
 	tm.mu.Lock()
@@ -690,6 +734,7 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 		ShowInCompetition:    traderCfg.ShowInCompetition,
 		IsDryRun:             traderCfg.IsDryRun,
 		VirtualEquity:        traderCfg.VirtualEquity,
+		ResetTimestamp:       traderCfg.ResetTimestamp,
 		StrategyConfig:       strategyConfig,
 	}
 

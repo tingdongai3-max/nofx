@@ -1,4 +1,3 @@
-import { useState, useEffect } from 'react'
 import { Clock, Activity, TrendingUp, BarChart2, Info, Lock, ExternalLink, Zap, Check, AlertCircle, Key } from 'lucide-react'
 import type { IndicatorConfig } from '../../types'
 
@@ -36,13 +35,6 @@ export function IndicatorEditor({
   disabled,
   language,
 }: IndicatorEditorProps) {
-  const [trailingOffsetLocal, setTrailingOffsetLocal] = useState<string>(() =>
-    String(config.trailing_offset_percent ?? 0)
-  )
-  useEffect(() => {
-    setTrailingOffsetLocal(String(config.trailing_offset_percent ?? 0))
-  }, [config.trailing_offset_percent])
-
   const t = (key: string) => {
     const translations: Record<string, Record<string, string>> = {
       // Section titles
@@ -142,24 +134,17 @@ export function IndicatorEditor({
       // Tips
       aiCanCalculate: { zh: '💡 提示：AI 可自行计算这些指标，开启可减少 AI 计算量', en: '💡 Tip: AI can calculate these, enabling reduces AI workload' },
 
-      // Trailing stop (Risk Watchdog)
-      trailingPanel: { zh: '动态追踪止盈/止损 (硬风控)', en: 'Trailing Stop (Hard Risk)' },
-      trailingPanelDesc: { zh: '不经过 AI：价格跌破/突破所选指标线即市价平仓', en: 'Close by market when price breaks the selected indicator line (no AI)' },
-      enableTrailing: { zh: '开启指标移动止盈止损', en: 'Enable indicator trailing stop' },
-      trailingIndicator: { zh: '平仓线指标', en: 'Trailing line' },
-      trailingEma20: { zh: 'EMA20', en: 'EMA20' },
-      trailingEma50: { zh: 'EMA50', en: 'EMA50' },
-      trailingBollMiddle: { zh: '布林带中轨', en: 'BOLL Middle' },
-      trailingTimeframe: { zh: '风控计算周期', en: 'Watchdog timeframe' },
-      trailingOffsetPercent: { zh: '触发偏移量 (%)', en: 'Trigger offset (%)' },
-      trailingOffsetTooltip: {
-        zh: '例如设置 0.5，多单将在价格跌破均线 0.5% 后才触发平仓，防止假跌破插针。',
-        en: 'e.g. 0.5: long closes only when price is 0.5% below the line, avoiding fake breakdowns.',
-      },
-      enableATRTrailing: { zh: 'ATR 移动止盈止损', en: 'ATR trailing TP/SL' },
-      enableATRTrailingDesc: { zh: '开启后开仓不设固定止盈止损，由 AI 输出 ATR 倍数，机器狗按价格监控触发', en: 'When on, no fixed TP/SL on open; AI outputs ATR multipliers, watchdog triggers by price' },
+      // System defense watchdog
+      trailingPanel: { zh: '系统防守引擎', en: 'System Defense Engine' },
+      trailingPanelDesc: { zh: '不经过 AI：后台机器狗直接监听数据流并触发强制平仓', en: 'No AI approval: backend watchdog listens to market data and force-closes positions' },
+      enableFractalDefense: { zh: '开启 2B 假突破防守', en: 'Enable 2B false-break defense' },
+      enableFractalDefenseDesc: { zh: '15m 二次刺破前高/前低但实体收回，判定诱多/诱空，立即强平', en: '15m second sweep through prior high/low with rejection close triggers an immediate forced exit' },
+      enableEMA20GapDefense: { zh: '开启 EMA20 引力缺口防守', en: 'Enable EMA20 gravity-gap defense' },
+      enableEMA20GapDefenseDesc: { zh: '当整根 K 线完全脱离 EMA20，判定趋势引力崩塌，立即强平', en: 'Force-close when a full candle detaches from EMA20 and trend gravity collapses' },
+      enable3BarTrailing: { zh: '开启 3K线动量追踪', en: 'Enable 3-bar momentum trailing' },
+      enable3BarTrailingDesc: { zh: '以最近 3 根 K 线极值为系统止损线，破位即落袋', en: 'Use the last 3 candles extreme as a system stop and exit on break' },
       enableStagedTakeProfit: { zh: '允许分批止盈', en: 'Allow staged take profit' },
-      enableStagedTakeProfitDesc: { zh: '关闭后 AI 只能使用单一止盈价全仓平仓，不能使用 take_profit_stages / atr_tp_stages', en: 'When off, AI may only use single take_profit for full close; no take_profit_stages or atr_tp_stages' },
+      enableStagedTakeProfitDesc: { zh: '关闭后 AI 只能使用单一止盈价全仓平仓，不能使用 take_profit_stages', en: 'When off, AI may only use single take_profit for full close; no take_profit_stages' },
 
       // NofxOS Data Provider
       nofxosTitle: { zh: 'NofxOS 量化数据源', en: 'NofxOS Data Provider' },
@@ -992,20 +977,48 @@ export function IndicatorEditor({
           <span className="text-xs" style={{ color: '#848E9C' }}>- {t('trailingPanelDesc')}</span>
         </div>
         <div className="p-3 space-y-3">
-          <div className="flex items-center justify-between p-2.5 rounded-lg" style={{ background: config.enable_atr_trailing ? 'rgba(20, 184, 166, 0.08)' : 'transparent', border: config.enable_atr_trailing ? '1px solid rgba(20, 184, 166, 0.3)' : '1px solid #2B3139' }}>
+          <div className="flex items-center justify-between p-2.5 rounded-lg" style={{ background: config.enable_fractal_defense ? 'rgba(239, 68, 68, 0.08)' : 'transparent', border: config.enable_fractal_defense ? '1px solid rgba(239, 68, 68, 0.3)' : '1px solid #2B3139' }}>
             <div className="flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full" style={{ background: '#14b8a6' }} />
-              <span className="text-xs font-medium" style={{ color: '#EAECEF' }}>{t('enableATRTrailing')}</span>
+              <div className="w-2 h-2 rounded-full" style={{ background: '#ef4444' }} />
+              <span className="text-xs font-medium" style={{ color: '#EAECEF' }}>{t('enableFractalDefense')}</span>
             </div>
             <input
               type="checkbox"
-              checked={config.enable_atr_trailing || false}
-              onChange={(e) => !disabled && onChange({ ...config, enable_atr_trailing: e.target.checked })}
+              checked={config.enable_fractal_defense || false}
+              onChange={(e) => !disabled && onChange({ ...config, enable_fractal_defense: e.target.checked })}
               disabled={disabled}
-              className="w-4 h-4 rounded accent-teal-500"
+              className="w-4 h-4 rounded accent-red-500"
             />
           </div>
-          <p className="text-[10px] mb-1.5" style={{ color: '#5E6673' }}>{t('enableATRTrailingDesc')}</p>
+          <p className="text-[10px] mb-1.5" style={{ color: '#5E6673' }}>{t('enableFractalDefenseDesc')}</p>
+          <div className="flex items-center justify-between p-2.5 rounded-lg" style={{ background: config.enable_ema20_gap_defense ? 'rgba(245, 158, 11, 0.08)' : 'transparent', border: config.enable_ema20_gap_defense ? '1px solid rgba(245, 158, 11, 0.3)' : '1px solid #2B3139' }}>
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 rounded-full" style={{ background: '#f59e0b' }} />
+              <span className="text-xs font-medium" style={{ color: '#EAECEF' }}>{t('enableEMA20GapDefense')}</span>
+            </div>
+            <input
+              type="checkbox"
+              checked={config.enable_ema20_gap_defense || false}
+              onChange={(e) => !disabled && onChange({ ...config, enable_ema20_gap_defense: e.target.checked })}
+              disabled={disabled}
+              className="w-4 h-4 rounded accent-amber-500"
+            />
+          </div>
+          <p className="text-[10px] mb-1.5" style={{ color: '#5E6673' }}>{t('enableEMA20GapDefenseDesc')}</p>
+          <div className="flex items-center justify-between p-2.5 rounded-lg" style={{ background: config.enable_3bar_trailing ? 'rgba(34, 197, 94, 0.08)' : 'transparent', border: config.enable_3bar_trailing ? '1px solid rgba(34, 197, 94, 0.3)' : '1px solid #2B3139' }}>
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 rounded-full" style={{ background: '#22c55e' }} />
+              <span className="text-xs font-medium" style={{ color: '#EAECEF' }}>{t('enable3BarTrailing')}</span>
+            </div>
+            <input
+              type="checkbox"
+              checked={config.enable_3bar_trailing || false}
+              onChange={(e) => !disabled && onChange({ ...config, enable_3bar_trailing: e.target.checked })}
+              disabled={disabled}
+              className="w-4 h-4 rounded accent-green-500"
+            />
+          </div>
+          <p className="text-[10px] mb-1.5" style={{ color: '#5E6673' }}>{t('enable3BarTrailingDesc')}</p>
           <div className="flex items-center justify-between p-2.5 rounded-lg" style={{ background: config.enable_staged_take_profit !== false ? 'rgba(34, 197, 94, 0.08)' : 'transparent', border: config.enable_staged_take_profit !== false ? '1px solid rgba(34, 197, 94, 0.3)' : '1px solid #2B3139' }}>
             <div className="flex items-center gap-2">
               <div className="w-2 h-2 rounded-full" style={{ background: '#22c55e' }} />
@@ -1020,78 +1033,6 @@ export function IndicatorEditor({
             />
           </div>
           <p className="text-[10px] mb-1.5" style={{ color: '#5E6673' }}>{t('enableStagedTakeProfitDesc')}</p>
-          <div className="flex items-center justify-between p-2.5 rounded-lg" style={{ background: config.enable_indicator_trailing ? 'rgba(245, 158, 11, 0.08)' : 'transparent', border: config.enable_indicator_trailing ? '1px solid rgba(245, 158, 11, 0.3)' : '1px solid #2B3139' }}>
-            <div className="flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full" style={{ background: '#f59e0b' }} />
-              <span className="text-xs font-medium" style={{ color: '#EAECEF' }}>{t('enableTrailing')}</span>
-            </div>
-            <input
-              type="checkbox"
-              checked={config.enable_indicator_trailing || false}
-              onChange={(e) => !disabled && onChange({ ...config, enable_indicator_trailing: e.target.checked, ...(e.target.checked && !config.trailing_indicator ? { trailing_indicator: 'ema_20' } : {}), ...(e.target.checked && !config.trailing_timeframe ? { trailing_timeframe: '5m' } : {}) })}
-              disabled={disabled}
-              className="w-4 h-4 rounded accent-amber-500"
-            />
-          </div>
-          {config.enable_indicator_trailing && (
-            <>
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] flex-shrink-0" style={{ color: '#848E9C' }}>{t('trailingIndicator')}:</span>
-                <select
-                  value={config.trailing_indicator || 'ema_20'}
-                  onChange={(e) => !disabled && onChange({ ...config, trailing_indicator: e.target.value })}
-                  disabled={disabled}
-                  className="flex-1 px-2 py-1.5 rounded text-xs"
-                  style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
-                >
-                  <option value="ema_20">{t('trailingEma20')}</option>
-                  <option value="ema_50">{t('trailingEma50')}</option>
-                  <option value="boll_middle_20">{t('trailingBollMiddle')}</option>
-                </select>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] flex-shrink-0" style={{ color: '#848E9C' }}>{t('trailingTimeframe')}:</span>
-                <select
-                  value={config.trailing_timeframe || '5m'}
-                  onChange={(e) => !disabled && onChange({ ...config, trailing_timeframe: e.target.value })}
-                  disabled={disabled}
-                  className="flex-1 px-2 py-1.5 rounded text-xs"
-                  style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
-                >
-                  <option value="1m">1m</option>
-                  <option value="5m">5m</option>
-                  <option value="15m">15m</option>
-                  <option value="1h">1h</option>
-                  <option value="4h">4h</option>
-                </select>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] flex-shrink-0" style={{ color: '#848E9C' }} title={t('trailingOffsetTooltip')}>{t('trailingOffsetPercent')}:</span>
-                <input
-                  type="text"
-                  inputMode="decimal"
-                  placeholder="-0.5"
-                  value={trailingOffsetLocal}
-                  onChange={(e) => {
-                    if (disabled) return
-                    setTrailingOffsetLocal(e.target.value)
-                  }}
-                  onBlur={() => {
-                    if (disabled) return
-                    const v = parseFloat(trailingOffsetLocal)
-                    const clamped = Number.isFinite(v) ? Math.max(-5, Math.min(5, v)) : 0
-                    setTrailingOffsetLocal(String(clamped))
-                    onChange({ ...config, trailing_offset_percent: clamped })
-                  }}
-                  disabled={disabled}
-                  title={t('trailingOffsetTooltip')}
-                  className="flex-1 px-2 py-1.5 rounded text-xs w-20"
-                  style={{ background: '#1E2329', border: '1px solid #2B3139', color: '#EAECEF' }}
-                />
-                <span className="text-[10px]" style={{ color: '#848E9C' }} title={t('trailingOffsetTooltip')}>%</span>
-              </div>
-            </>
-          )}
         </div>
       </div>
     </div>

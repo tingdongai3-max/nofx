@@ -57,6 +57,13 @@ var (
 	positionsCache sync.Map
 )
 
+func normalizeResetTimestamp(t time.Time) time.Time {
+	if t.IsZero() {
+		return time.Time{}
+	}
+	return t.UTC().Truncate(time.Second)
+}
+
 // Server HTTP API server
 type Server struct {
 	router          *gin.Engine
@@ -198,6 +205,8 @@ func (s *Server) setupRoutes() {
 			protected.DELETE("/traders/:id", s.handleDeleteTrader)
 			protected.POST("/traders/:id/start", s.handleStartTrader)
 			protected.POST("/traders/:id/stop", s.handleStopTrader)
+			protected.POST("/traders/:id/reload", s.handleReloadTrader)
+			protected.POST("/traders/:id/reset_data", s.handleResetTraderData)
 			protected.PUT("/traders/:id/prompt", s.handleUpdateTraderPrompt)
 			protected.POST("/traders/:id/sync-balance", s.handleSyncBalance)
 			protected.POST("/traders/:id/close-position", s.handleClosePosition)
@@ -1179,6 +1188,114 @@ func (s *Server) handleStopTrader(c *gin.Context) {
 
 	logger.Infof("⏹  Trader %s stopped", trader.GetName())
 	c.JSON(http.StatusOK, gin.H{"message": "Trader stopped"})
+}
+
+func invalidateTraderRuntimeCache(userID, traderID string) {
+	cacheKey := userID + ":" + traderID
+	accountCache.Delete(cacheKey)
+	positionsCache.Delete(cacheKey)
+
+	// Legacy cleanup for any older key shape.
+	accountCache.Delete(traderID)
+	positionsCache.Delete(traderID)
+}
+
+func (s *Server) reloadTraderRuntime(userID, traderID string) (bool, error) {
+	wasRunning := false
+	if existingTrader, err := s.traderManager.GetTrader(traderID); err == nil && existingTrader != nil {
+		status := existingTrader.GetStatus()
+		if isRunning, ok := status["is_running"].(bool); ok && isRunning {
+			wasRunning = true
+		}
+	}
+
+	invalidateTraderRuntimeCache(userID, traderID)
+
+	// Remove trader from memory to reload fresh config (will stop if running)
+	s.traderManager.RemoveTrader(traderID)
+
+	logger.Infof("🔄 Reloading trader %s from database...", traderID)
+	if err := s.traderManager.LoadTraderFromStore(s.store, userID, traderID); err != nil {
+		return wasRunning, fmt.Errorf("failed to reload trader: %w", err)
+	}
+
+	trader, err := s.traderManager.GetTrader(traderID)
+	if err != nil {
+		if loadErr := s.traderManager.GetLoadError(traderID); loadErr != nil {
+			return wasRunning, fmt.Errorf("failed to load trader: %w", loadErr)
+		}
+		return wasRunning, fmt.Errorf("failed to load trader, please check AI model, exchange and strategy configuration")
+	}
+
+	if wasRunning {
+		go func() {
+			logger.Infof("▶️  Restarting trader %s (%s) after reload", traderID, trader.GetName())
+			if runErr := trader.Run(); runErr != nil {
+				logger.Infof("❌ Trader %s runtime error: %v", trader.GetName(), runErr)
+			}
+		}()
+	}
+
+	return wasRunning, nil
+}
+
+// handleReloadTrader Reload trader configuration in memory and restart if running
+func (s *Server) handleReloadTrader(c *gin.Context) {
+	userID := c.GetString("user_id")
+	traderID := c.Param("id")
+
+	// Verify trader belongs to current user
+	_, err := s.store.Trader().GetFullConfig(userID, traderID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Trader does not exist or no access permission"})
+		return
+	}
+
+	wasRunning, err := s.reloadTraderRuntime(userID, traderID)
+	if err != nil {
+		logger.Infof("❌ Failed to reload trader %s: %v", traderID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	logger.Infof("✓ Trader %s reloaded (was_running=%v)", traderID, wasRunning)
+	c.JSON(http.StatusOK, gin.H{"message": "Trader reloaded", "was_running": wasRunning})
+}
+
+// handleResetTraderData performs a logical reset by moving the trader's generation cutoff forward.
+func (s *Server) handleResetTraderData(c *gin.Context) {
+	userID := c.GetString("user_id")
+	traderID := c.Param("id")
+
+	if _, err := s.store.Trader().GetFullConfig(userID, traderID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Trader does not exist or no access permission"})
+		return
+	}
+
+	resetAt := normalizeResetTimestamp(time.Now())
+	if err := s.store.Trader().UpdateResetTimestamp(userID, traderID, resetAt); err != nil {
+		logger.Infof("❌ Failed to update reset timestamp for trader %s: %v", traderID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reset trader data: " + err.Error()})
+		return
+	}
+
+	wasRunning := false
+	if memTrader, err := s.traderManager.GetTrader(traderID); err == nil && memTrader != nil {
+		status := memTrader.GetStatus()
+		if running, ok := status["is_running"].(bool); ok {
+			wasRunning = running
+		}
+		memTrader.ApplyDataReset(resetAt)
+	}
+	accountCache.Delete(userID + ":" + traderID)
+	positionsCache.Delete(userID + ":" + traderID)
+
+	logger.Infof("🕒 Logically reset trader data for %s at %s (was_running=%v)", traderID, resetAt.Format(time.RFC3339), wasRunning)
+	c.JSON(http.StatusOK, gin.H{
+		"message":         "Trader data reset",
+		"was_running":     wasRunning,
+		"reset_timestamp": resetAt.Format(time.RFC3339),
+	})
 }
 
 // handleUpdateTraderPrompt Update trader custom prompt
@@ -2198,6 +2315,7 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 		"ai_model":              aiModelID,
 		"exchange_id":           traderConfig.ExchangeID,
 		"strategy_id":           traderConfig.StrategyID,
+		"reset_timestamp":       traderConfig.ResetTimestamp,
 		"initial_balance":       traderConfig.InitialBalance,
 		"scan_interval_minutes": traderConfig.ScanIntervalMinutes,
 		"btc_eth_leverage":      traderConfig.BTCETHLeverage,
@@ -2258,6 +2376,10 @@ func (s *Server) handleAccount(c *gin.Context) {
 	}
 	traderCfg := fullConfig.Trader
 	exchangeCfg := fullConfig.Exchange
+	resetAt := time.Time{}
+	if traderCfg != nil {
+		resetAt = traderCfg.ResetTimestamp
+	}
 
 	// 模拟盘：财务看板完全本地化，用 VirtualEquity + dry_run 持仓浮盈
 	if traderCfg != nil && traderCfg.IsDryRun {
@@ -2265,7 +2387,7 @@ func (s *Server) handleAccount(c *gin.Context) {
 		if virtualEquity <= 0 {
 			virtualEquity = 10000
 		}
-		openPositions, errPos := s.store.Position().GetOpenPositionsBySource(traderID, "dry_run")
+		openPositions, errPos := s.store.Position().GetOpenPositionsBySourceSince(traderID, "dry_run", resetAt)
 		if errPos != nil {
 			SafeInternalError(c, "Get dry-run positions for account", errPos)
 			return
@@ -2364,10 +2486,14 @@ func (s *Server) handlePositions(c *gin.Context) {
 	}
 	traderCfg := fullConfig.Trader
 	exchangeCfg := fullConfig.Exchange
+	resetAt := time.Time{}
+	if traderCfg != nil {
+		resetAt = traderCfg.ResetTimestamp
+	}
 
 	// 模拟盘：从 DB 取 source='dry_run' 且 status=OPEN 的持仓，用行情当前价作为 mark_price，本地算浮盈
 	if traderCfg != nil && traderCfg.IsDryRun {
-		openPositions, errPos := s.store.Position().GetOpenPositionsBySource(traderID, "dry_run")
+		openPositions, errPos := s.store.Position().GetOpenPositionsBySourceSince(traderID, "dry_run", resetAt)
 		if errPos != nil {
 			SafeInternalError(c, "Get dry-run positions", errPos)
 			return
@@ -2514,17 +2640,31 @@ func (s *Server) handlePositionHistory(c *gin.Context) {
 		limit = l
 	}
 
-	// 模拟盘：强制 source=dry_run，仅返回模拟盘已平仓记录
 	fullConfig, _ := s.store.Trader().GetFullConfig(userID, traderID)
+	resetAt := time.Time{}
+	if fullConfig != nil && fullConfig.Trader != nil {
+		resetAt = fullConfig.Trader.ResetTimestamp
+	}
+
+	// 模拟盘：强制 source=dry_run，仅返回模拟盘已平仓记录
 	if fullConfig != nil && fullConfig.Trader != nil && fullConfig.Trader.IsDryRun {
-		positions, errPos := s.store.Position().GetClosedPositionsBySource(traderID, limit, "dry_run")
+		positions, errPos := s.store.Position().GetClosedPositionsBySourceSince(traderID, limit, "dry_run", resetAt)
 		if errPos != nil {
 			SafeInternalError(c, "Get position history", errPos)
 			return
 		}
-		stats, _ := s.store.Position().GetFullStatsBySource(traderID, "dry_run")
-		symbolStats, _ := s.store.Position().GetSymbolStatsBySource(traderID, 0, "dry_run")
-		directionStats, _ := s.store.Position().GetDirectionStatsBySource(traderID, "dry_run")
+		if len(positions) == 0 {
+			c.JSON(http.StatusOK, gin.H{
+				"positions":       positions,
+				"stats":           &store.TraderStats{},
+				"symbol_stats":    []store.SymbolStats{},
+				"direction_stats": []store.DirectionStats{},
+			})
+			return
+		}
+		stats, _ := s.store.Position().GetFullStatsBySourceSince(traderID, "dry_run", resetAt)
+		symbolStats, _ := s.store.Position().GetSymbolStatsBySourceSince(traderID, 0, "dry_run", resetAt)
+		directionStats, _ := s.store.Position().GetDirectionStatsBySourceSince(traderID, "dry_run", resetAt)
 		c.JSON(http.StatusOK, gin.H{
 			"positions":       positions,
 			"stats":           stats,
@@ -2539,19 +2679,28 @@ func (s *Server) handlePositionHistory(c *gin.Context) {
 		SafeNotFound(c, "Trader")
 		return
 	}
-	store := trader.GetStore()
-	if store == nil {
+	traderStore := trader.GetStore()
+	if traderStore == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Store not available"})
 		return
 	}
-	positions, err := store.Position().GetClosedPositions(trader.GetID(), limit)
+	positions, err := traderStore.Position().GetClosedPositionsSince(trader.GetID(), limit, resetAt)
 	if err != nil {
 		SafeInternalError(c, "Get position history", err)
 		return
 	}
-	stats, _ := store.Position().GetFullStats(trader.GetID())
-	symbolStats, _ := store.Position().GetSymbolStats(trader.GetID(), 0)
-	directionStats, _ := store.Position().GetDirectionStats(trader.GetID())
+	if len(positions) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"positions":       positions,
+			"stats":           &store.TraderStats{},
+			"symbol_stats":    []store.SymbolStats{},
+			"direction_stats": []store.DirectionStats{},
+		})
+		return
+	}
+	stats, _ := traderStore.Position().GetFullStatsSince(trader.GetID(), resetAt)
+	symbolStats, _ := traderStore.Position().GetSymbolStatsSince(trader.GetID(), 0, resetAt)
+	directionStats, _ := traderStore.Position().GetDirectionStatsSince(trader.GetID(), resetAt)
 	c.JSON(http.StatusOK, gin.H{
 		"positions":       positions,
 		"stats":           stats,
@@ -2579,10 +2728,15 @@ func (s *Server) handleTrades(c *gin.Context) {
 		symbol = market.Normalize(symbol)
 	}
 
-	// 模拟盘：仅查 source=dry_run，返回带 source 的列表供前端显示 [Paper]
 	fullConfig, _ := s.store.Trader().GetFullConfig(userID, traderID)
+	resetAt := time.Time{}
+	if fullConfig != nil && fullConfig.Trader != nil {
+		resetAt = fullConfig.Trader.ResetTimestamp
+	}
+
+	// 模拟盘：仅查 source=dry_run，返回带 source 的列表供前端显示 [Paper]
 	if fullConfig != nil && fullConfig.Trader != nil && fullConfig.Trader.IsDryRun {
-		allTrades, errT := s.store.Position().GetRecentTradesBySource(traderID, limit, "dry_run")
+		allTrades, errT := s.store.Position().GetRecentTradesBySourceSince(traderID, limit, "dry_run", resetAt)
 		if errT != nil {
 			SafeInternalError(c, "Get trades", errT)
 			return
@@ -2611,7 +2765,7 @@ func (s *Server) handleTrades(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Store not available"})
 		return
 	}
-	allTrades, err := store.Position().GetRecentTrades(trader.GetID(), limit)
+	allTrades, err := store.Position().GetRecentTradesSince(trader.GetID(), limit, resetAt)
 	if err != nil {
 		SafeInternalError(c, "Get trades", err)
 		return
@@ -2631,6 +2785,7 @@ func (s *Server) handleTrades(c *gin.Context) {
 
 // handleOrders Order list (all orders including open, close, stop loss, take profit, etc.)
 func (s *Server) handleOrders(c *gin.Context) {
+	userID := c.GetString("user_id")
 	_, traderID, err := s.getTraderFromQuery(c)
 	if err != nil {
 		SafeBadRequest(c, "Invalid trader ID")
@@ -2657,6 +2812,11 @@ func (s *Server) handleOrders(c *gin.Context) {
 		symbol = market.Normalize(symbol)
 	}
 
+	resetMs := int64(0)
+	if fullConfig, err := s.store.Trader().GetFullConfig(userID, traderID); err == nil && fullConfig != nil && fullConfig.Trader != nil && !fullConfig.Trader.ResetTimestamp.IsZero() {
+		resetMs = fullConfig.Trader.ResetTimestamp.UTC().UnixMilli()
+	}
+
 	// Get orders from store
 	store := trader.GetStore()
 	if store == nil {
@@ -2665,7 +2825,7 @@ func (s *Server) handleOrders(c *gin.Context) {
 	}
 
 	// Get orders with filters applied at database level
-	orders, err := store.Order().GetTraderOrdersFiltered(trader.GetID(), symbol, statusFilter, limit)
+	orders, err := store.Order().GetTraderOrdersFilteredSince(trader.GetID(), symbol, statusFilter, limit, resetMs)
 	if err != nil {
 		SafeInternalError(c, "Get orders", err)
 		return
@@ -2676,6 +2836,7 @@ func (s *Server) handleOrders(c *gin.Context) {
 
 // handleOrderFills Order fill details (all fills for a specific order)
 func (s *Server) handleOrderFills(c *gin.Context) {
+	userID := c.GetString("user_id")
 	orderIDStr := c.Param("id")
 	orderID, err := strconv.ParseInt(orderIDStr, 10, 64)
 	if err != nil {
@@ -2701,8 +2862,13 @@ func (s *Server) handleOrderFills(c *gin.Context) {
 		return
 	}
 
+	resetMs := int64(0)
+	if fullConfig, err := s.store.Trader().GetFullConfig(userID, traderID); err == nil && fullConfig != nil && fullConfig.Trader != nil && !fullConfig.Trader.ResetTimestamp.IsZero() {
+		resetMs = fullConfig.Trader.ResetTimestamp.UTC().UnixMilli()
+	}
+
 	// Get fills for this order
-	fills, err := store.Order().GetOrderFills(orderID)
+	fills, err := store.Order().GetOrderFillsForTraderSince(trader.GetID(), orderID, resetMs)
 	if err != nil {
 		SafeInternalError(c, "Get order fills", err)
 		return
@@ -3119,6 +3285,7 @@ func (s *Server) handleSymbols(c *gin.Context) {
 
 // handleDecisions Decision log list
 func (s *Server) handleDecisions(c *gin.Context) {
+	userID := c.GetString("user_id")
 	_, traderID, err := s.getTraderFromQuery(c)
 	if err != nil {
 		SafeBadRequest(c, "Invalid trader ID")
@@ -3132,7 +3299,12 @@ func (s *Server) handleDecisions(c *gin.Context) {
 	}
 
 	// Get all historical decision records (unlimited)
-	records, err := trader.GetStore().Decision().GetLatestRecords(trader.GetID(), 10000)
+	resetAt := time.Time{}
+	if fullConfig, err := s.store.Trader().GetFullConfig(userID, traderID); err == nil && fullConfig != nil && fullConfig.Trader != nil {
+		resetAt = fullConfig.Trader.ResetTimestamp
+	}
+
+	records, err := trader.GetStore().Decision().GetLatestRecordsSince(trader.GetID(), 10000, resetAt)
 	if err != nil {
 		SafeInternalError(c, "Get decision log", err)
 		return
@@ -3143,6 +3315,7 @@ func (s *Server) handleDecisions(c *gin.Context) {
 
 // handleLatestDecisions Latest decision logs (newest first, supports limit parameter)
 func (s *Server) handleLatestDecisions(c *gin.Context) {
+	userID := c.GetString("user_id")
 	_, traderID, err := s.getTraderFromQuery(c)
 	if err != nil {
 		SafeBadRequest(c, "Invalid trader ID")
@@ -3166,7 +3339,12 @@ func (s *Server) handleLatestDecisions(c *gin.Context) {
 		}
 	}
 
-	records, err := trader.GetStore().Decision().GetLatestRecords(trader.GetID(), limit)
+	resetAt := time.Time{}
+	if fullConfig, err := s.store.Trader().GetFullConfig(userID, traderID); err == nil && fullConfig != nil && fullConfig.Trader != nil {
+		resetAt = fullConfig.Trader.ResetTimestamp
+	}
+
+	records, err := trader.GetStore().Decision().GetLatestRecordsSince(trader.GetID(), limit, resetAt)
 	if err != nil {
 		SafeInternalError(c, "Get decision log", err)
 		return
@@ -3185,6 +3363,7 @@ func (s *Server) handleLatestDecisions(c *gin.Context) {
 // Query: trader_id (required), from, to (ISO8601 or YYYY-MM-DD), or period=last_24h|last_7d|last_30d.
 // Optional: include_prompts=1 to include system_prompt and input_prompt in each record.
 func (s *Server) handleDecisionsExport(c *gin.Context) {
+	userID := c.GetString("user_id")
 	_, traderID, err := s.getTraderFromQuery(c)
 	if err != nil {
 		SafeBadRequest(c, "Invalid trader ID")
@@ -3236,7 +3415,12 @@ func (s *Server) handleDecisionsExport(c *gin.Context) {
 		}
 	}
 
-	records, err := trader.GetStore().Decision().GetRecordsInRange(trader.GetID(), fromTime, toTime)
+	resetAt := time.Time{}
+	if fullConfig, err := s.store.Trader().GetFullConfig(userID, traderID); err == nil && fullConfig != nil && fullConfig.Trader != nil {
+		resetAt = fullConfig.Trader.ResetTimestamp
+	}
+
+	records, err := trader.GetStore().Decision().GetRecordsInRangeSince(trader.GetID(), fromTime, toTime, resetAt)
 	if err != nil {
 		SafeInternalError(c, "Export decisions", err)
 		return
@@ -3282,6 +3466,7 @@ func parseExportTime(s string) (time.Time, error) {
 
 // handleStatistics Statistics information
 func (s *Server) handleStatistics(c *gin.Context) {
+	userID := c.GetString("user_id")
 	_, traderID, err := s.getTraderFromQuery(c)
 	if err != nil {
 		SafeBadRequest(c, "Invalid trader ID")
@@ -3294,7 +3479,12 @@ func (s *Server) handleStatistics(c *gin.Context) {
 		return
 	}
 
-	stats, err := trader.GetStore().Decision().GetStatistics(trader.GetID())
+	resetAt := time.Time{}
+	if fullConfig, err := s.store.Trader().GetFullConfig(userID, traderID); err == nil && fullConfig != nil && fullConfig.Trader != nil {
+		resetAt = fullConfig.Trader.ResetTimestamp
+	}
+
+	stats, err := trader.GetStore().Decision().GetStatisticsSince(trader.GetID(), resetAt)
 	if err != nil {
 		SafeInternalError(c, "Get statistics", err)
 		return
@@ -3416,7 +3606,12 @@ func (s *Server) handleIndicatorAnalysis(c *gin.Context) {
 		return
 	}
 
-	positions, err := traderStore.Position().GetClosedPositions(trader.GetID(), limit)
+	resetAt := time.Time{}
+	if fullConfig, err := s.store.Trader().GetFullConfig(c.GetString("user_id"), traderID); err == nil && fullConfig != nil && fullConfig.Trader != nil {
+		resetAt = fullConfig.Trader.ResetTimestamp
+	}
+
+	positions, err := traderStore.Position().GetClosedPositionsSince(trader.GetID(), limit, resetAt)
 	if err != nil {
 		SafeInternalError(c, "Get closed positions", err)
 		return
@@ -4477,14 +4672,18 @@ func (s *Server) getEquityHistoryForTraders(traderIDs []string, hours int) map[s
 
 	// Pre-fetch initial balances for all traders
 	initialBalances := make(map[string]float64)
+	resetTimestamps := make(map[string]time.Time)
 	for _, traderID := range traderIDs {
 		if traderID == "" {
 			continue
 		}
 		// Get trader's initial balance from database (use GetByID which doesn't require userID)
 		trader, err := s.store.Trader().GetByID(traderID)
-		if err == nil && trader != nil && trader.InitialBalance > 0 {
-			initialBalances[traderID] = trader.InitialBalance
+		if err == nil && trader != nil {
+			if trader.InitialBalance > 0 {
+				initialBalances[traderID] = trader.InitialBalance
+			}
+			resetTimestamps[traderID] = trader.ResetTimestamp
 		}
 	}
 
@@ -4500,10 +4699,10 @@ func (s *Server) getEquityHistoryForTraders(traderIDs []string, hours int) map[s
 		if hours > 0 {
 			// Filter by time range
 			startTime := now.Add(-time.Duration(hours) * time.Hour)
-			snapshots, err = s.store.Equity().GetByTimeRange(traderID, startTime, now)
+			snapshots, err = s.store.Equity().GetByTimeRangeSince(traderID, startTime, now, resetTimestamps[traderID])
 		} else {
 			// Default: get latest 500 records
-			snapshots, err = s.store.Equity().GetLatest(traderID, 500)
+			snapshots, err = s.store.Equity().GetLatestSince(traderID, 500, resetTimestamps[traderID])
 		}
 		if err != nil {
 			logger.Errorf("[API] Failed to get equity history for %s: %v", traderID, err)

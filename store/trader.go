@@ -32,6 +32,7 @@ type Trader struct {
 	ShowInCompetition   bool      `gorm:"column:show_in_competition;default:true" json:"show_in_competition"`
 	IsDryRun            bool      `gorm:"column:is_dry_run;default:false" json:"is_dry_run"`                   // 模拟盘：不真实下单，仅本地撮合与落库
 	VirtualEquity       float64   `gorm:"column:virtual_equity;default:0" json:"virtual_equity"`             // 模拟盘本金（USDT），IsDryRun 时 Prompt 用此值
+	ResetTimestamp      time.Time `gorm:"column:reset_timestamp" json:"reset_timestamp"`
 	CreatedAt           time.Time `gorm:"column:created_at;autoCreateTime" json:"created_at"`
 	UpdatedAt           time.Time `gorm:"column:updated_at;autoUpdateTime" json:"updated_at"`
 
@@ -60,17 +61,29 @@ type TraderFullConfig struct {
 }
 
 func (s *TraderStore) initTables() error {
-	// For PostgreSQL with existing table, skip AutoMigrate
+	// For PostgreSQL with existing table, skip AutoMigrate after lightweight column migration
 	if s.db.Dialector.Name() == "postgres" {
 		var tableExists int64
 		s.db.Raw(`SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'traders'`).Scan(&tableExists)
 		if tableExists > 0 {
+			var columnExists int64
+			s.db.Raw(`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'traders' AND column_name = 'reset_timestamp'`).Scan(&columnExists)
+			if columnExists == 0 {
+				s.db.Exec(`ALTER TABLE traders ADD COLUMN reset_timestamp TIMESTAMPTZ NULL`)
+			}
 			return nil
 		}
 	}
 	// Use GORM AutoMigrate
 	if err := s.db.AutoMigrate(&Trader{}); err != nil {
 		return fmt.Errorf("failed to migrate traders table: %w", err)
+	}
+	if s.db.Dialector.Name() != "postgres" {
+		var columnExists int64
+		s.db.Raw(`SELECT COUNT(*) FROM pragma_table_info('traders') WHERE name = 'reset_timestamp'`).Scan(&columnExists)
+		if columnExists == 0 {
+			s.db.Exec(`ALTER TABLE traders ADD COLUMN reset_timestamp DATETIME`)
+		}
 	}
 	return nil
 }
@@ -151,6 +164,13 @@ func (s *TraderStore) UpdateVirtualEquity(userID, id string, virtualEquity float
 	return s.db.Model(&Trader{}).
 		Where("id = ? AND user_id = ?", id, userID).
 		Update("virtual_equity", virtualEquity).Error
+}
+
+// UpdateResetTimestamp updates a trader's logical reset time without deleting any historical rows.
+func (s *TraderStore) UpdateResetTimestamp(userID, id string, resetAt time.Time) error {
+	return s.db.Model(&Trader{}).
+		Where("id = ? AND user_id = ?", id, userID).
+		Update("reset_timestamp", resetAt.UTC()).Error
 }
 
 // UpdateStrategyID 仅更新某个 Trader 的 StrategyID 字段，用于在后端自动修复/绑定默认策略时持久化关联关系

@@ -132,8 +132,10 @@ export function TraderDashboardPage({
     exchanges,
 }: TraderDashboardPageProps) {
     const [closingPosition, setClosingPosition] = useState<string | null>(null)
+    const [resettingTraderData, setResettingTraderData] = useState(false)
     const [selectedChartSymbol, setSelectedChartSymbol] = useState<string | undefined>(undefined)
     const [chartUpdateKey, setChartUpdateKey] = useState<number>(0)
+    const [dataRefreshNonce, setDataRefreshNonce] = useState(0)
     const [exportPeriod, setExportPeriod] = useState<'last_24h' | 'last_7d' | 'last_30d'>('last_7d')
     const [exporting, setExporting] = useState(false)
     const chartSectionRef = useRef<HTMLDivElement>(null)
@@ -208,7 +210,7 @@ export function TraderDashboardPage({
         return () => {
             aborted = true
         }
-    }, [selectedTraderId, indicatorTimeframe, indicatorRSIPeriod, indicatorEMAPeriod, indicatorVolMultBars])
+    }, [selectedTraderId, indicatorTimeframe, indicatorRSIPeriod, indicatorEMAPeriod, indicatorVolMultBars, dataRefreshNonce])
 
     // Reset page when positions change
     useEffect(() => {
@@ -320,6 +322,48 @@ export function TraderDashboardPage({
             notify.error(errorMsg)
         } finally {
             setClosingPosition(null)
+        }
+    }
+
+    const handleResetTraderData = async () => {
+        if (!selectedTraderId || resettingTraderData) return
+
+        const confirmMsg =
+            language === 'zh'
+                ? '确定要清空该交易员当前世代的数据视图吗？系统只会更新 reset_timestamp，旧数据不会被删除，只会被隔离隐藏。'
+                : 'Clear this trader by moving its reset timestamp forward? Old data will be hidden, not deleted.'
+
+        const confirmed = await confirmToast(confirmMsg, {
+            title: language === 'zh' ? '确认清空历史数据' : 'Confirm Clear History',
+            okText: language === 'zh' ? '确认软重置' : 'Soft Reset',
+            cancelText: language === 'zh' ? '取消' : 'Cancel',
+        })
+
+        if (!confirmed) return
+
+        setResettingTraderData(true)
+        try {
+            await api.resetTraderData(selectedTraderId)
+            setDataRefreshNonce((prev) => prev + 1)
+            await Promise.all([
+                mutate(`status-${selectedTraderId}`),
+                mutate(`positions-${selectedTraderId}`),
+                mutate(`account-${selectedTraderId}`),
+                mutate(`decisions/latest-${selectedTraderId}-${decisionsLimit}`),
+                mutate(`statistics-${selectedTraderId}`),
+                mutate(`equity-history-${selectedTraderId}`),
+            ])
+            notify.success(language === 'zh' ? '已软重置，旧数据已隔离隐藏' : 'Soft reset applied')
+        } catch (err: unknown) {
+            const errorMsg =
+                err instanceof Error
+                    ? err.message
+                    : language === 'zh'
+                        ? '清空历史数据失败'
+                        : 'Failed to clear trader history'
+            notify.error(errorMsg)
+        } finally {
+            setResettingTraderData(false)
         }
     }
 
@@ -585,6 +629,22 @@ export function TraderDashboardPage({
                                 <span>Runtime: <span className="text-nofx-text-main">{status.runtime_minutes} min</span></span>
                             </div>
                         )}
+                    </div>
+                    <div className="flex items-center justify-end">
+                        <button
+                            type="button"
+                            onClick={handleResetTraderData}
+                            disabled={!selectedTraderId || resettingTraderData}
+                            className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold transition-all bg-red-500/10 text-red-300 border border-red-500/40 hover:bg-red-500/20 hover:border-red-400/60 disabled:opacity-50 disabled:cursor-not-allowed"
+                            title={language === 'zh' ? '清空历史数据并重置交易员内存状态' : 'Clear trader history and reset runtime state'}
+                        >
+                            {resettingTraderData ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                                <span className="text-base">🗑️</span>
+                            )}
+                            {language === 'zh' ? '清空历史数据' : 'Clear History'}
+                        </button>
                     </div>
                 </div>
 
@@ -1285,7 +1345,7 @@ export function TraderDashboardPage({
                                     {t('positionHistory.title', language)}
                                 </h2>
                             </div>
-                            <PositionHistory traderId={selectedTraderId} />
+                            <PositionHistory key={`${selectedTraderId}-${dataRefreshNonce}`} traderId={selectedTraderId} />
                         </div>
                     </div>
                 )}

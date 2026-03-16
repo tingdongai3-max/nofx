@@ -1,0 +1,212 @@
+{
+  "version": "1.0.0",
+  "name": "nofx-openclaw-tools",
+  "description": "OpenClaw-compatible tool manifest for controlling NOFX through authenticated frontend or webhook orchestration.",
+  "auth": {
+    "type": "bearer",
+    "header": "Authorization"
+  },
+  "tools": [
+    {
+      "name": "list_models",
+      "description": "Read configured AI models.",
+      "method": "GET",
+      "path": "/api/models",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "update_models",
+      "description": "Replace AI model configuration.",
+      "method": "PUT",
+      "path": "/api/models",
+      "input_schema": {
+        "type": "object",
+        "required": ["models"],
+        "properties": {
+          "models": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "list_exchanges",
+      "description": "Read configured exchange accounts.",
+      "method": "GET",
+      "path": "/api/exchanges",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "create_exchange",
+      "description": "Create a new exchange account.",
+      "method": "POST",
+      "path": "/api/exchanges",
+      "input_schema": {
+        "type": "object",
+        "required": ["exchange_type"],
+        "properties": {
+          "exchange_type": { "type": "string" },
+          "account_name": { "type": "string" },
+          "enabled": { "type": "boolean" },
+          "api_key": { "type": "string" },
+          "secret_key": { "type": "string" },
+          "passphrase": { "type": "string" },
+          "testnet": { "type": "boolean" }
+        }
+      }
+    },
+    {
+      "name": "update_exchanges",
+      "description": "Replace exchange configuration map.",
+      "method": "PUT",
+      "path": "/api/exchanges",
+      "input_schema": {
+        "type": "object",
+        "required": ["exchanges"],
+        "properties": {
+          "exchanges": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "name": "delete_exchange",
+      "description": "Delete an exchange account by id.",
+      "method": "DELETE",
+      "path": "/api/exchanges/{id}",
+      "input_schema": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "list_strategies",
+      "description": "Read strategies available for traders.",
+      "method": "GET",
+      "path": "/api/strategies",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "create_trader",
+      "description": "Create a trader.",
+      "method": "POST",
+      "path": "/api/traders",
+      "input_schema": {
+        "type": "object",
+        "required": ["name", "ai_model_id", "exchange_id"],
+        "properties": {
+          "name": { "type": "string" },
+          "ai_model_id": { "type": "string" },
+          "exchange_id": { "type": "string" },
+          "strategy_id": { "type": "string" },
+          "scan_interval_minutes": { "type": "integer" },
+          "is_cross_margin": { "type": "boolean" },
+          "show_in_competition": { "type": "boolean" },
+          "is_dry_run": { "type": "boolean" },
+          "virtual_equity": { "type": "number" }
+        }
+      }
+    },
+    {
+      "name": "update_trader",
+      "description": "Update trader config by id.",
+      "method": "PUT",
+      "path": "/api/traders/{id}",
+      "input_schema": {
+        "type": "object",
+        "required": ["id", "name", "ai_model_id", "exchange_id"],
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "ai_model_id": { "type": "string" },
+          "exchange_id": { "type": "string" },
+          "strategy_id": { "type": "string" },
+          "scan_interval_minutes": { "type": "integer" },
+          "is_cross_margin": { "type": "boolean" },
+          "show_in_competition": { "type": "boolean" },
+          "is_dry_run": { "type": "boolean" },
+          "virtual_equity": { "type": "number" }
+        }
+      }
+    },
+    {
+      "name": "start_trader",
+      "description": "Start one trader runtime.",
+      "method": "POST",
+      "path": "/api/traders/{id}/start",
+      "input_schema": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "stop_trader",
+      "description": "Stop one trader runtime.",
+      "method": "POST",
+      "path": "/api/traders/{id}/stop",
+      "input_schema": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "reload_trader",
+      "description": "Hot reload trader runtime.",
+      "method": "POST",
+      "path": "/api/traders/{id}/reload",
+      "input_schema": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "reset_trader_data",
+      "description": "Clear trader history and runtime cache.",
+      "method": "POST",
+      "path": "/api/traders/{id}/reset_data",
+      "input_schema": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "update_trader_prompt",
+      "description": "Update trader custom prompt.",
+      "method": "PUT",
+      "path": "/api/traders/{id}/prompt",
+      "input_schema": {
+        "type": "object",
+        "required": ["id", "custom_prompt"],
+        "properties": {
+          "id": { "type": "string" },
+          "custom_prompt": { "type": "string" }
+        }
+      }
+    }
+  ]
+}

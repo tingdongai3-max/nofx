@@ -63,8 +63,17 @@ func (s *EquityStore) Save(snapshot *EquitySnapshot) error {
 
 // GetLatest gets the latest N equity records for specified trader (sorted in ascending chronological order: old to new)
 func (s *EquityStore) GetLatest(traderID string, limit int) ([]*EquitySnapshot, error) {
+	return s.GetLatestSince(traderID, limit, time.Time{})
+}
+
+// GetLatestSince gets the latest N equity records on/after resetAt.
+func (s *EquityStore) GetLatestSince(traderID string, limit int, resetAt time.Time) ([]*EquitySnapshot, error) {
 	var snapshots []*EquitySnapshot
-	err := s.db.Where("trader_id = ?", traderID).
+	q := s.db.Where("trader_id = ?", traderID)
+	if !resetAt.IsZero() {
+		q = q.Where("timestamp >= ?", resetAt.UTC())
+	}
+	err := q.
 		Order("timestamp DESC").
 		Limit(limit).
 		Find(&snapshots).Error
@@ -82,8 +91,17 @@ func (s *EquityStore) GetLatest(traderID string, limit int) ([]*EquitySnapshot, 
 
 // GetByTimeRange gets equity records within specified time range
 func (s *EquityStore) GetByTimeRange(traderID string, start, end time.Time) ([]*EquitySnapshot, error) {
+	return s.GetByTimeRangeSince(traderID, start, end, time.Time{})
+}
+
+// GetByTimeRangeSince gets equity records within range and on/after resetAt.
+func (s *EquityStore) GetByTimeRangeSince(traderID string, start, end, resetAt time.Time) ([]*EquitySnapshot, error) {
 	var snapshots []*EquitySnapshot
-	err := s.db.Where("trader_id = ? AND timestamp >= ? AND timestamp <= ?", traderID, start, end).
+	q := s.db.Where("trader_id = ? AND timestamp >= ? AND timestamp <= ?", traderID, start, end)
+	if !resetAt.IsZero() {
+		q = q.Where("timestamp >= ?", resetAt.UTC())
+	}
+	err := q.
 		Order("timestamp ASC").
 		Find(&snapshots).Error
 	if err != nil {

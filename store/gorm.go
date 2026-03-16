@@ -13,6 +13,11 @@ import (
 // GormDB is the global GORM database connection
 var gormDB *gorm.DB
 
+const (
+	sqliteMaxOpenConns = 8
+	sqliteMaxIdleConns = 4
+)
+
 // DB returns the GORM database connection
 func DB() *gorm.DB {
 	return gormDB
@@ -36,14 +41,14 @@ func InitGorm(dbPath string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	sqlDB.SetMaxOpenConns(1)
-	sqlDB.SetMaxIdleConns(1)
+	sqlDB.SetMaxOpenConns(sqliteMaxOpenConns)
+	sqlDB.SetMaxIdleConns(sqliteMaxIdleConns)
 
 	// Enable foreign keys for SQLite
 	db.Exec("PRAGMA foreign_keys = ON")
-	db.Exec("PRAGMA journal_mode = DELETE")
-	db.Exec("PRAGMA synchronous = FULL")
-	db.Exec("PRAGMA busy_timeout = 5000")
+	db.Exec("PRAGMA journal_mode = WAL")
+	db.Exec("PRAGMA synchronous = NORMAL")
+	db.Exec("PRAGMA busy_timeout = 10000")
 
 	gormDB = db
 	return db, nil

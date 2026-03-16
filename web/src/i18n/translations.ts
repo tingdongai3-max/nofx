@@ -1155,6 +1155,10 @@ export const translations = {
       plRatioDesc: 'Avg Win / Avg Loss',
       sharpeRatio: 'Sharpe Ratio',
       sharpeRatioDesc: 'Risk-adjusted Return',
+      calmarRatio: 'Calmar Ratio',
+      calmarRatioDesc: 'Annualized Return / Max Drawdown',
+      maeAvg: 'MAE Avg (%)',
+      maeWorst: 'MAE Worst (%)',
       maxDrawdown: 'Max Drawdown',
       avgWin: 'Avg Win',
       avgLoss: 'Avg Loss',
@@ -1166,6 +1170,10 @@ export const translations = {
       avgPnL: 'Avg P&L',
       // Symbol Performance
       symbolPerformance: 'Symbol Performance',
+      batchManage: 'Batch Manage',
+      cancelBatchManage: 'Cancel',
+      selectPositiveSymbols: 'Select P&L > 0',
+      selectNegativeSymbols: 'Select P&L < 0',
       // Filters
       symbol: 'Symbol',
       allSymbols: 'All Symbols',
@@ -2404,6 +2412,10 @@ export const translations = {
       plRatioDesc: '平均盈利 / 平均亏损',
       sharpeRatio: '夏普比率',
       sharpeRatioDesc: '风险调整收益',
+      calmarRatio: '卡玛比率',
+      calmarRatioDesc: '年化收益 / 最大回撤',
+      maeAvg: 'MAE 平均(%)',
+      maeWorst: 'MAE 最差(%)',
       maxDrawdown: '最大回撤',
       avgWin: '平均盈利',
       avgLoss: '平均亏损',
@@ -2415,6 +2427,10 @@ export const translations = {
       avgPnL: '平均盈亏',
       // Symbol Performance
       symbolPerformance: '品种表现',
+      batchManage: '批量管理',
+      cancelBatchManage: '取消',
+      selectPositiveSymbols: '全选盈亏 > 0',
+      selectNegativeSymbols: '全选盈亏 < 0',
       // Filters
       symbol: '交易对',
       allSymbols: '全部交易对',

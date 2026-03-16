@@ -194,15 +194,17 @@ type IndicatorConfig struct {
 	EnableVolumePOC      bool `json:"enable_volume_poc"`       // 筹码分布 POC 与 POC 偏离度
 	EnableOrderBookDepth bool `json:"enable_order_book_depth"` // 深度图：1% 买卖深度与挂单大墙（Wall Detection）
 
-	// 动态指标移动止盈止损（硬风控狗）：不经过 AI，价格跌破/突破指定指标线即市价平仓
-	EnableIndicatorTrailing bool   `json:"enable_indicator_trailing"`   // 是否开启指标追踪止盈止损
-	TrailingIndicator       string  `json:"trailing_indicator,omitempty"`   // 平仓线指标，如 "ema_20", "ema_50", "boll_middle_20"
-	TrailingTimeframe       string  `json:"trailing_timeframe,omitempty"`   // 风控计算周期，如 "1m","5m","15m","1h","4h"，默认 "5m"
-	TrailingOffsetPercent   float64 `json:"trailing_offset_percent"`       // 触发偏移量(%)，多单跌破均线-偏移%才平仓，空单突破均线+偏移%才平仓，防插针，默认 0
-
-	// ATR 移动止盈止损：开启后开仓不设交易所固定 TP/SL，由 AI 输出 ATR 倍数，机器狗按价格流监控并触发
-	EnableATRTrailing    bool `json:"enable_atr_trailing"`    // 是否使用 ATR 倍数移动止盈止损（AI 输出 atr_sl_mult / atr_tp_mult / atr_tp_stages）
-	EnableStagedTakeProfit bool `json:"enable_staged_take_profit"` // 允许分批止盈：关闭后 AI 只能使用单一 take_profit 全仓止盈，不能使用 take_profit_stages / atr_tp_stages
+	// 系统级防守开关：由后台风控狗直接监听数据流并强制平仓，不经过 AI
+	EnableFractalDefense bool `json:"enable_fractal_defense"` // 2B 假突破防守（孤立极值刺透后实体拒绝）
+	EnableEMA20GapDefense bool `json:"enable_ema20_gap_defense"` // EMA20 引力缺口防守（K 线完全脱离 EMA20）
+	Enable3BarTrailing bool `json:"enable_3bar_trailing"` // 3K 线动量追踪防守（突破最近 3 根极值即平仓）
+	// Deprecated compatibility fields. No longer exposed in the UI.
+	EnableIndicatorTrailing bool   `json:"enable_indicator_trailing,omitempty"`
+	TrailingIndicator       string `json:"trailing_indicator,omitempty"`
+	TrailingTimeframe       string `json:"trailing_timeframe,omitempty"`
+	TrailingOffsetPercent   float64 `json:"trailing_offset_percent,omitempty"`
+	EnableATRTrailing       bool `json:"enable_atr_trailing,omitempty"`
+	EnableStagedTakeProfit bool `json:"enable_staged_take_profit"` // 允许分批止盈：关闭后 AI 只能使用单一 take_profit 全仓止盈，不能使用 take_profit_stages
 
 	// 缠论 CZSC：开启后对 K 线做笔/线段/中枢/买卖点分析，将标签注入 Prompt，AI 依标签做浪浪交易法，不开启时与之前一致
 	EnableCZSC       bool   `json:"enable_czsc"`        // 是否启用缠论分析（笔、线段、中枢、1/2/3类买卖点）
@@ -351,16 +353,13 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 			EnablePriceRanking:   true,
 			PriceRankingDuration: "1h,4h,24h",
 			PriceRankingLimit:    10,
-			// 指标移动止盈止损（风控狗）
-			EnableIndicatorTrailing: false,
-			TrailingIndicator:       "ema_20",
-			TrailingTimeframe:       "5m",
-			TrailingOffsetPercent:   0,
-			EnableATRTrailing:       false,
-			EnableStagedTakeProfit:  true,
-			EnableCZSC:              false,
-			CZSCServiceURL:          "http://czsc_service:8765",
-			BIASPeriods:             []int{6, 12, 24},
+			EnableFractalDefense:   false,
+			EnableEMA20GapDefense:  false,
+			Enable3BarTrailing:     false,
+			EnableStagedTakeProfit: true,
+			EnableCZSC:             false,
+			CZSCServiceURL:         "http://czsc_service:8765",
+			BIASPeriods:            []int{6, 12, 24},
 		},
 		RiskControl: RiskControlConfig{
 			EnableAIClose:                false, // By default, exits are handled by backend watchdog/ATR; AI focuses on entries

@@ -4,6 +4,7 @@ import { useLanguage } from '../contexts/LanguageContext'
 import { t } from '../i18n/translations'
 import { MetricTooltip } from './MetricTooltip'
 import { formatPrice, formatQuantity } from '../utils/format'
+import { toast } from 'sonner'
 import type {
   HistoricalPosition,
   TraderStats,
@@ -108,7 +109,19 @@ function StatCard({
 }
 
 // Symbol Stats Row
-function SymbolStatsRow({ stat }: { stat: SymbolStats }) {
+function SymbolStatsRow({
+  stat,
+  language,
+  showCheckbox,
+  checked,
+  onToggle,
+}: {
+  stat: SymbolStats
+  language: 'en' | 'zh'
+  showCheckbox?: boolean
+  checked?: boolean
+  onToggle?: () => void
+}) {
   const totalPnl = stat.total_pnl || 0
   const winRate = stat.win_rate || 0
   const pnlColor = totalPnl >= 0 ? '#0ECB81' : '#F6465D'
@@ -117,11 +130,15 @@ function SymbolStatsRow({ stat }: { stat: SymbolStats }) {
   const plRatio = stat.pl_ratio || 0
   const sharpe = stat.sharpe_ratio || 0
   const calmar = stat.calmar_ratio || 0
+  const maeAvg = stat.mae_avg || 0
+  const maeMin = stat.mae_min || 0
   const plRatioColor = plRatio < 1 ? '#848E9C' : '#EAECEF'
   const sharpeStyle =
     sharpe > 2
       ? { color: '#F0B90B', fontWeight: 700 }
       : { color: '#EAECEF', fontWeight: 600 }
+
+  const symbol = stat.symbol || ''
 
   return (
     <div
@@ -129,8 +146,17 @@ function SymbolStatsRow({ stat }: { stat: SymbolStats }) {
       style={{ borderBottom: '1px solid #2B3139' }}
     >
       <div className="flex items-center gap-3">
+        {showCheckbox && (
+          <input
+            type="checkbox"
+            checked={!!checked}
+            onChange={onToggle}
+            className="h-4 w-4 accent-[#F0B90B]"
+            aria-label={language === 'zh' ? `选择 ${symbol}` : `Select ${symbol}`}
+          />
+        )}
         <span className="font-mono font-semibold" style={{ color: '#EAECEF' }}>
-          {(stat.symbol || '').replace('USDT', '')}
+          {symbol.replace('USDT', '')}
         </span>
         <span className="text-xs" style={{ color: '#848E9C' }}>
           {stat.total_trades || 0} trades
@@ -139,7 +165,7 @@ function SymbolStatsRow({ stat }: { stat: SymbolStats }) {
       <div className="flex items-center gap-6">
         <div className="text-right">
           <div className="text-xs" style={{ color: '#848E9C' }}>
-            Win Rate
+            {t('positionHistory.winRate', language)}
           </div>
           <div className="font-mono font-semibold" style={{ color: winRateColor }}>
             {winRate.toFixed(1)}%
@@ -147,25 +173,53 @@ function SymbolStatsRow({ stat }: { stat: SymbolStats }) {
         </div>
         <div className="text-right min-w-[80px]">
           <div className="text-xs" style={{ color: '#848E9C' }}>
-            P&L
+            {t('positionHistory.pnl', language)}
           </div>
           <div className="font-mono font-semibold" style={{ color: pnlColor }}>
             {totalPnl >= 0 ? '+' : ''}
             {formatNumber(totalPnl)}
           </div>
         </div>
-        <div className="text-right min-w-[110px]">
-          <div className="text-xs" style={{ color: '#848E9C' }}>
-            PL / Sharpe / Calmar
-          </div>
-          <div className="font-mono text-xs">
-            <span style={{ color: plRatioColor }}>
+        <div className="grid grid-cols-5 gap-4 text-right min-w-[280px]">
+          <div>
+            <div className="text-[11px]" style={{ color: '#848E9C' }}>
+              {t('positionHistory.plRatio', language)}
+            </div>
+            <div className="font-mono text-xs font-semibold" style={{ color: plRatioColor }}>
               {plRatio.toFixed(2)}
-            </span>
-            <span style={{ color: '#848E9C' }}> / </span>
-            <span style={sharpeStyle}>{sharpe.toFixed(2)}</span>
-            <span style={{ color: '#848E9C' }}> / </span>
-            <span style={{ color: '#EAECEF' }}>{calmar.toFixed(2)}</span>
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px]" style={{ color: '#848E9C' }}>
+              {t('positionHistory.sharpeRatio', language)}
+            </div>
+            <div className="font-mono text-xs font-semibold" style={sharpeStyle}>
+              {sharpe.toFixed(2)}
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px]" style={{ color: '#848E9C' }}>
+              {t('positionHistory.calmarRatio', language)}
+            </div>
+            <div className="font-mono text-xs font-semibold" style={{ color: '#EAECEF' }}>
+              {calmar.toFixed(2)}
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px]" style={{ color: '#848E9C' }}>
+              {t('positionHistory.maeAvg', language)}
+            </div>
+            <div className="font-mono text-xs font-semibold" style={{ color: '#F6465D' }}>
+              {maeAvg.toFixed(2)}%
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px]" style={{ color: '#848E9C' }}>
+              {t('positionHistory.maeWorst', language)}
+            </div>
+            <div className="font-mono text-xs font-semibold" style={{ color: '#F6465D' }}>
+              {maeMin.toFixed(2)}%
+            </div>
           </div>
         </div>
       </div>
@@ -386,6 +440,9 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
   const [stats, setStats] = useState<TraderStats | null>(null)
   const [symbolStats, setSymbolStats] = useState<SymbolStats[]>([])
   const [directionStats, setDirectionStats] = useState<DirectionStats[]>([])
+  const [isBatchMode, setIsBatchMode] = useState(false)
+  const [selectedSymbols, setSelectedSymbols] = useState<string[]>([])
+  const [batchAction, setBatchAction] = useState<'exclude' | 'static' | null>(null)
 
   // Pagination state
   const [pageSize, setPageSize] = useState<number>(20)
@@ -455,6 +512,113 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
     } else {
       setSymbolSortBy(next)
       setSymbolSortOrder('desc')
+    }
+  }
+
+  const resetBatchMode = () => {
+    setIsBatchMode(false)
+    setSelectedSymbols([])
+  }
+
+  const toggleBatchMode = () => {
+    if (isBatchMode) {
+      resetBatchMode()
+      return
+    }
+    setIsBatchMode(true)
+    setSelectedSymbols([])
+  }
+
+  const toggleSymbolSelection = (symbol: string) => {
+    setSelectedSymbols((prev) => {
+      if (prev.includes(symbol)) {
+        return prev.filter((s) => s !== symbol)
+      }
+      return [...prev, symbol]
+    })
+  }
+
+  const selectAllPositive = () => {
+    setSelectedSymbols(
+      symbolStats
+        .filter((stat) => (stat.total_pnl || 0) > 0)
+        .map((stat) => stat.symbol)
+        .filter((symbol): symbol is string => Boolean(symbol))
+    )
+  }
+
+  const selectAllNegative = () => {
+    setSelectedSymbols(
+      symbolStats
+        .filter((stat) => (stat.total_pnl || 0) < 0)
+        .map((stat) => stat.symbol)
+        .filter((symbol): symbol is string => Boolean(symbol))
+    )
+  }
+
+  const handleBatchUpdate = async (action: 'exclude' | 'static') => {
+    if (!traderId || selectedSymbols.length === 0) return
+    setBatchAction(action)
+    try {
+      const latestTraderConfig = await api.getTraderConfig(traderId)
+      const strategyId = latestTraderConfig.strategy_id
+      if (!strategyId) {
+        throw new Error(language === 'zh' ? '交易员未绑定策略配置' : 'Trader has no strategy configured')
+      }
+
+      const strategy = await api.getStrategy(strategyId)
+      const existingConfig = strategy.config
+      if (!existingConfig) {
+        throw new Error(language === 'zh' ? '策略配置为空' : 'Strategy config is missing')
+      }
+      const existingCoinSource = existingConfig?.coin_source || {
+        source_type: 'static',
+        static_coins: [],
+        excluded_coins: [],
+        use_ai500: false,
+        use_oi_top: false,
+        use_oi_low: false,
+      }
+
+      const normalizedSelected = Array.from(new Set(selectedSymbols.filter(Boolean)))
+
+      const updatedCoinSource =
+        action === 'exclude'
+          ? {
+            ...existingCoinSource,
+            excluded_coins: Array.from(
+              new Set([...(existingCoinSource.excluded_coins || []), ...normalizedSelected])
+            ),
+          }
+          : {
+            ...existingCoinSource,
+            static_coins: Array.from(
+              new Set([...(existingCoinSource.static_coins || []), ...normalizedSelected])
+            ),
+          }
+
+      const updatedConfig = {
+        ...existingConfig,
+        coin_source: updatedCoinSource,
+      }
+
+      await api.updateStrategy(strategyId, {
+        name: strategy.name,
+        description: strategy.description,
+        config: updatedConfig,
+        is_public: strategy.is_public,
+        config_visible: strategy.config_visible,
+      })
+
+      await api.reloadTrader(traderId)
+
+      toast.success(language === 'zh' ? '已成功更新交易员配置' : 'Trader config updated successfully')
+      resetBatchMode()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : (language === 'zh' ? '更新失败' : 'Update failed')
+      toast.error(message)
+    } finally {
+      setBatchAction(null)
     }
   }
 
@@ -653,7 +817,7 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
 
       {/* Overall Stats - Row 2: Advanced Metrics */}
       {stats && (
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
           <StatCard
             icon="📉"
             title={t('positionHistory.sharpeRatio', language)}
@@ -661,6 +825,15 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
             color={(stats.sharpe_ratio || 0) >= 1 ? '#0ECB81' : (stats.sharpe_ratio || 0) >= 0 ? '#F0B90B' : '#F6465D'}
             subtitle={t('positionHistory.sharpeRatioDesc', language)}
             metricKey="sharpe_ratio"
+            language={language}
+          />
+          <StatCard
+            icon="⛰️"
+            title={t('positionHistory.calmarRatio', language)}
+            value={(stats.calmar_ratio || 0).toFixed(2)}
+            color={(stats.calmar_ratio || 0) >= 1 ? '#0ECB81' : (stats.calmar_ratio || 0) >= 0 ? '#F0B90B' : '#F6465D'}
+            subtitle={t('positionHistory.calmarRatioDesc', language)}
+            metricKey="calmar_ratio"
             language={language}
           />
           <StatCard
@@ -716,14 +889,62 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
             border: '1px solid #2B3139',
           }}
         >
-          <div className="flex items-center gap-2 mb-4">
-            <span className="text-lg">🏅</span>
-            <span className="font-semibold" style={{ color: '#EAECEF' }}>
-              {t('positionHistory.symbolPerformance', language)}
-            </span>
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+            <div className="flex items-center gap-2">
+              <span className="text-lg">🏅</span>
+              <span className="font-semibold" style={{ color: '#EAECEF' }}>
+                {t('positionHistory.symbolPerformance', language)}
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {isBatchMode && (
+                <>
+                  <button
+                    className="px-3 py-1.5 rounded border text-xs transition-colors"
+                    style={{
+                      color: '#0ECB81',
+                      borderColor: 'rgba(14, 203, 129, 0.45)',
+                      background: 'rgba(14, 203, 129, 0.1)',
+                    }}
+                    onClick={selectAllPositive}
+                    disabled={batchAction !== null}
+                  >
+                    {t('positionHistory.selectPositiveSymbols', language)}
+                  </button>
+                  <button
+                    className="px-3 py-1.5 rounded border text-xs transition-colors"
+                    style={{
+                      color: '#F6465D',
+                      borderColor: 'rgba(246, 70, 93, 0.45)',
+                      background: 'rgba(246, 70, 93, 0.1)',
+                    }}
+                    onClick={selectAllNegative}
+                    disabled={batchAction !== null}
+                  >
+                    {t('positionHistory.selectNegativeSymbols', language)}
+                  </button>
+                </>
+              )}
+              <button
+                className="px-3 py-1.5 rounded border text-xs transition-colors"
+                style={{
+                  color: isBatchMode ? '#F6465D' : '#EAECEF',
+                  borderColor: isBatchMode ? '#F6465D' : '#2B3139',
+                  background: isBatchMode ? 'rgba(246, 70, 93, 0.1)' : 'transparent',
+                }}
+                onClick={toggleBatchMode}
+                disabled={batchAction !== null}
+              >
+                {isBatchMode
+                  ? t('positionHistory.cancelBatchManage', language)
+                  : t('positionHistory.batchManage', language)}
+              </button>
+            </div>
           </div>
           <div className="flex items-center gap-3 mb-2 text-xs">
-            <span style={{ color: '#848E9C' }}>Sort:</span>
+            <span style={{ color: '#848E9C' }}>
+              {t('positionHistory.sort', language)}:
+            </span>
             <button
               className="px-2 py-1 rounded border"
               style={{
@@ -732,7 +953,7 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
               }}
               onClick={() => toggleSymbolSort('pnl')}
             >
-              P&amp;L {symbolSortBy === 'pnl' ? (symbolSortOrder === 'asc' ? '↑' : '↓') : ''}
+              {t('positionHistory.pnl', language)} {symbolSortBy === 'pnl' ? (symbolSortOrder === 'asc' ? '↑' : '↓') : ''}
             </button>
             <button
               className="px-2 py-1 rounded border"
@@ -742,7 +963,7 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
               }}
               onClick={() => toggleSymbolSort('sharpe')}
             >
-              Sharpe {symbolSortBy === 'sharpe' ? (symbolSortOrder === 'asc' ? '↑' : '↓') : ''}
+              {t('positionHistory.sharpeRatio', language)} {symbolSortBy === 'sharpe' ? (symbolSortOrder === 'asc' ? '↑' : '↓') : ''}
             </button>
             <button
               className="px-2 py-1 rounded border"
@@ -752,14 +973,59 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
               }}
               onClick={() => toggleSymbolSort('pl_ratio')}
             >
-              P/L {symbolSortBy === 'pl_ratio' ? (symbolSortOrder === 'asc' ? '↑' : '↓') : ''}
+              {t('positionHistory.plRatio', language)} {symbolSortBy === 'pl_ratio' ? (symbolSortOrder === 'asc' ? '↑' : '↓') : ''}
             </button>
           </div>
           <div className="space-y-1">
             {(symbolStatsExpanded ? sortedSymbolStats : sortedSymbolStats.slice(0, 10)).map((stat) => (
-              <SymbolStatsRow key={stat.symbol} stat={stat} />
+              <SymbolStatsRow
+                key={stat.symbol}
+                stat={stat}
+                language={language}
+                showCheckbox={isBatchMode}
+                checked={selectedSymbols.includes(stat.symbol)}
+                onToggle={() => toggleSymbolSelection(stat.symbol)}
+              />
             ))}
           </div>
+          {isBatchMode && selectedSymbols.length > 0 && (
+            <div
+              className="mt-4 flex flex-wrap items-center gap-3 rounded-lg px-4 py-3"
+              style={{ background: '#0B0E11', border: '1px solid #2B3139' }}
+            >
+              <span className="text-xs" style={{ color: '#848E9C' }}>
+                {language === 'zh'
+                  ? `已选 ${selectedSymbols.length} 个币种`
+                  : `${selectedSymbols.length} selected`}
+              </span>
+              <div className="flex items-center gap-2 ml-auto">
+                <button
+                  className="px-3 py-1.5 rounded text-xs font-semibold transition-colors"
+                  style={{
+                    background: 'rgba(246, 70, 93, 0.15)',
+                    color: '#F6465D',
+                    border: '1px solid rgba(246, 70, 93, 0.4)',
+                  }}
+                  onClick={() => handleBatchUpdate('exclude')}
+                  disabled={batchAction !== null}
+                >
+                  {language === 'zh' ? '🔴 批量拉黑' : '🔴 Exclude Selected'}
+                </button>
+                <button
+                  className="px-3 py-1.5 rounded text-xs font-semibold transition-colors"
+                  style={{
+                    background: 'rgba(14, 203, 129, 0.15)',
+                    color: '#0ECB81',
+                    border: '1px solid rgba(14, 203, 129, 0.4)',
+                  }}
+                  onClick={() => handleBatchUpdate('static')}
+                  disabled={batchAction !== null}
+                >
+                  {language === 'zh' ? '🟢 加入候选' : '🟢 Add to Static'}
+                </button>
+              </div>
+            </div>
+          )}
           {symbolStats.length > 10 && (
             <div className="flex justify-center mt-4">
               <button

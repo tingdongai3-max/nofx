@@ -226,8 +226,17 @@ func (s *OrderStore) GetOrderByExchangeID(exchangeID, exchangeOrderID string) (*
 
 // GetTraderOrders gets trader's order list
 func (s *OrderStore) GetTraderOrders(traderID string, limit int) ([]*TraderOrder, error) {
+	return s.GetTraderOrdersSince(traderID, limit, 0)
+}
+
+// GetTraderOrdersSince gets trader orders created on/after resetMs.
+func (s *OrderStore) GetTraderOrdersSince(traderID string, limit int, resetMs int64) ([]*TraderOrder, error) {
 	var orders []*TraderOrder
-	err := s.db.Where("trader_id = ?", traderID).
+	q := s.db.Where("trader_id = ?", traderID)
+	if resetMs > 0 {
+		q = q.Where("created_at >= ?", resetMs)
+	}
+	err := q.
 		Order("created_at DESC").
 		Limit(limit).
 		Find(&orders).Error
@@ -239,8 +248,16 @@ func (s *OrderStore) GetTraderOrders(traderID string, limit int) ([]*TraderOrder
 
 // GetTraderOrdersFiltered gets trader's order list with optional symbol and status filters
 func (s *OrderStore) GetTraderOrdersFiltered(traderID string, symbol string, status string, limit int) ([]*TraderOrder, error) {
+	return s.GetTraderOrdersFilteredSince(traderID, symbol, status, limit, 0)
+}
+
+// GetTraderOrdersFilteredSince gets trader orders with optional reset cutoff.
+func (s *OrderStore) GetTraderOrdersFilteredSince(traderID string, symbol string, status string, limit int, resetMs int64) ([]*TraderOrder, error) {
 	var orders []*TraderOrder
 	query := s.db.Where("trader_id = ?", traderID)
+	if resetMs > 0 {
+		query = query.Where("created_at >= ?", resetMs)
+	}
 
 	if symbol != "" {
 		query = query.Where("symbol = ?", symbol)
@@ -260,8 +277,20 @@ func (s *OrderStore) GetTraderOrdersFiltered(traderID string, symbol string, sta
 
 // GetOrderFills gets order's fill records
 func (s *OrderStore) GetOrderFills(orderID int64) ([]*TraderFill, error) {
+	return s.GetOrderFillsForTraderSince("", orderID, 0)
+}
+
+// GetOrderFillsForTraderSince gets fills for a trader/order pair on/after resetMs.
+func (s *OrderStore) GetOrderFillsForTraderSince(traderID string, orderID int64, resetMs int64) ([]*TraderFill, error) {
 	var fills []*TraderFill
-	err := s.db.Where("order_id = ?", orderID).
+	q := s.db.Where("order_id = ?", orderID)
+	if traderID != "" {
+		q = q.Where("trader_id = ?", traderID)
+	}
+	if resetMs > 0 {
+		q = q.Where("created_at >= ?", resetMs)
+	}
+	err := q.
 		Order("created_at ASC").
 		Find(&fills).Error
 	if err != nil {

@@ -131,6 +131,18 @@ type OpenPositionReasoning struct {
 	Reasoning string `json:"reasoning"`
 }
 
+// SymbolExcursionStats provides historical MAE/MFE context for one symbol.
+type SymbolExcursionStats struct {
+	Symbol            string  `json:"symbol"`
+	AvgMAEPct         float64 `json:"avg_mae_pct"`
+	AvgMFEPct         float64 `json:"avg_mfe_pct"`
+	LastTradeMAEPct   float64 `json:"last_trade_mae_pct"`
+	LastTradeMFEPct   float64 `json:"last_trade_mfe_pct"`
+	LastTradeSide     string  `json:"last_trade_side,omitempty"`
+	LastTradeExitTime int64   `json:"last_trade_exit_time,omitempty"`
+	TradeCount        int     `json:"trade_count"`
+}
+
 // Context trading context (complete information passed to AI)
 type Context struct {
 	CurrentTime     string                             `json:"current_time"`
@@ -145,6 +157,7 @@ type Context struct {
 	RecentReasoningHistory       []ReasoningOutcome                  `json:"recent_reasoning_history,omitempty"` // 近期开仓时的 AI 逻辑与盈亏（原证），供自我审阅
 	OpenPositionReasoning        []OpenPositionReasoning             `json:"open_position_reasoning,omitempty"` // 当前持仓的开仓逻辑，防串线
 	ClosedCountSinceLastDecision int                                 `json:"closed_count_since_last_decision"`   // 自上次决策以来系统平仓数，用于 ALERT
+	SymbolExcursionStatsMap      map[string]*SymbolExcursionStats    `json:"symbol_excursion_stats,omitempty"`
 	MarketDataMap                map[string]*market.Data            `json:"-"`
 	MultiTFMarket   map[string]map[string]*market.Data `json:"-"`
 	OITopDataMap    map[string]*OITopData              `json:"-"`
@@ -1328,17 +1341,27 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	if enableAIClose {
 		// Hybrid guardrail: AI may actively close positions, but still must respect watchdog/ATR rules.
 		sb.WriteString("## CRITICAL_SYSTEM_RULES — Hybrid Guardrail Mode (混合护盘架构)\n\n")
-		sb.WriteString("You MAY close positions manually. Allowed actions: `close_long`, `close_short` (full or partial), or `hold`/`wait` with TP/SL / ATR updates. Use closes for **professional scaling-out / risk reduction**, not for emotional over-trading.\n\n")
+		sb.WriteString("You MAY close positions manually. Allowed actions: `close_long`, `close_short` (full or partial), or `hold`/`wait` with TP/SL updates. Use closes for **professional scaling-out / risk reduction**, not for emotional over-trading.\n\n")
 		sb.WriteString("## CLOSE & REDUCE POSITION (平仓与减仓)\n\n")
 		sb.WriteString("- **Full close**: Use `close_long` or `close_short` with no `quantity` (or quantity=0) to close the entire position.\n")
 		sb.WriteString("- **Partial close / 分批止盈**: Use `close_long` or `close_short` with `quantity` set to the amount (in base asset, e.g. BTC amount) you want to close. Example: position 0.5 BTC, take profit 50% → output `{\"action\": \"close_long\", \"symbol\": \"BTCUSDT\", \"quantity\": 0.25}`. You can close in multiple steps (e.g. 1/3 at first target, 1/3 at second, rest at trailing).\n")
 		sb.WriteString("- When in doubt, you can still use only TP/SL orders and `hold`/`wait` to move them; closing is optional.\n\n")
 	} else {
-		// Fully automated kill-switch: AI has no permission to close; backend watchdog/ATR owns all exits.
+		// Fully automated kill-switch: AI has no permission to close; backend system defenses own all exits.
 		sb.WriteString("## CRITICAL_SYSTEM_RULES — Automated Kill-Switch Mode (物理断头台 / 全自动护盘)\n\n")
 		sb.WriteString("- **System Notice**: Your manual close permission has been REVOKED at the engine level. You are an **entry decision engine only**.\n")
 		sb.WriteString("- **DO NOT** output `close_long` or `close_short` under any circumstances. Any such actions will be ignored by the backend.\n")
-		sb.WriteString("- Position exits (take profit / stop loss / emergency kill) are fully managed by the backend watchdog / ATR auto-cruise system. You focus on selecting high-quality entries and updating TP/SL parameters via `hold` / `wait` only.\n\n")
+		sb.WriteString("- Position exits (take profit / stop loss / emergency kill) are fully managed by the backend system defense engine. You focus on selecting high-quality entries and updating TP/SL parameters via `hold` / `wait` only.\n\n")
+	}
+	sb.WriteString("## CORE RISK CONTROL & STAGED TAKE PROFIT\n\n")
+	sb.WriteString("- The User Prompt may provide `Avg MAE/MFE` and `Last Trade MAE/MFE` for each candidate coin. You MUST use this to calibrate entry spacing and stop placement.\n")
+	sb.WriteString("- If your planned stop is clearly tighter than historical Avg MAE, assume it is vulnerable to noise. Either improve the entry location or widen the stop logically.\n")
+	if e.config.Indicators.EnableStagedTakeProfit {
+		sb.WriteString("- `enable_staged_take_profit` is ON: you MUST output `take_profit_stages` only, with exactly 2 targets and `close_pct` = 50 for each.\n")
+		sb.WriteString("- Target 1 is the high-certainty de-risking level. Target 2 is the trend-extension target.\n")
+		sb.WriteString("- Backend automation will move stop loss to break-even plus fee buffer after Target 1, and will activate a 10% ratcheting trail after price reaches 80% of the distance to Target 2. You only set the two targets.\n\n")
+	} else {
+		sb.WriteString("- If staged take profit is disabled, use single `take_profit` with normal `stop_loss`.\n\n")
 	}
 	sb.WriteString("## TRAILING_STOP_PROTOCOL (Take Profit Iron Rule)\n\n")
 	sb.WriteString("When moving a trailing stop (action `hold` or `wait` with a new `stop_loss`): You may update ONLY the stop loss. Do NOT automatically move take_profit up together with the trailing stop. The initial risk-reward ratio applies only to **opening** positions; when trailing, the existing take_profit remains unchanged unless you explicitly output a new `take_profit` value. To update only the stop: set `take_profit` to 0 or omit it — the system will then leave the current TP order intact and only modify the SL order.\n\n")
@@ -1352,26 +1375,18 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	sb.WriteString("<decision>\n")
 	sb.WriteString("Step 2: JSON decision array\n\n")
 	sb.WriteString("```json\n[\n")
-	if e.config.Indicators.EnableATRTrailing {
-		if e.config.Indicators.EnableStagedTakeProfit {
-			sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": 5000, \"atr_sl_mult\": 1.2, \"atr_tp_mult\": 2, \"atr_tp_stages\": [{\"atr_mult\": 1.2, \"close_pct\": 50}, {\"atr_mult\": 1.5, \"close_pct\": 50}], \"confidence\": 85, \"risk_usd\": 300},\n",
-				riskControl.BTCETHMaxLeverage))
-		} else {
-			sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": 5000, \"atr_sl_mult\": 1.2, \"atr_tp_mult\": 2, \"confidence\": 85, \"risk_usd\": 300},\n",
-				riskControl.BTCETHMaxLeverage))
-		}
+	if e.config.Indicators.EnableStagedTakeProfit {
+		sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": 5000, \"stop_loss\": 97000,\n", riskControl.BTCETHMaxLeverage))
+		sb.WriteString("   \"take_profit_stages\": [\n")
+		sb.WriteString("     {\"price\": 93000, \"close_pct\": 50},\n")
+		sb.WriteString("     {\"price\": 91000, \"close_pct\": 50}\n")
+		sb.WriteString("   ], \"confidence\": 85, \"risk_usd\": 300},\n")
 	} else {
 		sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": 5000, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300},\n",
 			riskControl.BTCETHMaxLeverage))
-		if e.config.Indicators.EnableStagedTakeProfit {
-			sb.WriteString("  // 或使用多档静态分批止盈（不开 ATR），例如:\n")
-			sb.WriteString("  // {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": 10, \"position_size_usd\": 5000, \"stop_loss\": 97000,\n")
-			sb.WriteString("  //   \"take_profit_stages\": [\n")
-			sb.WriteString("  //     {\"price\": 91000, \"close_pct\": 30},\n")
-			sb.WriteString("  //     {\"price\": 90000, \"close_pct\": 30},\n")
-			sb.WriteString("  //     {\"price\": 89000, \"close_pct\": 40}\n")
-			sb.WriteString("  //   ], \"confidence\": 85, \"risk_usd\": 300},\n")
-		}
+	}
+	if e.config.Indicators.EnableStagedTakeProfit {
+		sb.WriteString("  // Staged take profit is mandatory here: exactly two stages, 50% each.\n")
 	}
 	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"wait\", \"confidence\": 90}\n")
 	sb.WriteString("]\n```\n")
@@ -1379,16 +1394,18 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 
 	// 7a. 自我审阅 + 反幻觉审计：原证复核，区分「逻辑错误」与「概率亏损」
 	sb.WriteString("## Review Recent AI Reasoning History (Self-Correction & No Hallucination)\n\n")
-	sb.WriteString("Before making the current decision, you **MUST** review the **## Recent AI Reasoning History** section in the User Prompt (if present). That section contains **only raw text from the database** (ai_reasoning_at_open). Do **not** reinterpret or invent past reasoning; treat it as audit evidence.\n\n")
-	sb.WriteString("- If you find that previous **losses** were due to **repeated logic** (e.g. multiple times believing a breakout that turned out to be fake), you **MUST** either explain why **this time** the logic is different, or choose to **avoid** the same setup.\n")
+	sb.WriteString("Before making the current decision, **briefly review** the **## Recent AI Reasoning History** section in the User Prompt (if present). That section contains **only raw text from the database** (ai_reasoning_at_open). If you reference past reasoning, **do not invent** or reinterpret; quote/paraphrase only what is shown.\n\n")
+	sb.WriteString("- If you notice previous **losses** were due to **repeated logic** (e.g. multiple times believing a breakout that turned out to be fake), you should **explain why this time is different** or **consider** avoiding the same setup.\n")
 	sb.WriteString("- **When auditing history, stay neutral and distinguish:**\n")
 	sb.WriteString("  - **概率亏损 (Probability loss)**: The opening logic was consistent with the strategy (e.g. volume breakout, multi-signal confluence), but normal market volatility (wick, washout, liquidity spike) triggered stop. Mark in your chain of thought as **「符合策略的必要损耗」** — no need to change strategy parameters.\n")
 	sb.WriteString("  - **逻辑错误 (Logic error)**: The opening logic had blind spots (e.g. did not notice BTC had broken support, chased at resistance, ignored divergence). Mark as **「认知失效」** and in subsequent decisions **force avoidance** of that pattern.\n")
 	sb.WriteString("- Do **not** conflate the two: probability loss is acceptable; logic error requires correction.\n\n")
+	sb.WriteString("- **Do NOT create a coin-level blacklist.** You may only avoid a **setup/pattern**, not a symbol. Past losses on a symbol are **not** a reason to refuse new trades if current signals satisfy the strategy.\n")
+	sb.WriteString("- **候选币池是唯一允许的交易范围**。除非当前逻辑被明确证伪，否则不得因历史亏损而回避某个币种；只能回避**相同错误模式**，而不是回避币种本身。\n\n")
 
 	// 7a2. 存在未平仓位时：强制「三要素」对照分析（开仓预期 vs 当前现实 vs 坚持/纠偏）
-	sb.WriteString("## Mandatory Three-Element Check (When You Have Open Positions)\n\n")
-	sb.WriteString("If **## Current Open Positions — Your Reasoning at Open** is present, you **MUST** include the following in your chain of thought for each open position (or state \"no open positions\"):\n\n")
+	sb.WriteString("## Three-Element Check (When You Have Open Positions)\n\n")
+	sb.WriteString("If **## Current Open Positions — Your Reasoning at Open** is present and you are making decisions on those positions, include a **brief** check for each open position (or state \"no open positions\"):\n\n")
 	sb.WriteString("- **当初预期 (Expectation)**: What move did you expect at open? (Quote or paraphrase from the opening reasoning above.)\n")
 	sb.WriteString("- **当前现实 (Reality)**: Does current price, volume, and market environment (e.g. BTC trend) still support that expectation?\n")
 	sb.WriteString("- **逻辑修正 (Pivot or Persevere)**: If reality contradicts expectation, is it **normal probability drawdown** (hold) or **logic invalidated** (close or reduce)?\n\n")
@@ -1396,16 +1413,15 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	// 7a3. 平仓幻觉拦截：输出 close 时必须明确「逻辑失效」而非「情绪波动」
 	if enableAIClose {
 		sb.WriteString("## Close Decision — No Hallucination Rule\n\n")
-		sb.WriteString("When you output **close_long** or **close_short**, you **MUST** state in your <reasoning> in one sentence:\n")
-		sb.WriteString("**\"I decide to close because [specific condition from the original opening logic] has been invalidated, not due to fear of short-term price fluctuation.\"**\n")
-		sb.WriteString("If you cannot point to a concrete condition from the opening thesis that is no longer true, do not close; use hold/wait instead.\n\n")
+		sb.WriteString("When you output **close_long** or **close_short**, include one sentence in <reasoning> that ties the close to a **specific condition from the original opening logic** that is now invalidated, not to short-term fear.\n")
+		sb.WriteString("If you cannot point to a concrete condition from the opening thesis that is no longer true, prefer hold/wait.\n\n")
 	}
 
 	// 7a4. 系统平仓后的认知同步：若 Recent AI Reasoning History 中有「系统平仓」记录，必须在 CoT 中回应
-	sb.WriteString("## System-Closed Positions — Mandatory Acknowledgment\n\n")
-	sb.WriteString("If **## Recent AI Reasoning History** shows any line with **系统平仓触发点** (e.g. StopLoss, TakeProfit, drawdown protection), you **MUST** write in your current chain of thought, for each such position:\n")
+	sb.WriteString("## System-Closed Positions — Acknowledgment\n\n")
+	sb.WriteString("If **## Recent AI Reasoning History** shows any line with **系统平仓触发点** (e.g. StopLoss, TakeProfit, drawdown protection), briefly acknowledge in your chain of thought, for each such position:\n")
 	sb.WriteString("**\"My [SYMBOL] [LONG/SHORT] position was closed by system risk control. I [agree / do not agree] with this action, because ...\"**\n")
-	sb.WriteString("This ensures cognitive sync after automatic exits and avoids ignoring system protector outcomes.\n\n")
+	sb.WriteString("This keeps cognitive sync after automatic exits and avoids ignoring system protector outcomes.\n\n")
 
 	// 7b. 错误案例库：Negative Examples（从 config/error_patterns 加载，可人工维护）
 	if patterns := loadErrorPatterns(); len(patterns) > 0 {
@@ -1422,34 +1438,19 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 		sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
 	} else {
 		sb.WriteString("- `action`: open_long | open_short | hold | wait\n")
-		sb.WriteString("- **You MUST NOT** output `close_long` or `close_short`; closing is handled by the backend watchdog / ATR engine. Any close_* actions will be discarded.\n")
+		sb.WriteString("- **You MUST NOT** output `close_long` or `close_short`; closing is handled by the backend system defense engine. Any close_* actions will be discarded.\n")
 	}
 	sb.WriteString(fmt.Sprintf("- `confidence`: 0-100 (opening recommended ≥ %d)\n", riskControl.MinConfidence))
+	sb.WriteString("- Required when opening: leverage, position_size_usd (use max from **This period** section; example shows 5000 as placeholder), stop_loss, **either** take_profit **or** take_profit_stages, confidence, risk_usd\n")
 	if !e.config.Indicators.EnableStagedTakeProfit {
-		sb.WriteString("- **Staged take profit is OFF**: Do NOT use `take_profit_stages` or `atr_tp_stages`. Use only single `take_profit` (or ATR mode: only `atr_tp_mult`) for full position close.\n")
-	}
-	if e.config.Indicators.EnableATRTrailing {
-		sb.WriteString("- **ATR trailing is ON**: Set `atr_sl_mult`, `atr_tp_mult`, and/or `atr_tp_stages` (max 3) for the watchdog to monitor and trigger. You may **also** set `stop_loss` and/or `take_profit`/`take_profit_stages` to place **exchange fixed orders** (e.g. hard stop or backup TP); ATR and exchange orders are **not mutually exclusive**.\n")
-		if e.config.Indicators.EnableStagedTakeProfit {
-			sb.WriteString("- Required when opening (ATR mode): leverage, position_size_usd, atr_sl_mult, atr_tp_mult and/or atr_tp_stages (max 3 entries), confidence, risk_usd. Optional: stop_loss, take_profit, or take_profit_stages for exchange orders.\n")
-		} else {
-			sb.WriteString("- Required when opening (ATR mode): leverage, position_size_usd, atr_sl_mult, atr_tp_mult (do NOT use atr_tp_stages), confidence, risk_usd. Optional: stop_loss, take_profit for exchange orders.\n")
-		}
+		sb.WriteString("- **Staged take profit is OFF**: Do NOT use `take_profit_stages`. Use only single `take_profit` for full position close.\n")
 	} else {
-		sb.WriteString("- Required when opening: leverage, position_size_usd (use max from **This period** section; example shows 5000 as placeholder), stop_loss, **either** take_profit **or** take_profit_stages, confidence, risk_usd\n")
-		if e.config.Indicators.EnableStagedTakeProfit {
-			sb.WriteString("- Static multi-stage TP (分批挂单止盈，非 ATR): use `take_profit_stages` = [{\"price\": x, \"close_pct\": y}, ...], prices strictly increasing for long positions and strictly decreasing for short positions; total close_pct ≤ 100 (percent of current position size).\n")
-		} else {
-			sb.WriteString("- Use only single `take_profit` (one price for full position close); do NOT use take_profit_stages.\n")
-		}
+		sb.WriteString("- **Staged take profit is ON**: opening decisions MUST use `take_profit_stages` only, with exactly 2 stages and `close_pct` = 50 for each. Long prices must be strictly increasing; short prices must be strictly decreasing.\n")
 	}
 	if enableAIClose {
 		sb.WriteString("- When close_long/close_short: you have **full permission** to close or reduce positions. Use optional `quantity` (base asset amount) or `quantity_pct` (0~1, e.g. 0.4 = close 40%% of current position). Omit both or 0 = close all; set `quantity` = partial close by amount, or `quantity_pct` = partial close by ratio (减仓/分批止盈).\n")
 	}
-	sb.WriteString("- When hold/wait to update TP/SL or ATR: use `stop_loss` and/or `take_profit` / `take_profit_stages` and/or ATR fields. If you only want to update the stop (trailing stop), set `take_profit` and `take_profit_stages` to 0/empty or omit them — the system will keep the existing TP orders and only update SL.\n")
-	if e.config.Indicators.EnableATRTrailing {
-		sb.WriteString("- When hold/wait with ATR trailing: you may update `atr_sl_mult`, `atr_tp_mult`, or `atr_tp_stages`; you may also set `stop_loss`/`take_profit`/`take_profit_stages` to update exchange fixed orders (both can coexist).\n")
-	}
+	sb.WriteString("- When hold/wait to update TP/SL: use `stop_loss` and/or `take_profit` / `take_profit_stages`. If you only want to update the stop (trailing stop), set `take_profit` and `take_profit_stages` to 0/empty or omit them — the system will keep the existing TP orders and only update SL.\n")
 	sb.WriteString("- **IMPORTANT**: All numeric values must be calculated numbers, NOT formulas/expressions (e.g., use `27.76` not `3000 * 0.01`)\n")
 	sb.WriteString("- **STRICT RULE**: In the JSON object, all numbers (including those inside the \"reason\" or \"reasoning\" string) MUST NOT contain any thousand separators (e.g., use 67317 instead of 67,317). Commas are ONLY allowed as delimiters between JSON fields.\n\n")
 
@@ -1654,7 +1655,7 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 
 	// 开仓逻辑优先：紧接 Account 之后、Candidate Coins 之前，强制与当前市场事实对标
 	if len(ctx.OpenPositionReasoning) > 0 {
-		sb.WriteString("**CRITICAL: You MUST evaluate if the initial THESIS for each open position still holds true under current market data.**\n\n")
+		sb.WriteString("**Note: Please evaluate if the initial thesis for each open position still holds under current market data.**\n\n")
 		sb.WriteString("## Current Open Positions — Your Reasoning at Open\n\n")
 		for _, o := range ctx.OpenPositionReasoning {
 			reasoning := o.Reasoning
@@ -1800,6 +1801,16 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 
 		sourceTags := e.formatCoinSourceTag(coin.Sources)
 		sb.WriteString(fmt.Sprintf("### %d. %s%s\n\n", displayedCount, coin.Symbol, sourceTags))
+		if ctx.SymbolExcursionStatsMap != nil {
+			if stats, ok := ctx.SymbolExcursionStatsMap[coin.Symbol]; ok && stats != nil && stats.TradeCount > 0 {
+				sb.WriteString(fmt.Sprintf("Symbol Avg MAE/MFE: %+.2f%% / %+.2f%%\n", stats.AvgMAEPct, stats.AvgMFEPct))
+				sb.WriteString(fmt.Sprintf("Last Trade MAE/MFE: %+.2f%% / %+.2f%%", stats.LastTradeMAEPct, stats.LastTradeMFEPct))
+				if stats.LastTradeSide != "" {
+					sb.WriteString(fmt.Sprintf(" (%s)", strings.ToUpper(stats.LastTradeSide)))
+				}
+				sb.WriteString("\n\n")
+			}
+		}
 		var czscLabels *CZSCLabels
 		if ctx.CZSCLabelsMap != nil {
 			czscLabels = ctx.CZSCLabelsMap[coin.Symbol]
@@ -2909,6 +2920,14 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 
 			hasSingleTP := d.TakeProfit > 0
 			hasStages := len(d.TakeProfitStages) > 0
+			if allowStagedTakeProfit {
+				if hasSingleTP {
+					return fmt.Errorf("when staged take profit is enabled, use take_profit_stages only")
+				}
+				if !hasStages {
+					return fmt.Errorf("when staged take profit is enabled, take_profit_stages is required")
+				}
+			}
 			if !hasSingleTP && !hasStages {
 				return fmt.Errorf("either take_profit or take_profit_stages must be provided when ATR trailing is disabled")
 			}
@@ -2932,6 +2951,9 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			}
 
 			if hasStages {
+				if allowStagedTakeProfit && len(d.TakeProfitStages) != 2 {
+					return fmt.Errorf("take_profit_stages must contain exactly 2 stages when staged take profit is enabled")
+				}
 				var sumPct float64
 				var prevPrice float64
 				for idx, st := range d.TakeProfitStages {
@@ -2940,6 +2962,9 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 					}
 					if st.ClosePct <= 0 || st.ClosePct > 100 {
 						return fmt.Errorf("take_profit_stages[%d].close_pct must be in (0,100]", idx)
+					}
+					if allowStagedTakeProfit && math.Abs(st.ClosePct-50) > 0.0001 {
+						return fmt.Errorf("take_profit_stages[%d].close_pct must be exactly 50 when staged take profit is enabled", idx)
 					}
 					sumPct += st.ClosePct
 

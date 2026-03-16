@@ -111,6 +111,16 @@ export const api = {
     if (!result.success) throw new Error('停止交易员失败')
   },
 
+  async reloadTrader(traderId: string): Promise<void> {
+    const result = await httpClient.post(`${API_BASE}/traders/${traderId}/reload`)
+    if (!result.success) throw new Error('重载交易员失败')
+  },
+
+  async resetTraderData(traderId: string): Promise<void> {
+    const result = await httpClient.post(`${API_BASE}/traders/${traderId}/reset_data`)
+    if (!result.success) throw new Error('清空交易员历史数据失败')
+  },
+
   async toggleCompetition(traderId: string, showInCompetition: boolean): Promise<void> {
     const result = await httpClient.put(
       `${API_BASE}/traders/${traderId}/competition`,
@@ -733,6 +743,8 @@ export const api = {
       name?: string
       description?: string
       config?: StrategyConfig
+      is_public?: boolean
+      config_visible?: boolean
     }
   ): Promise<Strategy> {
     const result = await httpClient.put<Strategy>(`${API_BASE}/strategies/${strategyId}`, data)

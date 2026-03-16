@@ -183,8 +183,17 @@ func (s *DecisionStore) LogDecision(record *DecisionRecord) error {
 
 // GetLatestDecisionTimeMs 返回该 Trader 最近一次决策的时间戳（Unix 毫秒），用于「未决策期间空档复盘」
 func (s *DecisionStore) GetLatestDecisionTimeMs(traderID string) (int64, bool) {
+	return s.GetLatestDecisionTimeMsSince(traderID, time.Time{})
+}
+
+// GetLatestDecisionTimeMsSince returns the latest decision time on/after resetAt.
+func (s *DecisionStore) GetLatestDecisionTimeMsSince(traderID string, resetAt time.Time) (int64, bool) {
 	var dbRecord DecisionRecordDB
-	err := s.db.Where("trader_id = ?", traderID).Order("timestamp DESC").Limit(1).First(&dbRecord).Error
+	q := s.db.Where("trader_id = ?", traderID)
+	if !resetAt.IsZero() {
+		q = q.Where("timestamp >= ?", resetAt.UTC())
+	}
+	err := q.Order("timestamp DESC").Limit(1).First(&dbRecord).Error
 	if err != nil || dbRecord.Timestamp.IsZero() {
 		return 0, false
 	}
@@ -193,8 +202,17 @@ func (s *DecisionStore) GetLatestDecisionTimeMs(traderID string) (int64, bool) {
 
 // GetLatestRecords gets the latest N records for specified trader (sorted by time in ascending order: old to new)
 func (s *DecisionStore) GetLatestRecords(traderID string, n int) ([]*DecisionRecord, error) {
+	return s.GetLatestRecordsSince(traderID, n, time.Time{})
+}
+
+// GetLatestRecordsSince gets the latest N records for a trader on/after resetAt.
+func (s *DecisionStore) GetLatestRecordsSince(traderID string, n int, resetAt time.Time) ([]*DecisionRecord, error) {
 	var dbRecords []*DecisionRecordDB
-	err := s.db.Where("trader_id = ?", traderID).
+	q := s.db.Where("trader_id = ?", traderID)
+	if !resetAt.IsZero() {
+		q = q.Where("timestamp >= ?", resetAt.UTC())
+	}
+	err := q.
 		Order("timestamp DESC").
 		Limit(n).
 		Find(&dbRecords).Error
@@ -258,8 +276,17 @@ func (s *DecisionStore) GetRecordsByDate(traderID string, date time.Time) ([]*De
 
 // GetRecordsInRange gets decision records for a trader within [fromTime, toTime] (inclusive).
 func (s *DecisionStore) GetRecordsInRange(traderID string, fromTime, toTime time.Time) ([]*DecisionRecord, error) {
+	return s.GetRecordsInRangeSince(traderID, fromTime, toTime, time.Time{})
+}
+
+// GetRecordsInRangeSince gets decision records for a trader within [fromTime, toTime] and on/after resetAt.
+func (s *DecisionStore) GetRecordsInRangeSince(traderID string, fromTime, toTime, resetAt time.Time) ([]*DecisionRecord, error) {
 	var dbRecords []*DecisionRecordDB
-	err := s.db.Where("trader_id = ? AND timestamp >= ? AND timestamp <= ?", traderID, fromTime, toTime).
+	q := s.db.Where("trader_id = ? AND timestamp >= ? AND timestamp <= ?", traderID, fromTime, toTime)
+	if !resetAt.IsZero() {
+		q = q.Where("timestamp >= ?", resetAt.UTC())
+	}
+	err := q.
 		Order("timestamp ASC").
 		Find(&dbRecords).Error
 	if err != nil {
@@ -286,19 +313,34 @@ func (s *DecisionStore) CleanOldRecords(traderID string, days int) (int64, error
 
 // GetStatistics gets statistics information for specified trader
 func (s *DecisionStore) GetStatistics(traderID string) (*Statistics, error) {
+	return s.GetStatisticsSince(traderID, time.Time{})
+}
+
+// GetStatisticsSince gets statistics information on/after resetAt.
+func (s *DecisionStore) GetStatisticsSince(traderID string, resetAt time.Time) (*Statistics, error) {
 	stats := &Statistics{}
 
 	var totalCount, successCount int64
-	s.db.Model(&DecisionRecordDB{}).Where("trader_id = ?", traderID).Count(&totalCount)
-	s.db.Model(&DecisionRecordDB{}).Where("trader_id = ? AND success = ?", traderID, true).Count(&successCount)
+	q := s.db.Model(&DecisionRecordDB{}).Where("trader_id = ?", traderID)
+	if !resetAt.IsZero() {
+		q = q.Where("timestamp >= ?", resetAt.UTC())
+	}
+	q.Count(&totalCount)
+	q.Where("success = ?", true).Count(&successCount)
 
 	stats.TotalCycles = int(totalCount)
 	stats.SuccessfulCycles = int(successCount)
 	stats.FailedCycles = stats.TotalCycles - stats.SuccessfulCycles
 
 	// Count from trader_positions table using raw query for cross-table
-	s.db.Raw("SELECT COUNT(*) FROM trader_positions WHERE trader_id = ?", traderID).Scan(&stats.TotalOpenPositions)
-	s.db.Raw("SELECT COUNT(*) FROM trader_positions WHERE trader_id = ? AND status = 'CLOSED'", traderID).Scan(&stats.TotalClosePositions)
+	if resetAt.IsZero() {
+		s.db.Raw("SELECT COUNT(*) FROM trader_positions WHERE trader_id = ? AND entry_time >= 0", traderID).Scan(&stats.TotalOpenPositions)
+		s.db.Raw("SELECT COUNT(*) FROM trader_positions WHERE trader_id = ? AND status = 'CLOSED' AND entry_time >= 0", traderID).Scan(&stats.TotalClosePositions)
+	} else {
+		resetMs := resetAt.UTC().UnixMilli()
+		s.db.Raw("SELECT COUNT(*) FROM trader_positions WHERE trader_id = ? AND entry_time >= ?", traderID, resetMs).Scan(&stats.TotalOpenPositions)
+		s.db.Raw("SELECT COUNT(*) FROM trader_positions WHERE trader_id = ? AND status = 'CLOSED' AND entry_time >= ?", traderID, resetMs).Scan(&stats.TotalClosePositions)
+	}
 
 	return stats, nil
 }
@@ -324,9 +366,18 @@ func (s *DecisionStore) GetAllStatistics() (*Statistics, error) {
 
 // GetLastCycleNumber gets the last cycle number for specified trader
 func (s *DecisionStore) GetLastCycleNumber(traderID string) (int, error) {
+	return s.GetLastCycleNumberSince(traderID, time.Time{})
+}
+
+// GetLastCycleNumberSince gets the last cycle number on/after resetAt.
+func (s *DecisionStore) GetLastCycleNumberSince(traderID string, resetAt time.Time) (int, error) {
 	var cycleNumber *int
-	err := s.db.Model(&DecisionRecordDB{}).
-		Where("trader_id = ?", traderID).
+	q := s.db.Model(&DecisionRecordDB{}).
+		Where("trader_id = ?", traderID)
+	if !resetAt.IsZero() {
+		q = q.Where("timestamp >= ?", resetAt.UTC())
+	}
+	err := q.
 		Select("MAX(cycle_number)").
 		Scan(&cycleNumber).Error
 	if err != nil {

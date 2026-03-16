@@ -100,6 +100,67 @@ func TestLeverageFallback(t *testing.T) {
 	}
 }
 
+func TestValidateDecision_StagedTakeProfitMustBeTwoByFifty(t *testing.T) {
+	tests := []struct {
+		name      string
+		decision   Decision
+		wantError bool
+	}{
+		{
+			name: "valid two stage 50 50",
+			decision: Decision{
+				Symbol:          "SOLUSDT",
+				Action:          "open_long",
+				Leverage:        5,
+				PositionSizeUSD: 100,
+				StopLoss:        90,
+				TakeProfitStages: []TakeProfitStage{
+					{Price: 110, ClosePct: 50},
+					{Price: 120, ClosePct: 50},
+				},
+			},
+			wantError: false,
+		},
+		{
+			name: "single take profit forbidden when staged enabled",
+			decision: Decision{
+				Symbol:          "SOLUSDT",
+				Action:          "open_long",
+				Leverage:        5,
+				PositionSizeUSD: 100,
+				StopLoss:        90,
+				TakeProfit:      120,
+			},
+			wantError: true,
+		},
+		{
+			name: "must be exactly two stages",
+			decision: Decision{
+				Symbol:          "SOLUSDT",
+				Action:          "open_long",
+				Leverage:        5,
+				PositionSizeUSD: 100,
+				StopLoss:        90,
+				TakeProfitStages: []TakeProfitStage{
+					{Price: 110, ClosePct: 30},
+					{Price: 120, ClosePct: 30},
+					{Price: 130, ClosePct: 40},
+				},
+			},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDecision(&tt.decision, 1000, 10, 5, 10.0, 1.5, true)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("validateDecision() error = %v, wantError %v", err, tt.wantError)
+			}
+		})
+	}
+}
+
 
 // contains checks if string contains substring (helper function)
 func contains(s, substr string) bool {

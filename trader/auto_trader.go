@@ -103,6 +103,7 @@ type AutoTraderConfig struct {
 	// Dry-run (paper trading): no real orders; use VirtualEquity in Prompt and local ProcessTrade only
 	IsDryRun      bool    // 模拟盘开关，默认 false
 	VirtualEquity float64 // 模拟盘本金 USDT，IsDryRun 时传给 AI 的 Equity
+	ResetTimestamp time.Time
 
 	// Risk control (only as hints, AI can make autonomous decisions)
 	MaxDailyLoss    float64       // Maximum daily loss percentage (hint)
@@ -157,6 +158,8 @@ type AutoTrader struct {
 	gridState             *GridState         // Grid trading state (only used when StrategyType == "grid_trading")
 	watchdogCtx           context.Context    // Context for risk watchdog (cancelled on Stop)
 	watchdogCancel        context.CancelFunc // Cancel risk watchdog on Stop
+	stagedTakeProfitState map[string]*StagedTakeProfitState
+	stagedTakeProfitMu    sync.RWMutex
 	atrTrailingState      map[string]*ATRTrailingState // symbol_side -> state（ATR 移动止盈止损）
 	atrTrailingMu         sync.RWMutex
 	atrTrailingCtx        context.Context
@@ -379,7 +382,7 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 	// Get last cycle number (for recovery)
 	var cycleNumber int
 	if st != nil {
-		cycleNumber, _ = st.Decision().GetLastCycleNumber(config.ID)
+		cycleNumber, _ = st.Decision().GetLastCycleNumberSince(config.ID, config.ResetTimestamp)
 		logger.Infof("📊 [%s] Decision records will be stored to database", config.Name)
 	}
 
@@ -404,11 +407,17 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		strategyEngine:        strategyEngine,
 		cycleNumber:           cycleNumber,
 		initialBalance:        resolveInitialBalanceForConfig(config),
-		lastResetTime:         time.Now(),
+		lastResetTime:         func() time.Time {
+			if !config.ResetTimestamp.IsZero() {
+				return config.ResetTimestamp.UTC()
+			}
+			return time.Now().UTC()
+		}(),
 		startTime:             time.Now(),
 		callCount:             0,
 		isRunning:             false,
 		positionFirstSeenTime: make(map[string]int64),
+		stagedTakeProfitState: make(map[string]*StagedTakeProfitState),
 		atrTrailingState:      make(map[string]*ATRTrailingState),
 		stopMonitorCh:         make(chan struct{}),
 		monitorWg:             sync.WaitGroup{},
@@ -421,6 +430,15 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		stopMonitorClosed:     false,
 		userID:                userID,
 	}, nil
+}
+
+// ApplyDataReset updates in-memory generation state without stopping the trader.
+func (at *AutoTrader) ApplyDataReset(resetAt time.Time) {
+	if resetAt.IsZero() {
+		resetAt = time.Now().UTC()
+	}
+	at.lastResetTime = resetAt.UTC()
+	at.cycleNumber = 0
 }
 
 // Run runs the automatic trading main loop
@@ -551,33 +569,23 @@ func (at *AutoTrader) Run() error {
 		}
 	}
 
-	ticker := time.NewTicker(at.config.ScanInterval)
-	defer ticker.Stop()
-
 	// Check if this is a grid trading strategy
 	isGridStrategy := at.IsGridStrategy()
-	// 脱机风控狗：指标移动止盈止损（不经过 AI，仅 AI 策略且开启时启动）
-	if !isGridStrategy && at.config.StrategyConfig != nil && at.config.StrategyConfig.Indicators.EnableIndicatorTrailing {
+	// 系统防守狗：直接监听数据流并强制平仓（不经过 AI，仅 AI 策略且开启时启动）
+	if !isGridStrategy && at.config.StrategyConfig != nil && (
+		at.config.StrategyConfig.Indicators.EnableFractalDefense ||
+		at.config.StrategyConfig.Indicators.EnableEMA20GapDefense ||
+		at.config.StrategyConfig.Indicators.Enable3BarTrailing ||
+		at.config.StrategyConfig.Indicators.EnableStagedTakeProfit) {
 		at.watchdogCtx, at.watchdogCancel = context.WithCancel(context.Background())
-		indicatorName := at.config.StrategyConfig.Indicators.TrailingIndicator
-		if indicatorName == "" {
-			indicatorName = "ema_20"
-		}
 		RunRiskWatchdog(at.watchdogCtx, at.trader, func() *store.StrategyConfig { return at.config.StrategyConfig }, func() string { return at.GetExchange() }, func(symbol, action string, order map[string]interface{}, quantity, exitPrice, entryPrice float64) {
 			at.recordAndConfirmOrder(order, symbol, action, quantity, exitPrice, 0, entryPrice)
+		}, &WatchdogHooks{
+			GetStagedTakeProfitStates: at.getStagedTakeProfitStateSnapshot,
+			OnStagedPartialClose:      at.onStagedTakeProfitPartialClose,
+			OnStagedFullClose:         at.onStagedTakeProfitFullClose,
 		})
-		logger.Infof("🛡️ [%s] Risk Watchdog (Trailing Indicator) started, indicator=%s", at.name, indicatorName)
-	}
-	if !isGridStrategy && at.config.StrategyConfig != nil && at.config.StrategyConfig.Indicators.EnableATRTrailing {
-		at.atrTrailingCtx, at.atrTrailingCancel = context.WithCancel(context.Background())
-		RunATRTrailingWatchdog(at.atrTrailingCtx, at.trader,
-			func() *store.StrategyConfig { return at.config.StrategyConfig },
-			func() string { return at.GetExchange() },
-			at.getATRTrailingStateSnapshot,
-			at.onATRPartialClose,
-			at.onATRFullClose,
-		)
-		logger.Infof("🛡️ [%s] ATR Trailing Watchdog started", at.name)
+		logger.Infof("🛡️ [%s] System defense watchdog started", at.name)
 	}
 	if isGridStrategy {
 		logger.Infof("🔲 [%s] Grid trading strategy detected, initializing grid...", at.name)
@@ -587,15 +595,10 @@ func (at *AutoTrader) Run() error {
 		}
 	}
 
-	// Execute immediately on first run
-	if isGridStrategy {
-		if err := at.RunGridCycle(); err != nil {
-			logger.Infof("❌ Grid execution failed: %v", err)
-		}
-	} else {
-		if err := at.runCycle(); err != nil {
-			logger.Infof("❌ Execution failed: %v", err)
-		}
+	// Align to next candle close before first run
+	const alignmentDelay = 2 * time.Second
+	if !at.waitForNextAlignedCycle(at.config.ScanInterval, alignmentDelay) {
+		return nil
 	}
 
 	for {
@@ -607,24 +610,77 @@ func (at *AutoTrader) Run() error {
 			break
 		}
 
-		select {
-		case <-ticker.C:
-			if isGridStrategy {
-				if err := at.RunGridCycle(); err != nil {
-					logger.Infof("❌ Grid execution failed: %v", err)
-				}
-			} else {
-				if err := at.runCycle(); err != nil {
-					logger.Infof("❌ Execution failed: %v", err)
-				}
+		if isGridStrategy {
+			if err := at.RunGridCycle(); err != nil {
+				logger.Infof("❌ Grid execution failed: %v", err)
 			}
-		case <-at.stopMonitorCh:
-			logger.Infof("[%s] ⏹ Stop signal received, exiting automatic trading main loop", at.name)
+		} else {
+			if err := at.runCycle(); err != nil {
+				logger.Infof("❌ Execution failed: %v", err)
+			}
+		}
+
+		if !at.waitForNextAlignedCycle(at.config.ScanInterval, alignmentDelay) {
 			return nil
 		}
 	}
 
 	return nil
+}
+
+func (at *AutoTrader) waitForNextAlignedCycle(interval time.Duration, delay time.Duration) bool {
+	nowUTC := time.Now().UTC()
+	nextTime := nextAlignedTime(nowUTC, interval, delay)
+	wait := time.Until(nextTime)
+	if wait < 0 {
+		wait = 0
+	}
+	logger.Infof(
+		"⏳ [%s] Waiting for next %s candle close at %s (remaining %s)...",
+		at.name,
+		interval.String(),
+		nextTime.Local().Format("15:04:05"),
+		formatWaitDuration(wait),
+	)
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-at.stopMonitorCh:
+		logger.Infof("[%s] ⏹ Stop signal received while waiting for aligned time", at.name)
+		return false
+	}
+}
+
+func nextAlignedTime(now time.Time, interval time.Duration, delay time.Duration) time.Time {
+	if interval <= 0 {
+		return now.Add(delay)
+	}
+	base := now.Truncate(interval)
+	next := base.Add(interval)
+	if !next.After(now) {
+		next = next.Add(interval)
+	}
+	return next.Add(delay)
+}
+
+func formatWaitDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	totalSeconds := int(d.Seconds())
+	hours := totalSeconds / 3600
+	minutes := (totalSeconds % 3600) / 60
+	seconds := totalSeconds % 60
+	if hours > 0 {
+		return fmt.Sprintf("%dh%dm%ds", hours, minutes, seconds)
+	}
+	if minutes > 0 {
+		return fmt.Sprintf("%dm%ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
 
 // Stop stops the automatic trading
@@ -1093,6 +1149,27 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 				Reasoning: op.AiReasoningAtOpen,
 			})
 		}
+		symbols := make([]string, 0, len(candidateCoins))
+		for _, coin := range candidateCoins {
+			symbols = append(symbols, coin.Symbol)
+		}
+		if len(symbols) > 0 {
+			if excursionStats, err := at.store.Position().GetSymbolExcursionSummaries(at.id, symbols, "dry_run", at.config.ResetTimestamp); err == nil && len(excursionStats) > 0 {
+				ctx.SymbolExcursionStatsMap = make(map[string]*kernel.SymbolExcursionStats, len(excursionStats))
+				for symbol, st := range excursionStats {
+					ctx.SymbolExcursionStatsMap[symbol] = &kernel.SymbolExcursionStats{
+						Symbol:            st.Symbol,
+						AvgMAEPct:         st.AvgMAEPct,
+						AvgMFEPct:         st.AvgMFEPct,
+						LastTradeMAEPct:   st.LastTradeMAEPct,
+						LastTradeMFEPct:   st.LastTradeMFEPct,
+						LastTradeSide:     st.LastTradeSide,
+						LastTradeExitTime: st.LastTradeExitTime,
+						TradeCount:        st.TradeCount,
+					}
+				}
+			}
+		}
 		// 统计信息仅来自 source='dry_run' 的已平仓订单
 		stats, _ := at.store.Position().GetFullStatsBySource(at.id, "dry_run")
 		if stats != nil {
@@ -1131,10 +1208,16 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 		}
 
 		if balance == nil {
-			return nil, fmt.Errorf("balance cache not ready")
+			balance, err = binanceTrader.GetBalance()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get account balance: %w", err)
+			}
 		}
 		if positions == nil {
-			return nil, fmt.Errorf("positions cache not ready")
+			positions, err = binanceTrader.GetPositions()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get positions: %w", err)
+			}
 		}
 	} else {
 		balance, err = at.trader.GetBalance()
@@ -1176,9 +1259,38 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 	var positionInfos []kernel.PositionInfo
 	totalMarginUsed := 0.0
 
+	// Enforce trader-level position isolation: only positions present in local store for this trader are allowed.
+	allowedPositionKeys := make(map[string]struct{})
+	allowPositions := false
+	if at.store != nil {
+		if dbPositions, err := at.store.Position().GetOpenPositions(at.id); err != nil {
+			logger.Infof("⚠️ [%s] Failed to load local open positions for isolation: %v (positions will be hidden)", at.name, err)
+		} else {
+			for _, p := range dbPositions {
+				sym := strings.ToUpper(strings.TrimSpace(p.Symbol))
+				side := strings.ToLower(strings.TrimSpace(p.Side))
+				if sym == "" || side == "" {
+					continue
+				}
+				allowedPositionKeys[sym+"_"+side] = struct{}{}
+				// Backward compatibility: allow matching without USDT suffix.
+				if strings.HasSuffix(sym, "USDT") {
+					base := strings.TrimSuffix(sym, "USDT")
+					if base != "" {
+						allowedPositionKeys[base+"_"+side] = struct{}{}
+					}
+				}
+			}
+			allowPositions = true
+		}
+	} else {
+		logger.Infof("⚠️ [%s] Store is nil; cannot isolate positions (positions will be hidden)", at.name)
+	}
+
 	// Current position key set (for cleaning up closed position records)
 	currentPositionKeys := make(map[string]bool)
 
+	filteredCount := 0
 	for _, pos := range positions {
 		symbol := pos["symbol"].(string)
 		side := pos["side"].(string)
@@ -1191,6 +1303,17 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 
 		// Skip closed positions (quantity = 0), prevent "ghost positions" from being passed to AI
 		if quantity == 0 {
+			continue
+		}
+
+		// TraderID isolation: only include positions that exist in local DB for this trader.
+		if !allowPositions {
+			filteredCount++
+			continue
+		}
+		key := strings.ToUpper(strings.TrimSpace(symbol)) + "_" + strings.ToLower(strings.TrimSpace(side))
+		if _, ok := allowedPositionKeys[key]; !ok {
+			filteredCount++
 			continue
 		}
 
@@ -1268,6 +1391,10 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 		if !currentPositionKeys[key] {
 			delete(at.positionFirstSeenTime, key)
 		}
+	}
+	if filteredCount > 0 || allowPositions {
+		logger.Infof("🔒 [%s] Position isolation: exchange=%d allowed=%d passed=%d filtered=%d",
+			at.name, len(positions), len(allowedPositionKeys), len(positionInfos), filteredCount)
 	}
 
 	// 3. Use strategy engine to get candidate coins (must have strategy engine)
@@ -1381,6 +1508,33 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 					Side:      op.Side,
 					Reasoning: op.AiReasoningAtOpen,
 				})
+			}
+		}
+		symbols := make([]string, 0, len(candidateCoins))
+		for _, coin := range candidateCoins {
+			symbols = append(symbols, coin.Symbol)
+		}
+		if len(symbols) > 0 {
+			source := ""
+			if at.config.IsDryRun {
+				source = "dry_run"
+			}
+			if excursionStats, err := at.store.Position().GetSymbolExcursionSummaries(at.id, symbols, source, at.config.ResetTimestamp); err != nil {
+				logger.Infof("⚠️ [%s] Failed to get symbol excursion stats: %v", at.name, err)
+			} else if len(excursionStats) > 0 {
+				ctx.SymbolExcursionStatsMap = make(map[string]*kernel.SymbolExcursionStats, len(excursionStats))
+				for symbol, st := range excursionStats {
+					ctx.SymbolExcursionStatsMap[symbol] = &kernel.SymbolExcursionStats{
+						Symbol:            st.Symbol,
+						AvgMAEPct:         st.AvgMAEPct,
+						AvgMFEPct:         st.AvgMFEPct,
+						LastTradeMAEPct:   st.LastTradeMAEPct,
+						LastTradeMFEPct:   st.LastTradeMFEPct,
+						LastTradeSide:     st.LastTradeSide,
+						LastTradeExitTime: st.LastTradeExitTime,
+						TradeCount:        st.TradeCount,
+					}
+				}
 			}
 		}
 		// Get trading statistics for AI context
@@ -1517,6 +1671,59 @@ func (at *AutoTrader) getATRTrailingStateSnapshot() map[string]*ATRTrailingState
 		}
 	}
 	return out
+}
+
+func (at *AutoTrader) getStagedTakeProfitStateSnapshot() map[string]*StagedTakeProfitState {
+	at.stagedTakeProfitMu.RLock()
+	defer at.stagedTakeProfitMu.RUnlock()
+	out := make(map[string]*StagedTakeProfitState, len(at.stagedTakeProfitState))
+	for k, v := range at.stagedTakeProfitState {
+		if v != nil {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func (at *AutoTrader) registerStagedTakeProfitState(symbol, side string, entryPrice, quantity, stopLoss float64, stages []kernel.TakeProfitStage) {
+	if len(stages) != 2 {
+		return
+	}
+	key := symbol + "_" + strings.ToLower(side)
+	at.stagedTakeProfitMu.Lock()
+	at.stagedTakeProfitState[key] = &StagedTakeProfitState{
+		Symbol:       symbol,
+		Side:         strings.ToLower(side),
+		EntryPrice:   entryPrice,
+		OriginalQty:  quantity,
+		StopLoss:     stopLoss,
+		Target1Price: stages[0].Price,
+		Target2Price: stages[1].Price,
+	}
+	at.stagedTakeProfitMu.Unlock()
+	logger.Infof("  ✓ [system defense] staged take profit registered: %s %s tp1=%.6f tp2=%.6f qty=%.4f", symbol, side, stages[0].Price, stages[1].Price, quantity)
+}
+
+func (at *AutoTrader) clearStagedTakeProfitState(symbol, side string) {
+	key := symbol + "_" + strings.ToLower(side)
+	at.stagedTakeProfitMu.Lock()
+	delete(at.stagedTakeProfitState, key)
+	at.stagedTakeProfitMu.Unlock()
+}
+
+func (at *AutoTrader) onStagedTakeProfitPartialClose(symbol, side string, closedQty float64, stageIndex int) {
+	at.stagedTakeProfitMu.Lock()
+	defer at.stagedTakeProfitMu.Unlock()
+	key := symbol + "_" + strings.ToLower(side)
+	if state, ok := at.stagedTakeProfitState[key]; ok && state != nil {
+		if stageIndex == 0 {
+			state.TP1Triggered = true
+		}
+	}
+}
+
+func (at *AutoTrader) onStagedTakeProfitFullClose(symbol, side string) {
+	at.clearStagedTakeProfitState(symbol, side)
 }
 
 // getPositionQuantity 从交易所获取当前仓位数量（正数）。用于平仓前 clamping，避免“实际可平 < 计划平”导致 -2022。
@@ -1673,11 +1880,21 @@ func (at *AutoTrader) updateTpSlForExistingPosition(decision *kernel.Decision) b
 	sideUpper := strings.ToUpper(posSide)
 	updateTP := decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0
 	updateSL := decision.StopLoss > 0
+	useSystemStagedTP := at.useSystemStagedTakeProfit(decision)
 	logger.Infof("  📍 [updateTpSl] %s 已有 %s 持仓 qty=%.4f，updateTP=%v updateSL=%v (TP=%.4f, stages=%d, SL=%.4f)",
 		decision.Symbol, posSide, quantity, updateTP, updateSL, decision.TakeProfit, len(decision.TakeProfitStages), decision.StopLoss)
 	// Only cancel and set TP when AI provided a new take_profit / take_profit_stages; otherwise keep existing TP (trailing stop = SL only).
 	if updateTP {
-		at.applyStaticTakeProfit(decision.Symbol, sideUpper, quantity, decision)
+		if useSystemStagedTP {
+			stages := at.normalizeStaticTakeProfitStages(decision.TakeProfitStages, sideUpper)
+			at.registerStagedTakeProfitState(decision.Symbol, posSide, entryPrice, quantity, decision.StopLoss, stages)
+			if err := at.trader.CancelTakeProfitOrders(decision.Symbol); err != nil {
+				logger.Infof("  ⚠️ [updateTpSl] cancel take profit orders for system-staged TP: %v", err)
+			}
+		} else {
+			at.clearStagedTakeProfitState(decision.Symbol, posSide)
+			at.applyStaticTakeProfit(decision.Symbol, sideUpper, quantity, decision)
+		}
 	} else {
 		logger.Infof("  ✓ [updateTpSl] take_profit not set (≤0 or omitted), keeping existing TP order")
 	}
@@ -1690,6 +1907,11 @@ func (at *AutoTrader) updateTpSlForExistingPosition(decision *kernel.Decision) b
 			logger.Infof("  ⚠️ [updateTpSl] set stop loss: %v", err)
 		} else {
 			logger.Infof("  ✓ [updateTpSl] stop loss set: %.4f", decision.StopLoss)
+			at.stagedTakeProfitMu.Lock()
+			if state := at.stagedTakeProfitState[decision.Symbol+"_"+posSide]; state != nil {
+				state.StopLoss = decision.StopLoss
+			}
+			at.stagedTakeProfitMu.Unlock()
 		}
 	}
 	return true
@@ -1800,6 +2022,12 @@ func (at *AutoTrader) normalizeStaticTakeProfitStages(stages []kernel.TakeProfit
 	}
 
 	return filtered
+}
+
+func (at *AutoTrader) useSystemStagedTakeProfit(decision *kernel.Decision) bool {
+	return at.config.StrategyConfig != nil &&
+		at.config.StrategyConfig.Indicators.EnableStagedTakeProfit &&
+		len(decision.TakeProfitStages) == 2
 }
 
 // ExecuteDecision executes a trading decision from external sources (e.g., debate consensus)
@@ -1974,7 +2202,13 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 			logger.Infof("  ⚠ Failed to set stop loss: %v", err)
 		}
 	}
-	if decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0 {
+	if at.useSystemStagedTakeProfit(decision) {
+		stages := at.normalizeStaticTakeProfitStages(decision.TakeProfitStages, "LONG")
+		at.registerStagedTakeProfitState(decision.Symbol, "long", marketData.CurrentPrice, quantity, decision.StopLoss, stages)
+		if err := at.trader.CancelTakeProfitOrders(decision.Symbol); err != nil {
+			logger.Infof("  ⚠ Failed to clear existing take profit orders before system-staged TP: %v", err)
+		}
+	} else if decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0 {
 		at.applyStaticTakeProfit(decision.Symbol, "LONG", quantity, decision)
 	}
 
@@ -2126,7 +2360,13 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 			logger.Infof("  ⚠ Failed to set stop loss: %v", err)
 		}
 	}
-	if decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0 {
+	if at.useSystemStagedTakeProfit(decision) {
+		stages := at.normalizeStaticTakeProfitStages(decision.TakeProfitStages, "SHORT")
+		at.registerStagedTakeProfitState(decision.Symbol, "short", marketData.CurrentPrice, quantity, decision.StopLoss, stages)
+		if err := at.trader.CancelTakeProfitOrders(decision.Symbol); err != nil {
+			logger.Infof("  ⚠ Failed to clear existing take profit orders before system-staged TP: %v", err)
+		}
+	} else if decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0 {
 		at.applyStaticTakeProfit(decision.Symbol, "SHORT", quantity, decision)
 	}
 
@@ -2197,6 +2437,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 	actualQty, _ := at.getPositionQuantity(decision.Symbol, "long")
 	if actualQty <= 0 {
 		logger.Infof("  ✓ 仓位已无或已平，跳过 close_long (避免 -2022)")
+		at.clearStagedTakeProfitState(decision.Symbol, "long")
 		at.onATRFullClose(decision.Symbol, "long")
 		return nil
 	}
@@ -2217,6 +2458,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 			bt.ForceZeroPositionInCache(decision.Symbol, "LONG")
 		}
 		logger.Infof("  ✓ Position already closed, skipped (ghost cache cleared)")
+		at.clearStagedTakeProfitState(decision.Symbol, "long")
 		return nil
 	}
 
@@ -2227,6 +2469,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 
 	// Record order to database and poll for confirmation
 	at.recordAndConfirmOrder(order, decision.Symbol, "close_long", closeQty, marketData.CurrentPrice, 0, entryPrice)
+	at.clearStagedTakeProfitState(decision.Symbol, "long")
 
 	if closeQty >= quantity {
 		at.onATRFullClose(decision.Symbol, "long")
@@ -2299,6 +2542,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 	actualQty, _ := at.getPositionQuantity(decision.Symbol, "short")
 	if actualQty <= 0 {
 		logger.Infof("  ✓ 仓位已无或已平，跳过 close_short (避免 -2022)")
+		at.clearStagedTakeProfitState(decision.Symbol, "short")
 		at.onATRFullClose(decision.Symbol, "short")
 		return nil
 	}
@@ -2319,6 +2563,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 			bt.ForceZeroPositionInCache(decision.Symbol, "SHORT")
 		}
 		logger.Infof("  ✓ Position already closed, skipped (ghost cache cleared)")
+		at.clearStagedTakeProfitState(decision.Symbol, "short")
 		return nil
 	}
 
@@ -2329,6 +2574,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 
 	// Record order to database and poll for confirmation
 	at.recordAndConfirmOrder(order, decision.Symbol, "close_short", closeQty, marketData.CurrentPrice, 0, entryPrice)
+	at.clearStagedTakeProfitState(decision.Symbol, "short")
 
 	if closeQty >= quantity {
 		at.onATRFullClose(decision.Symbol, "short")
@@ -2525,10 +2771,9 @@ func (at *AutoTrader) GetAccountInfo() (map[string]interface{}, error) {
 	// Get positions to calculate total margin
 	var positions []map[string]interface{}
 	if binanceTrader, ok := at.trader.(*binance.FuturesTrader); ok {
-		if cached, ok := binanceTrader.GetPositionsFromCache(); ok {
-			positions = cached
-		} else {
-			return nil, fmt.Errorf("positions cache not ready")
+		positions, err = binanceTrader.GetPositions()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get positions: %w", err)
 		}
 	} else {
 		positions, err = at.trader.GetPositions()
@@ -2602,10 +2847,9 @@ func (at *AutoTrader) GetPositions() ([]map[string]interface{}, error) {
 	var positions []map[string]interface{}
 	var err error
 	if binanceTrader, ok := at.trader.(*binance.FuturesTrader); ok {
-		if cached, ok := binanceTrader.GetPositionsFromCache(); ok {
-			positions = cached
-		} else {
-			return nil, fmt.Errorf("positions cache not ready")
+		positions, err = binanceTrader.GetPositions()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get positions: %w", err)
 		}
 	} else {
 		positions, err = at.trader.GetPositions()
@@ -3104,6 +3348,7 @@ func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
 	default:
 		return fmt.Errorf("unknown position direction: %s", side)
 	}
+	at.clearStagedTakeProfitState(symbol, side)
 	// 清除 ATR 移动止盈止损状态，避免 watchdog 继续追踪已平仓位
 	at.onATRFullClose(symbol, side)
 	return nil

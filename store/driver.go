@@ -177,8 +177,8 @@ func openSQLite(path string) (*sql.DB, error) {
 	}
 
 	// SQLite configuration
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	db.SetMaxOpenConns(sqliteMaxOpenConns)
+	db.SetMaxIdleConns(sqliteMaxIdleConns)
 
 	// Enable foreign key constraints
 	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
@@ -186,20 +186,20 @@ func openSQLite(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to enable foreign keys: %w", err)
 	}
 
-	// Use DELETE mode for Docker compatibility
-	if _, err := db.Exec("PRAGMA journal_mode=DELETE"); err != nil {
+	// WAL mode allows concurrent readers while writes are in progress.
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to set journal_mode: %w", err)
 	}
 
-	// Set synchronous=FULL
-	if _, err := db.Exec("PRAGMA synchronous=FULL"); err != nil {
+	// NORMAL is the usual tradeoff with WAL for higher throughput.
+	if _, err := db.Exec("PRAGMA synchronous=NORMAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to set synchronous: %w", err)
 	}
 
 	// Set busy_timeout
-	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+	if _, err := db.Exec("PRAGMA busy_timeout = 10000"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to set busy_timeout: %w", err)
 	}

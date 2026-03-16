@@ -244,6 +244,7 @@ export interface TraderConfigData {
   exchange_id: string
   strategy_id?: string  // 策略ID
   strategy_name?: string  // 策略名称
+  reset_timestamp?: string
   is_cross_margin: boolean
   show_in_competition: boolean  // 是否在竞技场显示
   scan_interval_minutes: number
@@ -596,14 +597,11 @@ export interface IndicatorConfig {
   price_ranking_duration?: string;  // "1h", "4h", "24h" or "1h,4h,24h"
   price_ranking_limit?: number;
 
-  // 动态指标移动止盈止损（硬风控狗）
-  enable_indicator_trailing?: boolean;
-  trailing_indicator?: string;  // 平仓线指标，如 "ema_20", "ema_50", "boll_middle_20"
-  trailing_timeframe?: string; // 风控计算周期，如 "1m","5m","15m","1h","4h"，默认 "5m"
-  trailing_offset_percent?: number; // 触发偏移量(%)，防插针，默认 0
-  // ATR 移动止盈止损：开启后开仓不设固定 TP/SL，由 AI 输出 ATR 倍数，机器狗监控价格触发
-  enable_atr_trailing?: boolean;
-  /** 允许分批止盈：关闭后 AI 只能使用单一 take_profit 全仓止盈，不能使用 take_profit_stages / atr_tp_stages */
+  // 系统级防守开关（后台风控狗直接执行，不经过 AI）
+  enable_fractal_defense?: boolean;
+  enable_ema20_gap_defense?: boolean;
+  enable_3bar_trailing?: boolean;
+  /** 允许分批止盈：关闭后 AI 只能使用单一 take_profit 全仓止盈，不能使用 take_profit_stages */
   enable_staged_take_profit?: boolean;
 }
 
@@ -845,7 +843,9 @@ export interface TraderStats {
   loss_trades: number;
   win_rate: number;
   profit_factor: number;
+  pl_ratio: number;
   sharpe_ratio: number;
+  calmar_ratio: number;
   total_pnl: number;
   total_fee: number;
   avg_win: number;
@@ -865,6 +865,8 @@ export interface SymbolStats {
   pl_ratio: number;
   sharpe_ratio: number;
   calmar_ratio: number;
+  mae_avg: number;
+  mae_min: number;
 }
 
 // Matches Go DirectionStats struct exactly
