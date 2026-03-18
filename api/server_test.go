@@ -303,3 +303,39 @@ func TestPublicTraderListResponse_SystemPromptTemplate(t *testing.T) {
 		t.Errorf("Expected system_prompt_template='default', got %v", response["system_prompt_template"])
 	}
 }
+
+func TestNormalizePositionsForFrontend_TrailingActivationMode(t *testing.T) {
+	positions := []map[string]interface{}{
+		{
+			"symbol":                  "BTCUSDT",
+			"side":                    "long",
+			"entryPrice":              100.0,
+			"markPrice":               108.0,
+			"positionAmt":             1.0,
+			"unRealizedProfit":        8.0,
+			"leverage":                5.0,
+			"trailing_activation_pct": 6.0,
+			"trailing_retrace_pct":    2.0,
+		},
+		{
+			"symbol":           "ETHUSDT",
+			"side":             "long",
+			"entryPrice":       100.0,
+			"markPrice":        108.0,
+			"positionAmt":      1.0,
+			"unRealizedProfit": 8.0,
+			"leverage":         5.0,
+		},
+	}
+
+	out := normalizePositionsForFrontend(positions, 80, 2)
+	if got := out[0]["trailing_activation_mode"]; got != "price_move" {
+		t.Fatalf("expected AI trailing mode price_move, got %v", got)
+	}
+	if got := out[1]["trailing_activation_mode"]; got != "tp_progress" {
+		t.Fatalf("expected global trailing mode tp_progress, got %v", got)
+	}
+	if got := out[1]["trailing_activation_pct"]; got != 80.0 {
+		t.Fatalf("expected global trailing activation pct 80, got %v", got)
+	}
+}

@@ -2,6 +2,7 @@ package market
 
 import (
 	"fmt"
+	"sync/atomic"
 	"sync"
 	"time"
 )
@@ -14,14 +15,31 @@ type latestPriceSlot struct {
 
 var (
 	latestPriceStore sync.Map // key: "symbol|exchange", value: *latestPriceSlot
+	priceUpdateSubMu sync.RWMutex
+	priceUpdateSubs  = make(map[uint64]chan PriceUpdateEvent)
+	priceUpdateSeq   atomic.Uint64
 )
 
 const latestPriceKeyFmt = "%s|%s"
 
+type PriceUpdateEvent struct {
+	Symbol   string
+	Exchange string
+	Price    float64
+	TimeMs   int64
+}
+
 // SetLatestPrice 由 WebSocket 线程调用，约 1ms 内完成写入，不涉及数据库或阻塞操作。
 func SetLatestPrice(symbol, exchange string, price float64, timeMs int64) {
-	key := fmt.Sprintf(latestPriceKeyFmt, Normalize(symbol), exchange)
+	symbol = Normalize(symbol)
+	key := fmt.Sprintf(latestPriceKeyFmt, symbol, exchange)
 	latestPriceStore.Store(key, &latestPriceSlot{Price: price, TimeMs: timeMs})
+	broadcastPriceUpdate(PriceUpdateEvent{
+		Symbol:   symbol,
+		Exchange: exchange,
+		Price:    price,
+		TimeMs:   timeMs,
+	})
 }
 
 // GetLatestPrice 读取热槽中的最新价；ok 表示存在且有效。
@@ -37,4 +55,38 @@ func GetLatestPrice(symbol, exchange string, maxAgeMs int64) (price float64, tim
 		return slot.Price, slot.TimeMs, false
 	}
 	return slot.Price, slot.TimeMs, true
+}
+
+func SubscribePriceUpdates(buffer int) (<-chan PriceUpdateEvent, func()) {
+	if buffer <= 0 {
+		buffer = 256
+	}
+	ch := make(chan PriceUpdateEvent, buffer)
+	id := priceUpdateSeq.Add(1)
+
+	priceUpdateSubMu.Lock()
+	priceUpdateSubs[id] = ch
+	priceUpdateSubMu.Unlock()
+
+	cancel := func() {
+		priceUpdateSubMu.Lock()
+		if sub, ok := priceUpdateSubs[id]; ok {
+			delete(priceUpdateSubs, id)
+			close(sub)
+		}
+		priceUpdateSubMu.Unlock()
+	}
+
+	return ch, cancel
+}
+
+func broadcastPriceUpdate(ev PriceUpdateEvent) {
+	priceUpdateSubMu.RLock()
+	defer priceUpdateSubMu.RUnlock()
+	for _, ch := range priceUpdateSubs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
 }

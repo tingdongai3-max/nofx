@@ -29,6 +29,8 @@ type Store struct {
 	equity   *EquityStore
 	order    *OrderStore
 	grid     *GridStore
+	experiment *ExperimentStore
+	experimentLog *ExperimentLogStore
 	traderAdmin         *TraderAdminStore
 	traderAdminAnalysis *TraderAdminAnalysisStore
 
@@ -161,6 +163,12 @@ func (s *Store) initTables() error {
 	}
 	if err := s.Grid().InitTables(); err != nil {
 		return fmt.Errorf("failed to initialize grid tables: %w", err)
+	}
+	if err := s.Experiment().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize experiment tables: %w", err)
+	}
+	if err := s.ExperimentLog().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize experiment log tables: %w", err)
 	}
 	if err := s.TraderAdmin().initTables(); err != nil {
 		return fmt.Errorf("failed to initialize trader admin tables: %w", err)
@@ -299,6 +307,25 @@ func (s *Store) Grid() *GridStore {
 		s.grid = NewGridStore(s.gdb)
 	}
 	return s.grid
+}
+
+// Experiment gets experiment storage
+func (s *Store) Experiment() *ExperimentStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.experiment == nil {
+		s.experiment = NewExperimentStore(s.gdb)
+	}
+	return s.experiment
+}
+
+func (s *Store) ExperimentLog() *ExperimentLogStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.experimentLog == nil {
+		s.experimentLog = NewExperimentLogStore(s.gdb)
+	}
+	return s.experimentLog
 }
 
 // TraderAdmin gets trader admin storage

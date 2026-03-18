@@ -48,6 +48,11 @@ type StrategyConfig struct {
 	RiskControl RiskControlConfig `json:"risk_control"`
 	// editable sections of System Prompt
 	PromptSections PromptSectionsConfig `json:"prompt_sections,omitempty"`
+	// Global trailing take-profit fallback; when 0, watchdog falls back to AI decision JSON.
+	// TrailingActivationPct means "percentage of the take-profit target progress" for global config.
+	// TrailingRetracePct remains the underlying price retrace from the post-activation extreme.
+	TrailingActivationPct float64 `json:"trailing_activation_pct,omitempty"`
+	TrailingRetracePct    float64 `json:"trailing_retrace_pct,omitempty"`
 
 	// Grid trading configuration (only used when StrategyType == "grid_trading")
 	GridConfig *GridStrategyConfig `json:"grid_config,omitempty"`
@@ -245,6 +250,10 @@ type RiskControlConfig struct {
 	// When false, exit is fully delegated to backend watchdog / ATR engine; AI should not output close actions.
 	EnableAIClose bool `json:"enable_ai_close"`
 
+	// Global switch: whether AI may update TP/SL for existing open positions via hold / wait.
+	// When false, AI can still open positions with initial TP/SL, but cannot move them mid-trade.
+	EnableAIMoveTPSL bool `json:"enable_ai_move_tp_sl"`
+
 	// Max number of coins held simultaneously (CODE ENFORCED)
 	MaxPositions int `json:"max_positions"`
 
@@ -363,6 +372,7 @@ func GetDefaultStrategyConfig(lang string) StrategyConfig {
 		},
 		RiskControl: RiskControlConfig{
 			EnableAIClose:                false, // By default, exits are handled by backend watchdog/ATR; AI focuses on entries
+			EnableAIMoveTPSL:             true,  // By default, AI may refine TP/SL on existing positions unless user disables it
 			MaxPositions:                    3,   // Max 3 coins simultaneously (CODE ENFORCED)
 			BTCETHMaxLeverage:               5,   // BTC/ETH exchange leverage (AI guided)
 			AltcoinMaxLeverage:              5,   // Altcoin exchange leverage (AI guided)

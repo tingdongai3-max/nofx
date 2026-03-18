@@ -480,6 +480,7 @@ func (t *FuturesTrader) applyAccountUpdate(ev *wsAccountUpdate) {
 	t.cachedPositions = result
 	t.positionsCacheTime = time.Now()
 	t.positionsCacheMutex.Unlock()
+	t.publishPositionsCache(result)
 
 	// Log (reason m: ORDER=trade fill, FUNDING_FEE=资金费; both handled identically)
 	wb := 0.0
@@ -560,6 +561,7 @@ func (t *FuturesTrader) applyOrderTradeUpdate(ev *wsOrderTradeUpdate) {
 	t.cachedPositions = result
 	t.positionsCacheTime = time.Now()
 	t.positionsCacheMutex.Unlock()
+	t.publishPositionsCache(result)
 
 	logger.Infof("[WS] 📥 Received ORDER_TRADE_UPDATE: Position %s %s updated.", ev.Order.Symbol, ev.Order.PositionSide)
 }
@@ -620,4 +622,5 @@ func (t *FuturesTrader) refreshAccountFromAPI() {
 	t.cachedPositions = result
 	t.positionsCacheTime = time.Now()
 	t.positionsCacheMutex.Unlock()
+	t.publishPositionsCache(result)
 }

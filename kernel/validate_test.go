@@ -161,6 +161,79 @@ func TestValidateDecision_StagedTakeProfitMustBeTwoByFifty(t *testing.T) {
 	}
 }
 
+func TestValidateDecision_TrailingRetraceGuardrail(t *testing.T) {
+	tests := []struct {
+		name      string
+		decision   Decision
+		wantError bool
+	}{
+		{
+			name: "activation 5 retrace 2 allowed at 40 percent boundary",
+			decision: Decision{
+				Symbol:                "ETHUSDT",
+				Action:                "open_long",
+				Leverage:              5,
+				PositionSizeUSD:       100,
+				StopLoss:              2200,
+				TakeProfit:            2500,
+				TrailingActivationPct: 5,
+				TrailingRetracePct:    2,
+			},
+			wantError: false,
+		},
+		{
+			name: "activation 5 retrace 1 point 9 allowed",
+			decision: Decision{
+				Symbol:                "ETHUSDT",
+				Action:                "open_long",
+				Leverage:              5,
+				PositionSizeUSD:       100,
+				StopLoss:              2200,
+				TakeProfit:            2500,
+				TrailingActivationPct: 5,
+				TrailingRetracePct:    1.9,
+			},
+			wantError: false,
+		},
+		{
+			name: "activation 5 retrace 2 point 1 rejected",
+			decision: Decision{
+				Symbol:                "ETHUSDT",
+				Action:                "open_long",
+				Leverage:              5,
+				PositionSizeUSD:       100,
+				StopLoss:              2200,
+				TakeProfit:            2500,
+				TrailingActivationPct: 5,
+				TrailingRetracePct:    2.1,
+			},
+			wantError: true,
+		},
+		{
+			name: "trailing fields must be provided together",
+			decision: Decision{
+				Symbol:                "ETHUSDT",
+				Action:                "open_long",
+				Leverage:              5,
+				PositionSizeUSD:       100,
+				StopLoss:              2200,
+				TakeProfit:            2500,
+				TrailingActivationPct: 5,
+			},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDecision(&tt.decision, 1000, 10, 5, 10.0, 1.5, false)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("validateDecision() error = %v, wantError %v", err, tt.wantError)
+			}
+		})
+	}
+}
+
 
 // contains checks if string contains substring (helper function)
 func contains(s, substr string) bool {

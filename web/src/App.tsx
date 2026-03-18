@@ -16,6 +16,7 @@ import { DebateArenaPage } from './pages/DebateArenaPage'
 import { StrategyMarketPage } from './pages/StrategyMarketPage'
 import { DataPage } from './pages/DataPage'
 import { QuantDashboardPage } from './pages/QuantDashboardPage'
+import { PromptVariantsLabPage } from './pages/PromptVariantsLabPage'
 import { LoginRequiredOverlay } from './components/LoginRequiredOverlay'
 import { OpenClawWidget } from './components/OpenClawWidget'
 import HeaderBar from './components/HeaderBar'
@@ -46,6 +47,7 @@ type Page =
   | 'strategy-market'
   | 'data'
   | 'screener'
+  | 'collider'
   | 'debate'
   | 'faq'
   | 'login'
@@ -75,6 +77,7 @@ function App() {
     if (path === '/strategy-market' || hash === 'strategy-market') return 'strategy-market'
     if (path === '/data' || hash === 'data') return 'data'
     if (path === '/screener' || hash === 'screener') return 'screener'
+    if (path === '/collider' || hash === 'collider') return 'collider'
     if (path === '/debate' || hash === 'debate') return 'debate'
     if (path === '/dashboard' || hash === 'trader' || hash === 'details')
       return 'trader'
@@ -97,6 +100,7 @@ function App() {
       'strategy-market': '/strategy-market',
       'data': '/data',
       'screener': '/screener',
+      'collider': '/collider',
       'traders': '/traders',
       'trader': '/dashboard',
       'backtest': '/backtest',
@@ -165,6 +169,8 @@ function App() {
         setCurrentPage('data')
       } else if (path === '/screener' || hash === 'screener') {
         setCurrentPage('screener')
+      } else if (path === '/collider' || hash === 'collider') {
+        setCurrentPage('collider')
       } else if (path === '/debate' || hash === 'debate') {
         setCurrentPage('debate')
       } else if (
@@ -327,6 +333,8 @@ function App() {
       setCurrentPage('competition')
     } else if (route === '/traders') {
       setCurrentPage('traders')
+    } else if (route === '/collider') {
+      setCurrentPage('collider')
     } else if (route === '/dashboard') {
       setCurrentPage('trader')
     }
@@ -392,6 +400,7 @@ function App() {
       const pathMap: Record<string, string> = {
         'data': '/data',
         'screener': '/screener',
+        'collider': '/collider',
         'competition': '/competition',
         'strategy-market': '/strategy-market',
         'traders': '/traders',
@@ -474,6 +483,8 @@ function App() {
               <DataPage />
             ) : currentPage === 'screener' ? (
               <QuantDashboardPage />
+            ) : currentPage === 'collider' ? (
+              <PromptVariantsLabPage />
             ) : currentPage === 'strategy-market' ? (
               <StrategyMarketPage />
             ) : currentPage === 'traders' ? (

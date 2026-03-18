@@ -27,6 +27,14 @@ export function RiskControlEditor({
         zh: '开启后，AI 有权根据盘面主动使用市价平仓或部分减仓；关闭后，平仓权 100% 交由后台 ATR / 风控引擎执行，AI 仅负责入场与参数调整。',
         en: 'When enabled, AI may actively use market closes or partial reductions; when disabled, all exits are handled by backend ATR / watchdog, and AI focuses on entries and parameter updates only.',
       },
+      enableAIMoveTPSLLabel: {
+        zh: '允许 AI 中途调整止盈止损',
+        en: 'Allow AI to move TP/SL mid-trade',
+      },
+      enableAIMoveTPSLDesc: {
+        zh: '开启后，AI 可以在 hold/wait 时调整已有持仓的止盈止损；关闭后，只允许开仓时设置初始 TP/SL，持仓中途不得改动。',
+        en: 'When enabled, AI may update TP/SL for existing positions during hold/wait; when disabled, TP/SL may only be set at entry and cannot be moved mid-trade.',
+      },
       // Trading leverage (exchange leverage)
       tradingLeverage: { zh: '交易杠杆（交易所杠杆）', en: 'Trading Leverage (Exchange)' },
       btcEthLeverage: { zh: 'BTC/ETH 交易杠杆', en: 'BTC/ETH Trading Leverage' },
@@ -84,6 +92,27 @@ export function RiskControlEditor({
         </label>
         <p className="text-xs" style={{ color: '#848E9C' }}>
           {t('enableAICloseDesc')}
+        </p>
+      </div>
+
+      <div
+        className="p-4 rounded-lg"
+        style={{ background: '#0B0E11', border: '1px solid #2B3139' }}
+      >
+        <label className="flex items-center gap-3 mb-2">
+          <input
+            type="checkbox"
+            className="w-4 h-4"
+            checked={config.enable_ai_move_tp_sl ?? true}
+            onChange={(e) => updateField('enable_ai_move_tp_sl', e.target.checked)}
+            disabled={disabled}
+          />
+          <span className="text-sm" style={{ color: '#EAECEF' }}>
+            {t('enableAIMoveTPSLLabel')}
+          </span>
+        </label>
+        <p className="text-xs" style={{ color: '#848E9C' }}>
+          {t('enableAIMoveTPSLDesc')}
         </p>
       </div>
 

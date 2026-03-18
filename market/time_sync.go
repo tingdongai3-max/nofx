@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"nofx/binanceguard"
 	"nofx/logger"
 )
 
@@ -30,6 +31,9 @@ func getServerTimeOffsetMs() int64 {
 	if time.Since(serverTimeCachedAt) < serverTimeCacheTTL {
 		return serverTimeOffsetMs
 	}
+	if err := binanceguard.CheckCircuitBreaker(); err != nil {
+		return serverTimeOffsetMs
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -46,9 +50,17 @@ func getServerTimeOffsetMs() int64 {
 	defer resp.Body.Close()
 
 	var body struct {
+		Code       int   `json:"code"`
 		ServerTime int64 `json:"serverTime"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil || body.ServerTime == 0 {
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return serverTimeOffsetMs
+	}
+	if body.Code == -1003 {
+		binanceguard.SetCircuitBreakerFromError(&binanceRESTError{msg: "binance server time -1003"})
+		return serverTimeOffsetMs
+	}
+	if body.ServerTime == 0 {
 		return serverTimeOffsetMs
 	}
 
@@ -60,4 +72,12 @@ func getServerTimeOffsetMs() int64 {
 			time.UnixMilli(localMs).UTC().Format("15:04:05"))
 	}
 	return serverTimeOffsetMs
+}
+
+type binanceRESTError struct {
+	msg string
+}
+
+func (e *binanceRESTError) Error() string {
+	return e.msg
 }

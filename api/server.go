@@ -20,6 +20,7 @@ import (
 	"nofx/provider/hyperliquid"
 	"nofx/provider/twelvedata"
 	"nofx/store"
+	"nofx/syncer"
 	"nofx/ta"
 	"nofx/trader"
 	"nofx/trader/aster"
@@ -43,8 +44,8 @@ import (
 )
 
 const (
-	accountPositionsCacheTTL        = 5 * time.Second
-	accountPositionsCacheTTLDryRun  = 2 * time.Second // DryRun 缩短缓存，减少「持仓不显示」延迟
+	accountPositionsCacheTTL        = 1 * time.Second
+	accountPositionsCacheTTLDryRun  = 1 * time.Second // 配合前端实时价重算，减少账户/持仓接口缓存滞后
 )
 
 type ttlCacheEntry struct {
@@ -57,6 +58,23 @@ var (
 	positionsCache sync.Map
 )
 
+func clearExchangeRuntimeCache(exchangeCfg *store.Exchange) {
+	if exchangeCfg == nil {
+		return
+	}
+	switch exchangeCfg.ExchangeType {
+	case "binance":
+		accountKey := binance.BuildExchangeAccountKey(exchangeCfg.ID, exchangeCfg.Testnet)
+		if accountKey == "" {
+			return
+		}
+		gsm := syncer.GetGlobalSyncManager()
+		gsm.ClearBalance(accountKey)
+		gsm.ClearPositions(accountKey)
+		logger.Infof("🧹 Cleared Binance shared cache for exchange %s", exchangeCfg.ID)
+	}
+}
+
 func normalizeResetTimestamp(t time.Time) time.Time {
 	if t.IsZero() {
 		return time.Time{}
@@ -68,6 +86,7 @@ func normalizeResetTimestamp(t time.Time) time.Time {
 type Server struct {
 	router          *gin.Engine
 	traderManager   *manager.TraderManager
+	coachService    *manager.CoachService
 	store           *store.Store
 	cryptoHandler   *CryptoHandler
 	backtestManager *backtest.Manager
@@ -83,7 +102,7 @@ func (s *Server) GetSignalPool() *ta.SignalPool {
 }
 
 // NewServer Creates API server
-func NewServer(traderManager *manager.TraderManager, st *store.Store, cryptoService *crypto.CryptoService, backtestManager *backtest.Manager, port int) *Server {
+func NewServer(traderManager *manager.TraderManager, coachService *manager.CoachService, st *store.Store, cryptoService *crypto.CryptoService, backtestManager *backtest.Manager, port int) *Server {
 	// Set to Release mode (reduce log output)
 	gin.SetMode(gin.ReleaseMode)
 
@@ -106,6 +125,7 @@ func NewServer(traderManager *manager.TraderManager, st *store.Store, cryptoServ
 	s := &Server{
 		router:          router,
 		traderManager:   traderManager,
+		coachService:    coachService,
 		store:           st,
 		cryptoHandler:   cryptoHandler,
 		backtestManager: backtestManager,
@@ -199,6 +219,11 @@ func (s *Server) setupRoutes() {
 
 			// AI trader management
 			protected.GET("/my-traders", s.handleTraderList)
+			protected.GET("/experiments", s.handleListExperiments)
+			protected.POST("/experiments/create", s.handleCreateExperiment)
+			protected.GET("/experiments/coach/config", s.handleGetCoachConfig)
+			protected.POST("/experiments/coach/config", s.handleUpdateCoachConfig)
+			protected.POST("/experiments/coach/trigger", s.handleTriggerCoachEvolution)
 			protected.GET("/traders/:id/config", s.handleGetTraderConfig)
 			protected.POST("/traders", s.handleCreateTrader)
 			protected.PUT("/traders/:id", s.handleUpdateTrader)
@@ -554,6 +579,33 @@ type CreateTraderRequest struct {
 	VirtualEquity        float64 `json:"virtual_equity"`
 }
 
+type CreateExperimentRequest struct {
+	TraderID      string `json:"trader_id" binding:"required"`
+	VariantCount  int    `json:"variant_count" binding:"required"`
+}
+
+type ColliderVariantPayload struct {
+	TraderID           string                 `json:"trader_id"`
+	TraderName         string                 `json:"trader_name"`
+	IsShadow           bool                   `json:"is_shadow"`
+	IsRunning          bool                   `json:"is_running"`
+	ResetTimestamp     time.Time              `json:"reset_timestamp"`
+	CustomPrompt       string                 `json:"custom_prompt"`
+	SystemPromptTemplate string               `json:"system_prompt_template"`
+	InitialBalance     float64                `json:"initial_balance"`
+	VirtualEquity      float64                `json:"virtual_equity"`
+	Decisions          []*store.DecisionRecord `json:"decisions"`
+	EquitySnapshots    []*store.EquitySnapshot `json:"equity_snapshots"`
+}
+
+type ColliderExperimentPayload struct {
+	ID              string                  `json:"id"`
+	MasterTraderID  string                  `json:"master_trader_id"`
+	ShadowTraderIDs []string                `json:"shadow_trader_ids"`
+	Variants        []ColliderVariantPayload `json:"variants"`
+	CreatedAt       time.Time               `json:"created_at"`
+}
+
 type ModelConfig struct {
 	ID           string `json:"id"`
 	Name         string `json:"name"`
@@ -782,6 +834,9 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 	}
 	logger.Infof("🔧 DEBUG: CreateTrader succeeded")
 
+	// Prevent a newly created trader from inheriting stale shared account positions.
+	clearExchangeRuntimeCache(exchangeCfg)
+
 	// Immediately load new trader into TraderManager
 	logger.Infof("🔧 DEBUG: Preparing to call LoadUserTraders")
 	err = s.traderManager.LoadUserTradersFromStore(s.store, userID)
@@ -799,6 +854,177 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		"ai_model":    req.AIModelID,
 		"is_running":  false,
 	})
+}
+
+func (s *Server) handleCreateExperiment(c *gin.Context) {
+	userID := c.GetString("user_id")
+	var req CreateExperimentRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		SafeBadRequest(c, "Invalid request parameters")
+		return
+	}
+	if req.VariantCount <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "variant_count must be greater than 0"})
+		return
+	}
+	if req.VariantCount > 30 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "variant_count must be less than or equal to 30"})
+		return
+	}
+
+	masterCfg, err := s.store.Trader().GetFullConfig(userID, req.TraderID)
+	if err != nil || masterCfg == nil || masterCfg.Trader == nil {
+		SafeNotFound(c, "Master trader")
+		return
+	}
+	master := masterCfg.Trader
+	if master.IsShadow {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "shadow trader cannot be used as experiment master"})
+		return
+	}
+
+	shadowIDs := make([]string, 0, req.VariantCount)
+	for i := 0; i < req.VariantCount; i++ {
+		shadowID := fmt.Sprintf("%s_shadow_%s", master.ID, uuid.NewString()[:8])
+		shadowName := fmt.Sprintf("%s Shadow %d", master.Name, i+1)
+		virtualEquity := master.InitialBalance
+		if master.IsDryRun && master.VirtualEquity > 0 {
+			virtualEquity = master.VirtualEquity
+		}
+		if virtualEquity <= 0 {
+			virtualEquity = 10000
+		}
+
+		shadow := &store.Trader{
+			ID:                   shadowID,
+			UserID:               userID,
+			Name:                 shadowName,
+			AIModelID:            master.AIModelID,
+			ExchangeID:           master.ExchangeID,
+			StrategyID:           master.StrategyID,
+			IsShadow:             true,
+			InitialBalance:       virtualEquity,
+			ScanIntervalMinutes:  master.ScanIntervalMinutes,
+			IsRunning:            false,
+			IsCrossMargin:        master.IsCrossMargin,
+			ShowInCompetition:    false,
+			IsDryRun:             false,
+			VirtualEquity:        virtualEquity,
+			ResetTimestamp:       master.ResetTimestamp,
+			BTCETHLeverage:       master.BTCETHLeverage,
+			AltcoinLeverage:      master.AltcoinLeverage,
+			TradingSymbols:       master.TradingSymbols,
+			UseAI500:             master.UseAI500,
+			UseOITop:             master.UseOITop,
+			CustomPrompt:         master.CustomPrompt,
+			OverrideBasePrompt:   master.OverrideBasePrompt,
+			SystemPromptTemplate: master.SystemPromptTemplate,
+		}
+		if err := s.store.Trader().Create(shadow); err != nil {
+			SafeInternalError(c, "Failed to create shadow trader", err)
+			return
+		}
+		shadowIDs = append(shadowIDs, shadowID)
+	}
+
+	experiment, err := s.store.Experiment().Create(userID, master.ID, shadowIDs)
+	if err != nil {
+		SafeInternalError(c, "Failed to create experiment", err)
+		return
+	}
+
+	if err := s.traderManager.LoadUserTradersFromStore(s.store, userID); err != nil {
+		logger.Warnf("failed to load shadow traders into memory: %v", err)
+	}
+
+	startedShadowIDs := make([]string, 0, len(shadowIDs))
+	if master.IsRunning {
+		for _, shadowID := range shadowIDs {
+			at, getErr := s.traderManager.GetTrader(shadowID)
+			if getErr != nil {
+				continue
+			}
+			go func(shadowTraderID string, traderInst *trader.AutoTrader) {
+				if err := traderInst.Run(); err != nil {
+					logger.Warnf("shadow trader %s stopped with error: %v", shadowTraderID, err)
+					_ = s.store.Trader().UpdateStatus(userID, shadowTraderID, false)
+				}
+			}(shadowID, at)
+			_ = s.store.Trader().UpdateStatus(userID, shadowID, true)
+			startedShadowIDs = append(startedShadowIDs, shadowID)
+		}
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"experiment":          experiment,
+		"master_trader_id":    master.ID,
+		"shadow_trader_ids":   shadowIDs,
+		"started_shadow_ids":  startedShadowIDs,
+	})
+}
+
+func (s *Server) handleListExperiments(c *gin.Context) {
+	userID := c.GetString("user_id")
+	experiments, err := s.store.Experiment().ListByUser(userID)
+	if err != nil {
+		SafeInternalError(c, "Failed to list experiments", err)
+		return
+	}
+
+	window := 72 * time.Hour
+	if raw := strings.TrimSpace(c.Query("window")); raw != "" {
+		if parsed, parseErr := time.ParseDuration(raw); parseErr == nil && parsed > 0 {
+			window = parsed
+		}
+	}
+	start := time.Now().UTC().Add(-window)
+	end := time.Now().UTC()
+
+	payload := make([]ColliderExperimentPayload, 0, len(experiments))
+	for _, exp := range experiments {
+		traderIDs := append([]string{exp.MasterTraderID}, exp.ShadowTraderIDs...)
+		variants := make([]ColliderVariantPayload, 0, len(traderIDs))
+
+		for _, traderID := range traderIDs {
+			traderCfg, getErr := s.store.Trader().GetByID(traderID)
+			if getErr != nil || traderCfg == nil || traderCfg.UserID != userID {
+				continue
+			}
+
+			isRunning := traderCfg.IsRunning
+			if at, err := s.traderManager.GetTrader(traderID); err == nil {
+				if running, ok := at.GetStatus()["is_running"].(bool); ok {
+					isRunning = running
+				}
+			}
+
+			decisions, _ := s.store.Decision().GetByTimeRange(traderID, start, end)
+			equity, _ := s.store.Equity().GetByTimeRange(traderID, start, end)
+			variants = append(variants, ColliderVariantPayload{
+				TraderID:             traderCfg.ID,
+				TraderName:           traderCfg.Name,
+				IsShadow:             traderCfg.IsShadow,
+				IsRunning:            isRunning,
+				ResetTimestamp:       traderCfg.ResetTimestamp,
+				CustomPrompt:         traderCfg.CustomPrompt,
+				SystemPromptTemplate: traderCfg.SystemPromptTemplate,
+				InitialBalance:       traderCfg.InitialBalance,
+				VirtualEquity:        traderCfg.VirtualEquity,
+				Decisions:            decisions,
+				EquitySnapshots:      equity,
+			})
+		}
+
+		payload = append(payload, ColliderExperimentPayload{
+			ID:              exp.ID,
+			MasterTraderID:  exp.MasterTraderID,
+			ShadowTraderIDs: exp.ShadowTraderIDs,
+			Variants:        variants,
+			CreatedAt:       exp.CreatedAt,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"experiments": payload})
 }
 
 // UpdateTraderRequest Update trader request
@@ -820,6 +1046,59 @@ type UpdateTraderRequest struct {
 	SystemPromptTemplate string  `json:"system_prompt_template"`
 	IsDryRun             *bool   `json:"is_dry_run"`
 	VirtualEquity        *float64 `json:"virtual_equity"`
+}
+
+type coachConfigPayload struct {
+	CoachModelID string `json:"coach_model_id"`
+}
+
+func (s *Server) handleGetCoachConfig(c *gin.Context) {
+	modelID, err := s.store.GetSystemConfig("coach_model_id")
+	if err != nil {
+		SafeInternalError(c, "Failed to get coach config", err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"coach_model_id": strings.TrimSpace(modelID)})
+}
+
+func (s *Server) handleUpdateCoachConfig(c *gin.Context) {
+	var req coachConfigPayload
+	if err := c.ShouldBindJSON(&req); err != nil {
+		SafeBadRequest(c, "Invalid request parameters")
+		return
+	}
+
+	modelID := strings.TrimSpace(req.CoachModelID)
+	if modelID != "" {
+		userID := c.GetString("user_id")
+		model, err := s.store.AIModel().Get(userID, modelID)
+		if err != nil || model == nil {
+			SafeNotFound(c, "Coach model")
+			return
+		}
+	}
+
+	if err := s.store.SetSystemConfig("coach_model_id", modelID); err != nil {
+		SafeInternalError(c, "Failed to update coach config", err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":        "Coach configuration updated",
+		"coach_model_id": modelID,
+	})
+}
+
+func (s *Server) handleTriggerCoachEvolution(c *gin.Context) {
+	if s.coachService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Coach service unavailable"})
+		return
+	}
+	if err := s.coachService.RunEvolutionStep(); err != nil {
+		SafeInternalError(c, "Failed to trigger coach evolution", err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Coach evolution triggered"})
 }
 
 // handleUpdateTrader Update trader configuration
@@ -969,6 +1248,7 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		AIModelID:            req.AIModelID,
 		ExchangeID:           req.ExchangeID,
 		StrategyID:           strategyID, // Associated strategy ID
+		IsShadow:             existingTrader.IsShadow,
 		InitialBalance:       initialBalance,
 		BTCETHLeverage:       btcEthLeverage,
 		AltcoinLeverage:      altcoinLeverage,
@@ -1039,6 +1319,11 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 func (s *Server) handleDeleteTrader(c *gin.Context) {
 	userID := c.GetString("user_id")
 	traderID := c.Param("id")
+
+	fullConfig, _ := s.store.Trader().GetFullConfig(userID, traderID)
+	if fullConfig != nil {
+		clearExchangeRuntimeCache(fullConfig.Exchange)
+	}
 
 	// Delete from database
 	err := s.store.Trader().Delete(userID, traderID)
@@ -1207,6 +1492,10 @@ func (s *Server) reloadTraderRuntime(userID, traderID string) (bool, error) {
 		if isRunning, ok := status["is_running"].(bool); ok && isRunning {
 			wasRunning = true
 		}
+	}
+
+	if fullConfig, err := s.store.Trader().GetFullConfig(userID, traderID); err == nil && fullConfig != nil {
+		clearExchangeRuntimeCache(fullConfig.Exchange)
 	}
 
 	invalidateTraderRuntimeCache(userID, traderID)
@@ -2268,10 +2557,13 @@ func (s *Server) handleTraderList(c *gin.Context) {
 			"ai_model":            trader.AIModelID, // Use complete ID
 			"exchange_id":         trader.ExchangeID,
 			"is_running":          isRunning,
+			"is_shadow":           trader.IsShadow,
 			"show_in_competition": trader.ShowInCompetition,
 			"initial_balance":     trader.InitialBalance,
 			"strategy_id":         trader.StrategyID,
 			"strategy_name":       strategyName,
+			"custom_prompt":       trader.CustomPrompt,
+			"system_prompt_template": trader.SystemPromptTemplate,
 			"is_dry_run":          trader.IsDryRun,
 			"virtual_equity":      trader.VirtualEquity,
 		})
@@ -2315,6 +2607,7 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 		"ai_model":              aiModelID,
 		"exchange_id":           traderConfig.ExchangeID,
 		"strategy_id":           traderConfig.StrategyID,
+		"is_shadow":             traderConfig.IsShadow,
 		"reset_timestamp":       traderConfig.ResetTimestamp,
 		"initial_balance":       traderConfig.InitialBalance,
 		"scan_interval_minutes": traderConfig.ScanIntervalMinutes,
@@ -2486,6 +2779,14 @@ func (s *Server) handlePositions(c *gin.Context) {
 	}
 	traderCfg := fullConfig.Trader
 	exchangeCfg := fullConfig.Exchange
+	strategyTrailingActivationPct := 0.0
+	strategyTrailingRetracePct := 0.0
+	if fullConfig.Strategy != nil {
+		if strategyCfg, errParse := fullConfig.Strategy.ParseConfig(); errParse == nil && strategyCfg != nil {
+			strategyTrailingActivationPct = strategyCfg.TrailingActivationPct
+			strategyTrailingRetracePct = strategyCfg.TrailingRetracePct
+		}
+	}
 	resetAt := time.Time{}
 	if traderCfg != nil {
 		resetAt = traderCfg.ResetTimestamp
@@ -2503,6 +2804,10 @@ func (s *Server) handlePositions(c *gin.Context) {
 			exchangeType = exchangeCfg.ExchangeType
 		}
 		out := make([]map[string]interface{}, 0, len(openPositions))
+		trailingActivationMode := "price_move"
+		if strategyTrailingActivationPct > 0 {
+			trailingActivationMode = "tp_progress"
+		}
 		for _, pos := range openPositions {
 			markPrice := pos.EntryPrice
 			if data, errMarket := market.GetWithExchange(pos.Symbol, exchangeType, nil); errMarket == nil {
@@ -2536,9 +2841,40 @@ func (s *Server) handlePositions(c *gin.Context) {
 				"max_adverse_excursion":       pos.MaxAdverseExcursion,
 				"liquidation_price":           0.0,
 				"margin_used":                 marginUsed,
+				"trailing_activation_pct":    strategyTrailingActivationPct,
+				"trailing_activation_mode":   trailingActivationMode,
+				"trailing_retrace_pct":       strategyTrailingRetracePct,
 				"source":                      "dry_run",
 				"ai_reasoning_at_open":        pos.AiReasoningAtOpen,
 			})
+		}
+		if memTrader, errMem := s.traderManager.GetTrader(traderID); errMem == nil && memTrader != nil {
+			if managedPositions, errManaged := memTrader.GetPositions(); errManaged == nil {
+				managedIndex := make(map[string]map[string]interface{}, len(managedPositions))
+				for _, managed := range managedPositions {
+					symbol, _ := managed["symbol"].(string)
+					side, _ := managed["side"].(string)
+					if symbol == "" || side == "" {
+						continue
+					}
+					managedIndex[symbol+"_"+strings.ToLower(side)] = managed
+				}
+				for _, item := range out {
+					symbol, _ := item["symbol"].(string)
+					side, _ := item["side"].(string)
+					if managed := managedIndex[symbol+"_"+strings.ToLower(side)]; managed != nil {
+						if stopLoss := toFloat64(managed["stopLoss"], managed["stop_loss"]); stopLoss > 0 {
+							item["stop_loss"] = stopLoss
+						}
+						if takeProfit := toFloat64(managed["takeProfit"], managed["take_profit"]); takeProfit > 0 {
+							item["take_profit"] = takeProfit
+						}
+						if safetyFloor := toFloat64(managed["safetyFloorSL"], managed["safety_floor_sl"]); safetyFloor > 0 {
+							item["safety_floor_sl"] = safetyFloor
+						}
+					}
+				}
+			}
 		}
 		body, _ := json.Marshal(out)
 		positionsCache.Store(cacheKey, &ttlCacheEntry{Body: body, Until: time.Now().Add(accountPositionsCacheTTLDryRun)})
@@ -2557,14 +2893,15 @@ func (s *Server) handlePositions(c *gin.Context) {
 		return
 	}
 	// 统一映射为前端期望的 snake_case 且数值类型，避免 OKX 等返回 string 或 camelCase 导致前端崩溃
-	out := normalizePositionsForFrontend(positions)
+	out := normalizePositionsForFrontend(positions, strategyTrailingActivationPct, strategyTrailingRetracePct)
 	body, _ := json.Marshal(out)
 	positionsCache.Store(cacheKey, &ttlCacheEntry{Body: body, Until: time.Now().Add(accountPositionsCacheTTL)})
 	c.Data(http.StatusOK, "application/json", body)
 }
 
-// normalizePositionsForFrontend 将各交易所的持仓 map 转为前端 Position 结构（snake_case，数值保证为 number）
-func normalizePositionsForFrontend(positions []map[string]interface{}) []map[string]interface{} {
+// normalizePositionsForFrontend 将各交易所的持仓 map 转为前端 Position 结构（snake_case，数值保证为 number）。
+// 若持仓未携带 trailing_activation_pct，则回退到策略全局配置，并标记 trailing_activation_mode=tp_progress。
+func normalizePositionsForFrontend(positions []map[string]interface{}, defaultTrailingActivationPct, defaultTrailingRetracePct float64) []map[string]interface{} {
 	if len(positions) == 0 {
 		return positions
 	}
@@ -2580,6 +2917,24 @@ func normalizePositionsForFrontend(positions []map[string]interface{}) []map[str
 		leverage := toFloat64(p["leverage"], p["leverage"])
 		liqPrice := toFloat64(p["liquidationPrice"], p["liqPx"], p["liquidation_price"])
 		marginUsed := toFloat64(p["margin"], p["margin_used"])
+		stopLoss := toFloat64(p["stopLoss"], p["stop_loss"])
+		takeProfit := toFloat64(p["takeProfit"], p["take_profit"])
+		safetyFloorSL := toFloat64(p["safetyFloorSL"], p["safety_floor_sl"])
+		trailingActivationPct := toFloat64(p["trailingActivationPct"], p["trailing_activation_pct"])
+		trailingRetracePct := toFloat64(p["trailingRetracePct"], p["trailing_retrace_pct"])
+		trailingActivationMode, _ := p["trailing_activation_mode"].(string)
+		if trailingActivationPct <= 0 {
+			trailingActivationPct = defaultTrailingActivationPct
+			if trailingActivationPct > 0 {
+				trailingActivationMode = "tp_progress"
+			}
+		}
+		if trailingActivationMode == "" {
+			trailingActivationMode = "price_move"
+		}
+		if trailingRetracePct <= 0 {
+			trailingRetracePct = defaultTrailingRetracePct
+		}
 		side, _ := p["side"].(string)
 		if side == "" {
 			side = "long"
@@ -2600,6 +2955,12 @@ func normalizePositionsForFrontend(positions []map[string]interface{}) []map[str
 			"unrealized_pnl_pct": unrealizedPnlPct,
 			"liquidation_price":  liqPrice,
 			"margin_used":        marginUsed,
+			"stop_loss":          stopLoss,
+			"take_profit":        takeProfit,
+			"safety_floor_sl":    safetyFloorSL,
+			"trailing_activation_mode": trailingActivationMode,
+			"trailing_activation_pct": trailingActivationPct,
+			"trailing_retrace_pct":    trailingRetracePct,
 		})
 	}
 	return out

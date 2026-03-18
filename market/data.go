@@ -79,7 +79,9 @@ func getKlinesFromCoinAnk(symbol, interval, exchange string, limit int) ([]Kline
 	}
 
 	// Prefer live WebSocket buffer first to achieve real-time, zero-HTTP quotes.
-	ensureKlineStream(symbol, interval, exchange)
+	if err := ensureKlineStream(symbol, interval, exchange); err != nil && strings.EqualFold(exchange, "binance") {
+		logger.Warnf("⚠️ K-line pre-warm skipped for %s %s %s: %v", symbol, interval, exchange, err)
+	}
 	if live, ok := getRealtimeKlines(symbol, interval, exchange, limit); ok && len(live) > 0 {
 		// 数据新鲜度校验：使用「本地时间 + 交易所服务器时间偏移」作为 effectiveNow，避免本地时钟快于交易所时误判为 stale
 		nowMs := time.Now().UTC().UnixMilli()

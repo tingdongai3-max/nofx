@@ -135,7 +135,7 @@ func ensureScreenerPool() {
 	pool := buildSymbolPool()
 	for _, symbol := range pool {
 		for _, tf := range []string{"5m", "15m", "1h"} {
-			ensureKlineStream(symbol, tf, ScreenerDefaultExchange)
+			_ = ensureKlineStream(symbol, tf, ScreenerDefaultExchange)
 		}
 	}
 	logger.Infof("✓ Screener pool refreshed: %d symbols", len(pool))

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"nofx/binanceguard"
 	"nofx/logger"
 	"nofx/provider/coinank"
 	"nofx/provider/coinank/coinank_api"
@@ -43,6 +44,11 @@ type KlineUpdateEvent struct {
 	Symbol   string
 	Exchange string
 	Interval string
+}
+
+type klinePrewarmState struct {
+	done chan struct{}
+	err  error
 }
 
 var (
@@ -126,6 +132,7 @@ func (r *klineRing) snapshot(count int) []Kline {
 var (
 	klineStreamsMu       sync.Mutex
 	klineStreams         = make(map[klineSeriesKey]*klineRing)
+	klinePrewarms        = make(map[klineSeriesKey]*klinePrewarmState)
 	binanceMultiplexDone chan struct{}
 	binanceMultiplexOnce sync.Once
 	okxMultiplexDone     chan struct{}
@@ -308,17 +315,17 @@ func intervalToBarMs(interval string) int64 {
 	}
 }
 
-// ensureKlineStream 为 (symbol, interval, exchange) 注册 ring 并触发多路复用（Binance/OKX 直连 WS，其余 CoinAnk REST）
-func ensureKlineStream(symbol, interval, exchange string) {
+// ensureKlineStream 为 (symbol, interval, exchange) 注册 ring，并将首轮 REST 预热单例化。
+func ensureKlineStream(symbol, interval, exchange string) error {
 	symbol = Normalize(symbol)
 	exchangeEnum := mapExchangeToEnum(exchange)
 	intervalEnum, ok := mapIntervalToEnum(interval)
 	if !ok {
-		return
+		return nil
 	}
 
 	if IsXyzDexAsset(symbol) {
-		return
+		return nil
 	}
 
 	key := klineSeriesKey{
@@ -328,24 +335,43 @@ func ensureKlineStream(symbol, interval, exchange string) {
 	}
 
 	klineStreamsMu.Lock()
-	if _, exists := klineStreams[key]; exists {
-		klineStreamsMu.Unlock()
-		return
+	ring, exists := klineStreams[key]
+	if !exists {
+		ring = newKlineRing(2000)
+		klineStreams[key] = ring
 	}
-	ring := newKlineRing(2000)
-	klineStreams[key] = ring
+	if exists && ring != nil && len(ring.snapshot(1)) > 0 {
+		klineStreamsMu.Unlock()
+		return nil
+	}
+	prewarm, prewarmExists := klinePrewarms[key]
+	if !prewarmExists {
+		prewarm = &klinePrewarmState{done: make(chan struct{})}
+		klinePrewarms[key] = prewarm
+	}
 	klineStreamsMu.Unlock()
+
+	if prewarmExists {
+		<-prewarm.done
+		return prewarm.err
+	}
 
 	// REST 预热
 	const restPreFetchBars = 200
+	var prewarmErr error
 	if exchangeEnum == coinank_enum.Binance {
-		api := GetAPIClient()
-		klines, err := api.GetKlines(symbol, interval, restPreFetchBars)
-		if err == nil && len(klines) > 0 {
-			ring.loadHistory(klines)
-			logger.Infof("✓ K-line REST pre-warm (Binance): %s %s, %d bars", symbol, interval, len(klines))
-		} else if err != nil {
-			logger.Warnf("⚠️ Binance K-line pre-warm failed (%s %s): %v", symbol, interval, err)
+		if err := binanceguard.CheckCircuitBreaker(); err != nil {
+			prewarmErr = err
+		} else {
+			api := GetAPIClient()
+			klines, err := api.GetKlines(symbol, interval, restPreFetchBars)
+			if err == nil && len(klines) > 0 {
+				ring.loadHistory(klines)
+				logger.Infof("✓ K-line REST pre-warm (Binance): %s %s, %d bars", symbol, interval, len(klines))
+			} else if err != nil {
+				prewarmErr = err
+				logger.Warnf("⚠️ Binance K-line pre-warm failed (%s %s): %v", symbol, interval, err)
+			}
 		}
 	} else if exchangeEnum == coinank_enum.Okex {
 		klines, err := fetchOkxKlinesREST(symbol, interval, restPreFetchBars)
@@ -353,6 +379,7 @@ func ensureKlineStream(symbol, interval, exchange string) {
 			ring.loadHistory(klines)
 			logger.Infof("✓ K-line REST pre-warm (OKX): %s %s, %d bars", symbol, interval, len(klines))
 		} else if err != nil {
+			prewarmErr = err
 			logger.Warnf("⚠️ OKX K-line pre-warm failed (%s %s): %v", symbol, interval, err)
 		}
 		startOkxMultiplex()
@@ -369,13 +396,21 @@ func ensureKlineStream(symbol, interval, exchange string) {
 			ring.loadHistory(klines)
 			logger.Infof("✓ K-line REST pre-warm: %s %s %s, %d bars", symbol, exchange, interval, len(klines))
 		} else if err != nil {
+			prewarmErr = err
 			logger.Warnf("⚠️ K-line REST pre-warm failed (%s %s %s): %v", symbol, exchange, interval, err)
 		}
 	}
 
+	klineStreamsMu.Lock()
+	prewarm.err = prewarmErr
+	close(prewarm.done)
+	delete(klinePrewarms, key)
+	klineStreamsMu.Unlock()
+
 	if exchangeEnum == coinank_enum.Binance {
 		startBinanceMultiplex()
 	}
+	return prewarmErr
 }
 
 // startOkxMultiplex 启动 OKX 单连接多路复用（按需只起一次）
@@ -925,6 +960,23 @@ func getRealtimeKlines(symbol, interval, exchange string, count int) ([]Kline, b
 // GetRealtimeKlines returns a snapshot of the in-memory kline ring for the stream, if available.
 func GetRealtimeKlines(symbol, interval, exchange string, count int) ([]Kline, bool) {
 	return getRealtimeKlines(symbol, interval, exchange, count)
+}
+
+func ReleaseRealtimeKlineStream(symbol, interval, exchange string) {
+	symbol = Normalize(symbol)
+	exchangeEnum := mapExchangeToEnum(exchange)
+	intervalEnum, ok := mapIntervalToEnum(interval)
+	if !ok {
+		return
+	}
+	key := klineSeriesKey{
+		Symbol:   symbol,
+		Exchange: exchangeEnum,
+		Interval: intervalEnum,
+	}
+	klineStreamsMu.Lock()
+	delete(klineStreams, key)
+	klineStreamsMu.Unlock()
 }
 
 func coinankResultToKline(k coinank.KlineResult) Kline {

@@ -87,6 +87,8 @@ type DecisionAction struct {
 	Price      float64   `json:"price"`
 	StopLoss   float64   `json:"stop_loss,omitempty"`   // Stop loss price
 	TakeProfit float64   `json:"take_profit,omitempty"` // Take profit price
+	TrailingActivationPct float64 `json:"trailing_activation_pct,omitempty"` // Underlying price move %, not leveraged ROI
+	TrailingRetracePct    float64 `json:"trailing_retrace_pct,omitempty"`    // Underlying price retrace %
 	Confidence int       `json:"confidence,omitempty"`  // AI confidence (0-100)
 	Reasoning  string    `json:"reasoning,omitempty"`   // Brief reasoning
 	OrderID    int64     `json:"order_id"`
@@ -230,6 +232,23 @@ func (s *DecisionStore) GetLatestRecordsSince(traderID string, n int, resetAt ti
 		records[i], records[j] = records[j], records[i]
 	}
 
+	return records, nil
+}
+
+// GetByTimeRange gets decision records within a time range.
+func (s *DecisionStore) GetByTimeRange(traderID string, start, end time.Time) ([]*DecisionRecord, error) {
+	var dbRecords []*DecisionRecordDB
+	err := s.db.Where("trader_id = ? AND timestamp >= ? AND timestamp <= ?", traderID, start.UTC(), end.UTC()).
+		Order("timestamp ASC").
+		Find(&dbRecords).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to query decision records by time range: %w", err)
+	}
+
+	records := make([]*DecisionRecord, len(dbRecords))
+	for i, db := range dbRecords {
+		records[i] = db.toRecord()
+	}
 	return records, nil
 }
 

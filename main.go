@@ -98,6 +98,7 @@ func main() {
 
 	// Create TraderManager and BacktestManager
 	traderManager := manager.NewTraderManager()
+	coachService := manager.NewCoachService(st, traderManager)
 	mcpClient := newSharedMCPClient()
 	backtestManager := backtest.NewManager(mcpClient)
 
@@ -112,6 +113,8 @@ func main() {
 	if err := traderManager.LoadTradersFromStore(st); err != nil {
 		logger.Fatalf("❌ Failed to load traders: %v", err)
 	}
+	coachService.Start()
+	defer coachService.Stop()
 
 	// Display loaded trader information
 	traders, err := st.Trader().List("default")
@@ -134,7 +137,7 @@ func main() {
 	}
 
 	// Start API server
-	server := api.NewServer(traderManager, st, cryptoService, backtestManager, cfg.APIServerPort)
+	server := api.NewServer(traderManager, coachService, st, cryptoService, backtestManager, cfg.APIServerPort)
 	go func() {
 		if err := server.Start(); err != nil {
 			logger.Fatalf("❌ Failed to start API server: %v", err)

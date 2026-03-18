@@ -42,6 +42,8 @@ var (
 	reThousandSep = regexp.MustCompile(`(\d),(\d)`)
 )
 
+const maxTrailingRetraceToActivationRatio = 0.4
+
 // ============================================================================
 // Type Definitions
 // ============================================================================
@@ -231,6 +233,8 @@ type Decision struct {
 	ATRTrailingSlMult   float64             `json:"atr_sl_mult,omitempty"`   // 止损：entry ± atr_sl_mult * ATR
 	ATRTrailingTpMult   float64             `json:"atr_tp_mult,omitempty"`   // 止盈：entry ± atr_tp_mult * ATR（可与 atr_tp_stages 二选一或同时用）
 	ATRTrailingTpStages []ATRTrailingStage `json:"atr_tp_stages,omitempty"` // 分批止盈，最多 3 阶段：每阶段 atr_mult + close_pct(0-100)
+	TrailingActivationPct float64           `json:"trailing_activation_pct,omitempty"` // Favorable underlying price move from entry (%), not leveraged ROI
+	TrailingRetracePct    float64           `json:"trailing_retrace_pct,omitempty"`    // Price retrace from post-activation extreme (%)
 
 	// Grid trading parameters
 	Price      float64 `json:"price,omitempty"`       // Limit order price (for grid)
@@ -1248,6 +1252,7 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	riskControl := e.config.RiskControl
 	promptSections := e.config.PromptSections
 	enableAIClose := riskControl.EnableAIClose
+	enableAIMoveTPSL := riskControl.EnableAIMoveTPSL
 
 	// 1. Role definition (editable)
 	if promptSections.RoleDefinition != "" {
@@ -1341,17 +1346,31 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	if enableAIClose {
 		// Hybrid guardrail: AI may actively close positions, but still must respect watchdog/ATR rules.
 		sb.WriteString("## CRITICAL_SYSTEM_RULES — Hybrid Guardrail Mode (混合护盘架构)\n\n")
-		sb.WriteString("You MAY close positions manually. Allowed actions: `close_long`, `close_short` (full or partial), or `hold`/`wait` with TP/SL updates. Use closes for **professional scaling-out / risk reduction**, not for emotional over-trading.\n\n")
+		if enableAIMoveTPSL {
+			sb.WriteString("You MAY close positions manually. Allowed actions: `close_long`, `close_short` (full or partial), or `hold`/`wait` with TP/SL updates. Use closes for **professional scaling-out / risk reduction**, not for emotional over-trading.\n\n")
+		} else {
+			sb.WriteString("You MAY close positions manually. Allowed actions: `close_long`, `close_short` (full or partial), `hold`, or `wait`. Use closes for **professional scaling-out / risk reduction**, not for emotional over-trading.\n")
+			sb.WriteString("注意：当前策略中，一旦仓位开启，其 take_profit 和 stop_loss 将被锁定，不可中途修改。你只能选择 hold、wait 或 close。\n\n")
+		}
 		sb.WriteString("## CLOSE & REDUCE POSITION (平仓与减仓)\n\n")
 		sb.WriteString("- **Full close**: Use `close_long` or `close_short` with no `quantity` (or quantity=0) to close the entire position.\n")
 		sb.WriteString("- **Partial close / 分批止盈**: Use `close_long` or `close_short` with `quantity` set to the amount (in base asset, e.g. BTC amount) you want to close. Example: position 0.5 BTC, take profit 50% → output `{\"action\": \"close_long\", \"symbol\": \"BTCUSDT\", \"quantity\": 0.25}`. You can close in multiple steps (e.g. 1/3 at first target, 1/3 at second, rest at trailing).\n")
-		sb.WriteString("- When in doubt, you can still use only TP/SL orders and `hold`/`wait` to move them; closing is optional.\n\n")
+		if enableAIMoveTPSL {
+			sb.WriteString("- When in doubt, you can still use only TP/SL orders and `hold`/`wait` to move them; closing is optional.\n\n")
+		} else {
+			sb.WriteString("- When in doubt, prefer `hold` / `wait`. Do not attempt to modify TP/SL on existing positions.\n\n")
+		}
 	} else {
 		// Fully automated kill-switch: AI has no permission to close; backend system defenses own all exits.
 		sb.WriteString("## CRITICAL_SYSTEM_RULES — Automated Kill-Switch Mode (物理断头台 / 全自动护盘)\n\n")
 		sb.WriteString("- **System Notice**: Your manual close permission has been REVOKED at the engine level. You are an **entry decision engine only**.\n")
 		sb.WriteString("- **DO NOT** output `close_long` or `close_short` under any circumstances. Any such actions will be ignored by the backend.\n")
-		sb.WriteString("- Position exits (take profit / stop loss / emergency kill) are fully managed by the backend system defense engine. You focus on selecting high-quality entries and updating TP/SL parameters via `hold` / `wait` only.\n\n")
+		if enableAIMoveTPSL {
+			sb.WriteString("- Position exits (take profit / stop loss / emergency kill) are fully managed by the backend system defense engine. You focus on selecting high-quality entries and updating TP/SL parameters via `hold` / `wait` only.\n\n")
+		} else {
+			sb.WriteString("- Position exits (take profit / stop loss / emergency kill) are fully managed by the backend system defense engine.\n")
+			sb.WriteString("- 注意：当前策略中，一旦仓位开启，其 take_profit 和 stop_loss 将被锁定，不可中途修改。你只能选择 hold 或 wait。\n\n")
+		}
 	}
 	sb.WriteString("## CORE RISK CONTROL & STAGED TAKE PROFIT\n\n")
 	sb.WriteString("- The User Prompt may provide `Avg MAE/MFE` and `Last Trade MAE/MFE` for each candidate coin. You MUST use this to calibrate entry spacing and stop placement.\n")
@@ -1363,8 +1382,20 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	} else {
 		sb.WriteString("- If staged take profit is disabled, use single `take_profit` with normal `stop_loss`.\n\n")
 	}
-	sb.WriteString("## TRAILING_STOP_PROTOCOL (Take Profit Iron Rule)\n\n")
-	sb.WriteString("When moving a trailing stop (action `hold` or `wait` with a new `stop_loss`): You may update ONLY the stop loss. Do NOT automatically move take_profit up together with the trailing stop. The initial risk-reward ratio applies only to **opening** positions; when trailing, the existing take_profit remains unchanged unless you explicitly output a new `take_profit` value. To update only the stop: set `take_profit` to 0 or omit it — the system will then leave the current TP order intact and only modify the SL order.\n\n")
+	if enableAIMoveTPSL {
+		sb.WriteString("## TRAILING_STOP_PROTOCOL (Take Profit Iron Rule)\n\n")
+		sb.WriteString("When moving a trailing stop (action `hold` or `wait` with a new `stop_loss`): You may update ONLY the stop loss. Do NOT automatically move take_profit up together with the trailing stop. The initial risk-reward ratio applies only to **opening** positions; when trailing, the existing take_profit remains unchanged unless you explicitly output a new `take_profit` value. To update only the stop: set `take_profit` to 0 or omit it — the system will then leave the current TP order intact and only modify the SL order.\n\n")
+	}
+	if e.config.TrailingActivationPct == 0 && e.config.TrailingRetracePct == 0 {
+		sb.WriteString("## DYNAMIC TRAILING TAKE-PROFIT REQUIRED\n\n")
+		sb.WriteString("注意：全局未配置追踪止盈，你必须在 JSON 中提供 `trailing_activation_pct` 和 `trailing_retrace_pct`。\n")
+		sb.WriteString("⚠️ 极其致命的警告：这两个参数代表的是**标的价格百分比**，不是带杠杆收益率，不是 ROI，不要乘杠杆。\n")
+		sb.WriteString("- `trailing_activation_pct`: 价格相对入场价的有利变动百分比。例如多头从 100 涨到 106，则 activation move = 6%。\n")
+		sb.WriteString("- `trailing_retrace_pct`: 激活后，价格从极值回撤的百分比。例如多头最高到 110，retrace=3 表示跌到 106.7 触发。\n")
+		sb.WriteString(fmt.Sprintf("- 风控硬约束：`trailing_retrace_pct` 必须 ≤ `trailing_activation_pct` 的 %.0f%%，也就是激活后利润回吐不得超过 %.0f%%。例如 activation=5 时，retrace 最大只能是 2；可填 1.9、1.5、0.5，但不能填 2.1。\n", maxTrailingRetraceToActivationRatio*100, maxTrailingRetraceToActivationRatio*100))
+		sb.WriteString("【计算范例】：5x 杠杆多头，入场 100，若你希望价格上涨 4% 后启动追踪，随后从高点回撤 1.5% 平仓，则应设置 activation=4，retrace=1.5，而不是 20 和 7.5。\n")
+		sb.WriteString("绝不要把杠杆 ROI 数值直接填进 trailing 字段，否则会导致触发条件严重失真。\n\n")
+	}
 	sb.WriteString("# Output Format (Strictly Follow)\n\n")
 	sb.WriteString("**Must use XML tags <reasoning> and <decision> to separate chain of thought and decision JSON, avoiding parsing errors**\n\n")
 	sb.WriteString("## Format Requirements\n\n")
@@ -1442,6 +1473,7 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	}
 	sb.WriteString(fmt.Sprintf("- `confidence`: 0-100 (opening recommended ≥ %d)\n", riskControl.MinConfidence))
 	sb.WriteString("- Required when opening: leverage, position_size_usd (use max from **This period** section; example shows 5000 as placeholder), stop_loss, **either** take_profit **or** take_profit_stages, confidence, risk_usd\n")
+	sb.WriteString("- Optional trailing watchdog fields: `trailing_activation_pct` (favorable underlying price move % from entry that activates trailing) and `trailing_retrace_pct` (underlying price retrace % from the post-activation extreme that forces market exit). These are price-based percentages, not leveraged ROI.\n")
 	if !e.config.Indicators.EnableStagedTakeProfit {
 		sb.WriteString("- **Staged take profit is OFF**: Do NOT use `take_profit_stages`. Use only single `take_profit` for full position close.\n")
 	} else {
@@ -1450,7 +1482,11 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	if enableAIClose {
 		sb.WriteString("- When close_long/close_short: you have **full permission** to close or reduce positions. Use optional `quantity` (base asset amount) or `quantity_pct` (0~1, e.g. 0.4 = close 40%% of current position). Omit both or 0 = close all; set `quantity` = partial close by amount, or `quantity_pct` = partial close by ratio (减仓/分批止盈).\n")
 	}
-	sb.WriteString("- When hold/wait to update TP/SL: use `stop_loss` and/or `take_profit` / `take_profit_stages`. If you only want to update the stop (trailing stop), set `take_profit` and `take_profit_stages` to 0/empty or omit them — the system will keep the existing TP orders and only update SL.\n")
+	if enableAIMoveTPSL {
+		sb.WriteString("- When hold/wait to update TP/SL: use `stop_loss` and/or `take_profit` / `take_profit_stages`. If you only want to update the stop (trailing stop), set `take_profit` and `take_profit_stages` to 0/empty or omit them — the system will keep the existing TP orders and only update SL.\n")
+	} else {
+		sb.WriteString("- **TP/SL move is OFF**: on existing positions, do NOT output new `stop_loss`, `take_profit`, or `take_profit_stages` in `hold` / `wait`. Initial TP/SL may be set only when opening a new position.\n")
+	}
 	sb.WriteString("- **IMPORTANT**: All numeric values must be calculated numbers, NOT formulas/expressions (e.g., use `27.76` not `3000 * 0.01`)\n")
 	sb.WriteString("- **STRICT RULE**: In the JSON object, all numbers (including those inside the \"reason\" or \"reasoning\" string) MUST NOT contain any thousand separators (e.g., use 67317 instead of 67,317). Commas are ONLY allowed as delimiters between JSON fields.\n\n")
 
@@ -1768,7 +1804,19 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 	// Position information
 	if len(ctx.Positions) > 0 {
 		sb.WriteString("## Current Positions\n")
-		sb.WriteString("For these symbols you may: wait, hold (with optional stop_loss/take_profit to update TP/SL), or close_long/close_short (optional quantity for partial close / 分批止盈).\n\n")
+		if enableAIClose {
+			if enableAIMoveTPSL {
+				sb.WriteString("For these symbols you may: wait, hold (with optional stop_loss/take_profit to update TP/SL), or close_long/close_short (optional quantity for partial close / 分批止盈).\n\n")
+			} else {
+				sb.WriteString("For these symbols you may: wait, hold, or close_long/close_short (optional quantity for partial close / 分批止盈). Current position TP/SL is locked and cannot be modified mid-trade.\n\n")
+			}
+		} else {
+			if enableAIMoveTPSL {
+				sb.WriteString("For these symbols you may: wait or hold (with optional stop_loss/take_profit to update TP/SL).\n\n")
+			} else {
+				sb.WriteString("For these symbols you may: wait or hold only. Current position TP/SL is locked and cannot be modified mid-trade.\n\n")
+			}
+		}
 		for i, pos := range ctx.Positions {
 			sb.WriteString(e.formatPositionInfo(i+1, pos, ctx))
 		}
@@ -2986,6 +3034,20 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 				if sumPct > 100.01 {
 					return fmt.Errorf("sum of take_profit_stages.close_pct must be ≤ 100, got %.2f", sumPct)
 				}
+			}
+		}
+
+		if d.TrailingActivationPct < 0 || d.TrailingRetracePct < 0 {
+			return fmt.Errorf("trailing_activation_pct and trailing_retrace_pct must be >= 0")
+		}
+		if (d.TrailingActivationPct > 0) != (d.TrailingRetracePct > 0) {
+			return fmt.Errorf("trailing_activation_pct and trailing_retrace_pct must be provided together")
+		}
+		if d.TrailingActivationPct > 0 {
+			maxRetracePct := d.TrailingActivationPct * maxTrailingRetraceToActivationRatio
+			if d.TrailingRetracePct > maxRetracePct+1e-9 {
+				return fmt.Errorf("trailing_retrace_pct must be ≤ %.4f (%.0f%% of trailing_activation_pct %.4f), got %.4f",
+					maxRetracePct, maxTrailingRetraceToActivationRatio*100, d.TrailingActivationPct, d.TrailingRetracePct)
 			}
 		}
 

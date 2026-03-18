@@ -6,7 +6,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"nofx/hook"
+	"nofx/binanceguard"
 	"strconv"
 	"time"
 )
@@ -54,6 +56,18 @@ func GetAPIClient() *APIClient {
 	return NewAPIClient()
 }
 
+func translateBinanceRESTError(resp *http.Response, body []byte) error {
+	if resp == nil {
+		return nil
+	}
+	if resp.StatusCode < http.StatusBadRequest && !strings.Contains(string(body), "\"code\":-1003") {
+		return nil
+	}
+	err := fmt.Errorf("binance REST %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	binanceguard.SetCircuitBreakerFromError(err)
+	return err
+}
+
 func (c *APIClient) GetExchangeInfo() (*ExchangeInfo, error) {
 	url := fmt.Sprintf("%s/fapi/v1/exchangeInfo", c.GetBaseURL())
 	resp, err := c.client.Get(url)
@@ -76,6 +90,9 @@ func (c *APIClient) GetExchangeInfo() (*ExchangeInfo, error) {
 }
 
 func (c *APIClient) GetKlines(symbol, interval string, limit int) ([]Kline, error) {
+	if err := binanceguard.CheckCircuitBreaker(); err != nil {
+		return nil, err
+	}
 	url := fmt.Sprintf("%s/fapi/v1/klines", c.GetBaseURL())
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -97,6 +114,9 @@ func (c *APIClient) GetKlines(symbol, interval string, limit int) ([]Kline, erro
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+	if restErr := translateBinanceRESTError(resp, body); restErr != nil {
+		return nil, restErr
 	}
 
 	var klineResponses []KlineResponse
@@ -143,6 +163,9 @@ func parseKline(kr KlineResponse) (Kline, error) {
 }
 
 func (c *APIClient) GetCurrentPrice(symbol string) (float64, error) {
+	if err := binanceguard.CheckCircuitBreaker(); err != nil {
+		return 0, err
+	}
 	url := fmt.Sprintf("%s/fapi/v1/ticker/price", c.GetBaseURL())
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -162,6 +185,9 @@ func (c *APIClient) GetCurrentPrice(symbol string) (float64, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return 0, err
+	}
+	if restErr := translateBinanceRESTError(resp, body); restErr != nil {
+		return 0, restErr
 	}
 
 	var ticker PriceTicker

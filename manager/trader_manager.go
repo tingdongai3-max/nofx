@@ -733,6 +733,7 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 		IsCrossMargin:        traderCfg.IsCrossMargin,
 		ShowInCompetition:    traderCfg.ShowInCompetition,
 		IsDryRun:             traderCfg.IsDryRun,
+		IsShadow:             traderCfg.IsShadow,
 		VirtualEquity:        traderCfg.VirtualEquity,
 		ResetTimestamp:       traderCfg.ResetTimestamp,
 		StrategyConfig:       strategyConfig,

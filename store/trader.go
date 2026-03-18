@@ -25,6 +25,7 @@ type Trader struct {
 	AIModelID           string    `gorm:"column:ai_model_id;not null" json:"ai_model_id"`
 	ExchangeID          string    `gorm:"column:exchange_id;not null" json:"exchange_id"`
 	StrategyID          string    `gorm:"column:strategy_id;default:''" json:"strategy_id"`
+	IsShadow            bool      `gorm:"column:is_shadow;default:false;index" json:"is_shadow"`
 	InitialBalance      float64   `gorm:"column:initial_balance;not null" json:"initial_balance"`
 	ScanIntervalMinutes int       `gorm:"column:scan_interval_minutes;default:3" json:"scan_interval_minutes"`
 	IsRunning           bool      `gorm:"column:is_running;default:false" json:"is_running"`
@@ -66,10 +67,18 @@ func (s *TraderStore) initTables() error {
 		var tableExists int64
 		s.db.Raw(`SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'traders'`).Scan(&tableExists)
 		if tableExists > 0 {
-			var columnExists int64
-			s.db.Raw(`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'traders' AND column_name = 'reset_timestamp'`).Scan(&columnExists)
-			if columnExists == 0 {
-				s.db.Exec(`ALTER TABLE traders ADD COLUMN reset_timestamp TIMESTAMPTZ NULL`)
+			for _, migration := range []struct {
+				column string
+				sql    string
+			}{
+				{column: "reset_timestamp", sql: `ALTER TABLE traders ADD COLUMN reset_timestamp TIMESTAMPTZ NULL`},
+				{column: "is_shadow", sql: `ALTER TABLE traders ADD COLUMN is_shadow BOOLEAN NOT NULL DEFAULT FALSE`},
+			} {
+				var columnExists int64
+				s.db.Raw(`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'traders' AND column_name = ?`, migration.column).Scan(&columnExists)
+				if columnExists == 0 {
+					s.db.Exec(migration.sql)
+				}
 			}
 			return nil
 		}
@@ -79,10 +88,18 @@ func (s *TraderStore) initTables() error {
 		return fmt.Errorf("failed to migrate traders table: %w", err)
 	}
 	if s.db.Dialector.Name() != "postgres" {
-		var columnExists int64
-		s.db.Raw(`SELECT COUNT(*) FROM pragma_table_info('traders') WHERE name = 'reset_timestamp'`).Scan(&columnExists)
-		if columnExists == 0 {
-			s.db.Exec(`ALTER TABLE traders ADD COLUMN reset_timestamp DATETIME`)
+		for _, migration := range []struct {
+			column string
+			sql    string
+		}{
+			{column: "reset_timestamp", sql: `ALTER TABLE traders ADD COLUMN reset_timestamp DATETIME`},
+			{column: "is_shadow", sql: `ALTER TABLE traders ADD COLUMN is_shadow BOOLEAN NOT NULL DEFAULT FALSE`},
+		} {
+			var columnExists int64
+			s.db.Raw(`SELECT COUNT(*) FROM pragma_table_info('traders') WHERE name = ?`, migration.column).Scan(&columnExists)
+			if columnExists == 0 {
+				s.db.Exec(migration.sql)
+			}
 		}
 	}
 	return nil
@@ -129,6 +146,7 @@ func (s *TraderStore) Update(trader *Trader) error {
 		"ai_model_id":         trader.AIModelID,
 		"exchange_id":         trader.ExchangeID,
 		"strategy_id":         trader.StrategyID,
+		"is_shadow":           trader.IsShadow,
 		"is_cross_margin":     trader.IsCrossMargin,
 		"show_in_competition": trader.ShowInCompetition,
 		"is_dry_run":          trader.IsDryRun,

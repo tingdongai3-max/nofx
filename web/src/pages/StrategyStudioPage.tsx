@@ -38,6 +38,7 @@ import { RiskControlEditor } from '../components/strategy/RiskControlEditor'
 import { PromptSectionsEditor } from '../components/strategy/PromptSectionsEditor'
 import { PublishSettingsEditor } from '../components/strategy/PublishSettingsEditor'
 import { GridConfigEditor, defaultGridConfig } from '../components/strategy/GridConfigEditor'
+import { TrailingTakeProfitEditor } from '../components/strategy/TrailingTakeProfitEditor'
 import { DeepVoidBackground } from '../components/DeepVoidBackground'
 
 const API_BASE = import.meta.env.VITE_API_BASE || ''
@@ -599,12 +600,22 @@ export function StrategyStudioPage() {
       title: t('riskControl'),
       forStrategyType: 'ai_trading' as const,
       content: editingConfig && (
-        <RiskControlEditor
-          config={editingConfig.risk_control}
-          onChange={(riskControl) => updateConfig('risk_control', riskControl)}
-          disabled={selectedStrategy?.is_default}
-          language={language}
-        />
+        <>
+          <RiskControlEditor
+            config={editingConfig.risk_control}
+            onChange={(riskControl) => updateConfig('risk_control', riskControl)}
+            disabled={selectedStrategy?.is_default}
+            language={language}
+          />
+          <TrailingTakeProfitEditor
+            activationPct={editingConfig.trailing_activation_pct}
+            retracePct={editingConfig.trailing_retrace_pct}
+            onActivationChange={(value) => updateConfig('trailing_activation_pct', value)}
+            onRetraceChange={(value) => updateConfig('trailing_retrace_pct', value)}
+            disabled={selectedStrategy?.is_default}
+            language={language}
+          />
+        </>
       ),
     },
     {

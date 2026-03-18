@@ -138,6 +138,14 @@ func (t *FuturesTrader) SetAccountKey(key string) {
 	t.accountKey = key
 }
 
+// BuildExchangeAccountKey builds the shared cache key for a Binance exchange config.
+func BuildExchangeAccountKey(exchangeID string, isTestnet bool) string {
+	if exchangeID == "" {
+		return ""
+	}
+	return fmt.Sprintf("binance:%s:%t", exchangeID, isTestnet)
+}
+
 func (t *FuturesTrader) accountCacheKey() string {
 	if t.accountKey != "" {
 		return t.accountKey
@@ -156,8 +164,19 @@ func (t *FuturesTrader) publishBalanceCache(balance map[string]interface{}) {
 	syncer.GetGlobalSyncManager().SetBalance(key, balance)
 }
 
+func (t *FuturesTrader) publishPositionsCache(positions []map[string]interface{}) {
+	key := t.accountCacheKey()
+	if key == "" {
+		return
+	}
+	syncer.GetGlobalSyncManager().SetPositions(key, positions)
+}
+
 // setDualSidePosition sets dual-side position mode (called during initialization)
 func (t *FuturesTrader) setDualSidePosition() error {
+	if err := CheckCircuitBreaker(); err != nil {
+		return err
+	}
 	// Try to set dual-side position mode
 	err := t.client.NewChangePositionModeService().
 		DualSide(true). // true = dual-side position (Hedge Mode)
@@ -180,6 +199,9 @@ func (t *FuturesTrader) setDualSidePosition() error {
 
 // syncBinanceServerTime syncs Binance server time to ensure request timestamps are valid
 func syncBinanceServerTime(client *futures.Client) {
+	if err := CheckCircuitBreaker(); err != nil {
+		return
+	}
 	serverTime, err := client.NewServerTimeService().Do(context.Background())
 	if err != nil {
 		logger.Infof("⚠️ Failed to sync Binance server time: %v", err)
@@ -194,6 +216,9 @@ func syncBinanceServerTime(client *futures.Client) {
 
 // ensureTimeSync forces sync if offset exceeds threshold (mitigate -1021)
 func (t *FuturesTrader) ensureTimeSync() {
+	if err := CheckCircuitBreaker(); err != nil {
+		return
+	}
 	serverTime, err := t.client.NewServerTimeService().Do(context.Background())
 	if err != nil {
 		return
@@ -294,6 +319,12 @@ func (t *FuturesTrader) fetchAndCacheBalance() (map[string]interface{}, error) {
 // without HTTP. Falls back to HTTP only when cache is empty.
 // Returns a copy to avoid race: reader holds copy while WS may replace cache.
 func (t *FuturesTrader) GetPositions() ([]map[string]interface{}, error) {
+	if key := t.accountCacheKey(); key != "" {
+		if cached, ok := syncer.GetGlobalSyncManager().GetPositions(key, 0); ok {
+			return cached, nil
+		}
+	}
+
 	t.positionsCacheMutex.RLock()
 	if t.cachedPositions != nil {
 		snapshot := make([]map[string]interface{}, len(t.cachedPositions))
@@ -305,6 +336,7 @@ func (t *FuturesTrader) GetPositions() ([]map[string]interface{}, error) {
 			snapshot[i] = pm
 		}
 		t.positionsCacheMutex.RUnlock()
+		t.publishPositionsCache(snapshot)
 		return snapshot, nil
 	}
 	t.positionsCacheMutex.RUnlock()
@@ -315,6 +347,11 @@ func (t *FuturesTrader) GetPositions() ([]map[string]interface{}, error) {
 
 // GetPositionsFromCache returns cached positions only (no REST).
 func (t *FuturesTrader) GetPositionsFromCache() ([]map[string]interface{}, bool) {
+	if key := t.accountCacheKey(); key != "" {
+		if cached, ok := syncer.GetGlobalSyncManager().GetPositions(key, 365*24*time.Hour); ok {
+			return cached, true
+		}
+	}
 	t.positionsCacheMutex.RLock()
 	if t.cachedPositions != nil {
 		snapshot := make([]map[string]interface{}, len(t.cachedPositions))
@@ -330,6 +367,32 @@ func (t *FuturesTrader) GetPositionsFromCache() ([]map[string]interface{}, bool)
 	}
 	t.positionsCacheMutex.RUnlock()
 	return nil, false
+}
+
+// GetPositionsFromCacheMaxAge returns cached positions only when they are recent enough.
+func (t *FuturesTrader) GetPositionsFromCacheMaxAge(maxAge time.Duration) ([]map[string]interface{}, bool) {
+	if key := t.accountCacheKey(); key != "" {
+		if cached, ok := syncer.GetGlobalSyncManager().GetPositions(key, maxAge); ok {
+			return cached, true
+		}
+	}
+	if maxAge <= 0 {
+		maxAge = 5 * time.Second
+	}
+	t.positionsCacheMutex.RLock()
+	defer t.positionsCacheMutex.RUnlock()
+	if t.cachedPositions == nil || time.Since(t.positionsCacheTime) > maxAge {
+		return nil, false
+	}
+	snapshot := make([]map[string]interface{}, len(t.cachedPositions))
+	for i, p := range t.cachedPositions {
+		pm := make(map[string]interface{}, len(p))
+		for k, v := range p {
+			pm[k] = v
+		}
+		snapshot[i] = pm
+	}
+	return snapshot, true
 }
 
 // fetchAndCachePositions fetches positions via REST API and updates cache
@@ -370,6 +433,7 @@ func (t *FuturesTrader) fetchAndCachePositions() ([]map[string]interface{}, erro
 	t.cachedPositions = result
 	t.positionsCacheTime = time.Now()
 	t.positionsCacheMutex.Unlock()
+	t.publishPositionsCache(result)
 
 	return result, nil
 }
@@ -478,6 +542,9 @@ func (t *FuturesTrader) SetLeverage(symbol string, leverage int) error {
 
 // OpenLong opens a long position
 func (t *FuturesTrader) OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	if err := CheckCircuitBreaker(); err != nil {
+		return nil, err
+	}
 	// First cancel all pending orders for this symbol (clean up old stop-loss and take-profit orders)
 	if err := t.CancelAllOrders(symbol); err != nil {
 		logger.Infof("  ⚠ Failed to cancel old pending orders (may not have any): %v", err)
@@ -533,6 +600,9 @@ func (t *FuturesTrader) OpenLong(symbol string, quantity float64, leverage int) 
 
 // OpenShort opens a short position
 func (t *FuturesTrader) OpenShort(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	if err := CheckCircuitBreaker(); err != nil {
+		return nil, err
+	}
 	// First cancel all pending orders for this symbol (clean up old stop-loss and take-profit orders)
 	if err := t.CancelAllOrders(symbol); err != nil {
 		logger.Infof("  ⚠ Failed to cancel old pending orders (may not have any): %v", err)
@@ -605,6 +675,15 @@ func (t *FuturesTrader) ForceZeroPositionInCache(symbol, positionSide string) {
 	}
 	t.cachedPositions = newList
 	t.positionsCacheTime = time.Now()
+	snapshot := make([]map[string]interface{}, len(t.cachedPositions))
+	for i, p := range t.cachedPositions {
+		pm := make(map[string]interface{}, len(p))
+		for k, v := range p {
+			pm[k] = v
+		}
+		snapshot[i] = pm
+	}
+	t.publishPositionsCache(snapshot)
 }
 
 // getPositionSizeForClose returns absolute position size from WS cache, floored. 0 if not found.
@@ -810,6 +889,9 @@ func (t *FuturesTrader) CloseShort(symbol string, quantity float64) (map[string]
 // CancelStopLossOrders cancels only stop-loss orders (doesn't affect take-profit orders)
 // Now uses both legacy API and new Algo Order API
 func (t *FuturesTrader) CancelStopLossOrders(symbol string) error {
+	if err := CheckCircuitBreaker(); err != nil {
+		return err
+	}
 	canceledCount := 0
 	var cancelErrors []error
 
@@ -886,6 +968,9 @@ func (t *FuturesTrader) CancelStopLossOrders(symbol string) error {
 // CancelTakeProfitOrders cancels only take-profit orders (doesn't affect stop-loss orders)
 // Now uses both legacy API and new Algo Order API
 func (t *FuturesTrader) CancelTakeProfitOrders(symbol string) error {
+	if err := CheckCircuitBreaker(); err != nil {
+		return err
+	}
 	canceledCount := 0
 	var cancelErrors []error
 
@@ -962,6 +1047,9 @@ func (t *FuturesTrader) CancelTakeProfitOrders(symbol string) error {
 // CancelAllOrders cancels all pending orders for this symbol
 // Now uses both legacy API and new Algo Order API
 func (t *FuturesTrader) CancelAllOrders(symbol string) error {
+	if err := CheckCircuitBreaker(); err != nil {
+		return err
+	}
 	// 1. Cancel all legacy orders
 	err := t.client.NewCancelAllOpenOrdersService().
 		Symbol(symbol).
@@ -993,6 +1081,9 @@ func (t *FuturesTrader) CancelAllOrders(symbol string) error {
 // PlaceLimitOrder places a limit order for grid trading
 // This implements the GridTrader interface for FuturesTrader
 func (t *FuturesTrader) PlaceLimitOrder(req *types.LimitOrderRequest) (*types.LimitOrderResult, error) {
+	if err := CheckCircuitBreaker(); err != nil {
+		return nil, err
+	}
 	// Format quantity to correct precision
 	quantityStr, err := t.FormatQuantity(req.Symbol, req.Quantity)
 	if err != nil {
@@ -1059,6 +1150,9 @@ func (t *FuturesTrader) PlaceLimitOrder(req *types.LimitOrderRequest) (*types.Li
 // CancelOrder cancels a specific order by ID
 // This implements the GridTrader interface for FuturesTrader
 func (t *FuturesTrader) CancelOrder(symbol, orderID string) error {
+	if err := CheckCircuitBreaker(); err != nil {
+		return err
+	}
 	// Parse order ID to int64
 	orderIDInt, err := strconv.ParseInt(orderID, 10, 64)
 	if err != nil {
@@ -1081,6 +1175,9 @@ func (t *FuturesTrader) CancelOrder(symbol, orderID string) error {
 // GetOrderBook gets the order book for a symbol
 // This implements the GridTrader interface for FuturesTrader
 func (t *FuturesTrader) GetOrderBook(symbol string, depth int) (bids, asks [][]float64, err error) {
+	if err := CheckCircuitBreaker(); err != nil {
+		return nil, nil, err
+	}
 	book, err := t.client.NewDepthService().
 		Symbol(symbol).
 		Limit(depth).
@@ -1112,6 +1209,9 @@ func (t *FuturesTrader) GetOrderBook(symbol string, depth int) (bids, asks [][]f
 // CancelStopOrders cancels take-profit/stop-loss orders for this symbol (used to adjust TP/SL positions)
 // Now uses both legacy API and new Algo Order API (Binance migrated stop orders to Algo system)
 func (t *FuturesTrader) CancelStopOrders(symbol string) error {
+	if err := CheckCircuitBreaker(); err != nil {
+		return err
+	}
 	canceledCount := 0
 
 	// 1. Cancel legacy stop orders (for backward compatibility)
@@ -1281,6 +1381,10 @@ func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity
 		Do(context.Background())
 
 	if err != nil {
+		if strings.Contains(err.Error(), "-4509") || strings.Contains(err.Error(), "positions are available") {
+			logger.Infof("  ⚠ Binance reports no position for stop-loss, clearing cache: %s %s", symbol, positionSide)
+			t.ForceZeroPositionInCache(symbol, positionSide)
+		}
 		return fmt.Errorf("failed to set stop-loss: %w", err)
 	}
 
@@ -1315,6 +1419,10 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 		Do(context.Background())
 
 	if err != nil {
+		if strings.Contains(err.Error(), "-4509") || strings.Contains(err.Error(), "positions are available") {
+			logger.Infof("  ⚠ Binance reports no position for take-profit, clearing cache: %s %s", symbol, positionSide)
+			t.ForceZeroPositionInCache(symbol, positionSide)
+		}
 		return fmt.Errorf("failed to set take-profit: %w", err)
 	}
 

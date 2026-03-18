@@ -11,6 +11,7 @@ import (
 const (
 	minOrderSyncInterval  = 2 * time.Minute
 	balanceCacheMaxAge    = 5 * time.Minute
+	positionCacheMaxAge   = 5 * time.Second
 )
 
 // GlobalSyncManager 全局同步管理器（单例模式）
@@ -23,6 +24,9 @@ type GlobalSyncManager struct {
 
 	// 全局余额缓存
 	balanceCache map[string]*balanceCacheEntry // key: accountKey
+
+	// 全局仓位缓存
+	positionCache map[string]*positionCacheEntry // key: accountKey
 }
 
 type exchangeSyncer struct {
@@ -46,6 +50,11 @@ type balanceCacheEntry struct {
 	timestamp time.Time
 }
 
+type positionCacheEntry struct {
+	positions []map[string]interface{}
+	timestamp time.Time
+}
+
 // 全局同步管理器实例
 var (
 	globalSyncManager     *GlobalSyncManager
@@ -56,8 +65,9 @@ var (
 func GetGlobalSyncManager() *GlobalSyncManager {
 	globalSyncManagerOnce.Do(func() {
 		globalSyncManager = &GlobalSyncManager{
-			syncers:      make(map[string]*exchangeSyncer),
-			balanceCache: make(map[string]*balanceCacheEntry),
+			syncers:       make(map[string]*exchangeSyncer),
+			balanceCache:  make(map[string]*balanceCacheEntry),
+			positionCache: make(map[string]*positionCacheEntry),
 		}
 		logger.Infof("🌐 GlobalSyncManager initialized")
 	})
@@ -189,6 +199,75 @@ func (gsm *GlobalSyncManager) SetBalance(accountKey string, balance map[string]i
 		balance:   copied,
 		timestamp: time.Now(),
 	}
+}
+
+// GetPositions 获取仓位缓存。
+// maxAge<=0 时默认仅信任最近 5 秒数据，避免多个组件重复打仓位 REST。
+func (gsm *GlobalSyncManager) GetPositions(accountKey string, maxAge time.Duration) ([]map[string]interface{}, bool) {
+	if maxAge <= 0 {
+		maxAge = positionCacheMaxAge
+	}
+
+	gsm.mu.RLock()
+	entry, exists := gsm.positionCache[accountKey]
+	gsm.mu.RUnlock()
+
+	if !exists || time.Since(entry.timestamp) > maxAge {
+		return nil, false
+	}
+
+	result := make([]map[string]interface{}, len(entry.positions))
+	for i, pos := range entry.positions {
+		copied := make(map[string]interface{}, len(pos))
+		for k, v := range pos {
+			copied[k] = v
+		}
+		result[i] = copied
+	}
+	return result, true
+}
+
+// SetPositions 设置仓位缓存。
+func (gsm *GlobalSyncManager) SetPositions(accountKey string, positions []map[string]interface{}) {
+	if accountKey == "" || positions == nil {
+		return
+	}
+
+	copied := make([]map[string]interface{}, len(positions))
+	for i, pos := range positions {
+		posCopy := make(map[string]interface{}, len(pos))
+		for k, v := range pos {
+			posCopy[k] = v
+		}
+		copied[i] = posCopy
+	}
+
+	gsm.mu.Lock()
+	gsm.positionCache[accountKey] = &positionCacheEntry{
+		positions: copied,
+		timestamp: time.Now(),
+	}
+	gsm.mu.Unlock()
+}
+
+// ClearBalance removes cached balance for an exchange account.
+func (gsm *GlobalSyncManager) ClearBalance(accountKey string) {
+	if accountKey == "" {
+		return
+	}
+	gsm.mu.Lock()
+	delete(gsm.balanceCache, accountKey)
+	gsm.mu.Unlock()
+}
+
+// ClearPositions removes cached positions for an exchange account.
+func (gsm *GlobalSyncManager) ClearPositions(accountKey string) {
+	if accountKey == "" {
+		return
+	}
+	gsm.mu.Lock()
+	delete(gsm.positionCache, accountKey)
+	gsm.mu.Unlock()
 }
 
 // runExchangeSync 运行交易所同步协程

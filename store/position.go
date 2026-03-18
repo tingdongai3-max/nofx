@@ -974,6 +974,20 @@ type RecentTradeWithReasoning struct {
 	CloseReason      string `json:"close_reason"`       // 系统平仓触发点：StopLoss / TakeProfit / sync 等
 }
 
+type CoachFailureCase struct {
+	TraderID              string  `json:"trader_id"`
+	Symbol                string  `json:"symbol"`
+	Side                  string  `json:"side"`
+	RealizedPnL           float64 `json:"realized_pnl"`
+	PnLPct                float64 `json:"pnl_pct"`
+	MAEPct                float64 `json:"mae_pct"`
+	MFEPct                float64 `json:"mfe_pct"`
+	CloseReason           string  `json:"close_reason"`
+	AiReasoningAtOpen     string  `json:"ai_reasoning_at_open"`
+	EntryTime             int64   `json:"entry_time"`
+	ExitTime              int64   `json:"exit_time"`
+}
+
 // SymbolExcursionSummary aggregates historical MAE/MFE behavior for one symbol.
 type SymbolExcursionSummary struct {
 	Symbol           string  `json:"symbol"`
@@ -1133,6 +1147,85 @@ func (s *PositionStore) GetRecentTradesWithReasoningBySource(traderID string, li
 		trades = append(trades, t)
 	}
 	return trades, nil
+}
+
+func (s *PositionStore) GetRecentTradesWithReasoningBySourceSince(traderID string, limit int, source string, resetAt time.Time) ([]RecentTradeWithReasoning, error) {
+	q := s.closedPositionsQuery(traderID, source, resetAt)
+	var positions []TraderPosition
+	err := q.Order("exit_time DESC").Limit(limit).Find(&positions).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to query recent trades: %w", err)
+	}
+	var trades []RecentTradeWithReasoning
+	for _, pos := range positions {
+		t := RecentTradeWithReasoning{
+			RecentTrade: RecentTrade{
+				Symbol:      pos.Symbol,
+				Side:        strings.ToLower(pos.Side),
+				EntryPrice:  pos.EntryPrice,
+				ExitPrice:   pos.ExitPrice,
+				RealizedPnL: pos.RealizedPnL,
+				EntryTime:   pos.EntryTime / 1000,
+			},
+			PositionID:        pos.ID,
+			AiReasoningAtOpen: pos.AiReasoningAtOpen,
+			CloseReason:       pos.CloseReason,
+		}
+		if pos.ExitTime > 0 {
+			t.ExitTime = pos.ExitTime / 1000
+			t.HoldDuration = formatDurationMs(pos.ExitTime - pos.EntryTime)
+		}
+		if pos.EntryPrice > 0 {
+			if t.Side == "long" {
+				t.PnLPct = (pos.ExitPrice - pos.EntryPrice) / pos.EntryPrice * 100 * float64(pos.Leverage)
+			} else {
+				t.PnLPct = (pos.EntryPrice - pos.ExitPrice) / pos.EntryPrice * 100 * float64(pos.Leverage)
+			}
+		}
+		trades = append(trades, t)
+	}
+	return trades, nil
+}
+
+func (s *PositionStore) GetWorstFailureCasesBySourceSince(traderID, source string, resetAt time.Time, limit int) ([]CoachFailureCase, error) {
+	var positions []TraderPosition
+	q := s.closedPositionsQuery(traderID, source, resetAt).
+		Where("realized_pnl < 0").
+		Order("max_adverse_excursion ASC, realized_pnl ASC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if err := q.Find(&positions).Error; err != nil {
+		return nil, fmt.Errorf("failed to query failure cases: %w", err)
+	}
+
+	result := make([]CoachFailureCase, 0, len(positions))
+	for _, pos := range positions {
+		notional := pos.EntryPrice * pos.Quantity
+		if notional <= 0 {
+			continue
+		}
+		pnlPct := 0.0
+		if strings.EqualFold(pos.Side, "LONG") {
+			pnlPct = (pos.ExitPrice - pos.EntryPrice) / pos.EntryPrice * 100 * float64(pos.Leverage)
+		} else {
+			pnlPct = (pos.EntryPrice - pos.ExitPrice) / pos.EntryPrice * 100 * float64(pos.Leverage)
+		}
+		result = append(result, CoachFailureCase{
+			TraderID:          traderID,
+			Symbol:            pos.Symbol,
+			Side:              strings.ToLower(pos.Side),
+			RealizedPnL:       pos.RealizedPnL,
+			PnLPct:            pnlPct,
+			MAEPct:            pos.MaxAdverseExcursion / notional * 100,
+			MFEPct:            pos.MaxFavorableExcursion / notional * 100,
+			CloseReason:       pos.CloseReason,
+			AiReasoningAtOpen: pos.AiReasoningAtOpen,
+			EntryTime:         pos.EntryTime,
+			ExitTime:          pos.ExitTime,
+		})
+	}
+	return result, nil
 }
 
 // GetClosedCountSince 返回自某时刻（Unix 毫秒）以来被平仓的仓位数量（用于「未决策期间空档复盘」ALERT）
@@ -2063,6 +2156,40 @@ func (s *PositionStore) CreateOpenPosition(pos *TraderPosition) error {
 	}
 
 	return nil
+}
+
+// RecordVirtualTrade records a local-only OPEN position for shadow execution.
+func (s *PositionStore) RecordVirtualTrade(traderID, exchangeID, exchangeType, symbol, side string, quantity, entryPrice float64, leverage int, aiReasoning string) (*TraderPosition, error) {
+	if quantity <= 0 || entryPrice <= 0 {
+		return nil, fmt.Errorf("invalid virtual trade payload")
+	}
+
+	normSymbol := strings.ToUpper(strings.TrimSpace(symbol))
+	normSide := strings.ToUpper(strings.TrimSpace(side))
+	nowMs := time.Now().UTC().UnixMilli()
+	pos := &TraderPosition{
+		TraderID:           traderID,
+		ExchangeID:         exchangeID,
+		ExchangeType:       exchangeType,
+		ExchangePositionID: fmt.Sprintf("shadow_%s_%s_%d", normSymbol, normSide, nowMs),
+		Symbol:             normSymbol,
+		Side:               normSide,
+		Quantity:           quantity,
+		EntryQuantity:      quantity,
+		EntryPrice:         entryPrice,
+		EntryOrderID:       fmt.Sprintf("shadow_entry_%d", nowMs),
+		EntryTime:          nowMs,
+		Leverage:           leverage,
+		Status:             "OPEN",
+		Source:             "shadow",
+		AiReasoningAtOpen:  aiReasoning,
+		CreatedAt:          nowMs,
+		UpdatedAt:          nowMs,
+	}
+	if err := s.CreateOpenPosition(pos); err != nil {
+		return nil, err
+	}
+	return pos, nil
 }
 
 // ClosePositionWithAccurateData closes a position with accurate data from exchange.
