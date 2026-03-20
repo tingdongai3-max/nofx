@@ -26,12 +26,18 @@ func (at *AutoTrader) executeDryRunOrder(decision *kernel.Decision, actionRecord
 	switch action {
 	case "open_long":
 		return at.executeDryRunOpenLong(decision, actionRecord, aiReasoning)
+	case "open_long_limit":
+		return at.executeDryRunOpenLong(decision, actionRecord, aiReasoning)
 	case "open_short":
+		return at.executeDryRunOpenShort(decision, actionRecord, aiReasoning)
+	case "open_short_limit":
 		return at.executeDryRunOpenShort(decision, actionRecord, aiReasoning)
 	case "close_long":
 		return at.executeDryRunCloseLong(decision, actionRecord)
 	case "close_short":
 		return at.executeDryRunCloseShort(decision, actionRecord)
+	case "cancel_order":
+		return nil
 	default:
 		if silentDryRunActions[strings.ToLower(strings.TrimSpace(action))] {
 			return nil
@@ -102,6 +108,8 @@ func (at *AutoTrader) executeDryRunOpenLong(decision *kernel.Decision, actionRec
 		Quantity:            quantity,
 		EntryQuantity:       quantity,
 		EntryPrice:          price,
+		TakeProfit:          decision.TakeProfit,
+		StopLoss:            decision.StopLoss,
 		EntryOrderID:        orderID,
 		EntryTime:           nowMs,
 		Leverage:            decision.Leverage,
@@ -161,6 +169,8 @@ func (at *AutoTrader) executeDryRunOpenShort(decision *kernel.Decision, actionRe
 		Quantity:            quantity,
 		EntryQuantity:       quantity,
 		EntryPrice:          price,
+		TakeProfit:          decision.TakeProfit,
+		StopLoss:            decision.StopLoss,
 		EntryOrderID:        orderID,
 		EntryTime:           nowMs,
 		Leverage:            decision.Leverage,

@@ -716,6 +716,7 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 	traderConfig := trader.AutoTraderConfig{
 		ID:                    traderCfg.ID,
 		Name:                  traderCfg.Name,
+		AIModelID:             traderCfg.AIModelID,
 		AIModel:               aiModelCfg.Provider,
 		Exchange:              exchangeCfg.ExchangeType, // Exchange type: binance/bybit/okx/etc
 		ExchangeID:            exchangeCfg.ID,           // Exchange account UUID (for multi-account)
@@ -735,6 +736,7 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 		IsDryRun:             traderCfg.IsDryRun,
 		IsShadow:             traderCfg.IsShadow,
 		VirtualEquity:        traderCfg.VirtualEquity,
+		EnableLimitEntry:     traderCfg.EnableLimitEntry,
 		ResetTimestamp:       traderCfg.ResetTimestamp,
 		StrategyConfig:       strategyConfig,
 	}

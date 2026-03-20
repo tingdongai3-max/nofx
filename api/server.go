@@ -46,6 +46,9 @@ import (
 const (
 	accountPositionsCacheTTL        = 1 * time.Second
 	accountPositionsCacheTTLDryRun  = 1 * time.Second // 配合前端实时价重算，减少账户/持仓接口缓存滞后
+	variantLabDefaultWindow         = 72 * time.Hour
+	variantLabMaxCurvePoints        = 720
+	variantLabCoachLogLimit         = 8
 )
 
 type ttlCacheEntry struct {
@@ -80,6 +83,96 @@ func normalizeResetTimestamp(t time.Time) time.Time {
 		return time.Time{}
 	}
 	return t.UTC().Truncate(time.Second)
+}
+
+func parseEquityWindowHours(raw string, defaultHours int) int {
+	hours := defaultHours
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return hours
+	}
+	if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+		return parsed
+	}
+	if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+		return int(parsed.Hours())
+	}
+	return hours
+}
+
+func sampleHistoryPoints[T any](points []T, maxPoints int) []T {
+	if maxPoints <= 0 || len(points) <= maxPoints {
+		return points
+	}
+
+	sampled := make([]T, 0, maxPoints)
+	lastIndex := len(points) - 1
+	lastAppendedIdx := -1
+	for i := 0; i < maxPoints; i++ {
+		idx := int(math.Round(float64(i*lastIndex) / float64(maxPoints-1)))
+		if idx < 0 {
+			idx = 0
+		}
+		if idx > lastIndex {
+			idx = lastIndex
+		}
+		if idx == lastAppendedIdx {
+			continue
+		}
+		sampled = append(sampled, points[idx])
+		lastAppendedIdx = idx
+	}
+	if lastAppendedIdx != lastIndex {
+		sampled = append(sampled, points[lastIndex])
+	}
+	return sampled
+}
+
+func computeVariantPerformance(snapshots []*store.EquitySnapshot, initialBalance, virtualEquity float64) (float64, float64, float64) {
+	if len(snapshots) == 0 {
+		baseline := initialBalance
+		if baseline <= 0 {
+			baseline = virtualEquity
+		}
+		return baseline, 0, 0
+	}
+
+	baseline := initialBalance
+	if baseline <= 0 {
+		baseline = virtualEquity
+	}
+	if baseline <= 0 && snapshots[0].TotalEquity > 0 {
+		baseline = snapshots[0].TotalEquity
+	}
+
+	peak := 0.0
+	drawdown := 0.0
+	for _, snap := range snapshots {
+		if snap.TotalEquity > peak {
+			peak = snap.TotalEquity
+		}
+		if peak > 0 {
+			drawdown = math.Max(drawdown, ((peak-snap.TotalEquity)/peak)*100)
+		}
+	}
+
+	lastEquity := snapshots[len(snapshots)-1].TotalEquity
+	returnPct := 0.0
+	if baseline > 0 {
+		returnPct = ((lastEquity - baseline) / baseline) * 100
+	}
+	return lastEquity, returnPct, drawdown
+}
+
+func (s *Server) scheduleVariantCleanup(traderID string, cutoff time.Time) {
+	if traderID == "" || cutoff.IsZero() {
+		return
+	}
+	go func() {
+		if err := s.store.CleanupTraderVariantDataBefore(traderID, cutoff); err != nil {
+			logger.Warnf("failed to cleanup stale variant data for trader %s: %v", traderID, err)
+		}
+	}()
 }
 
 // Server HTTP API server
@@ -577,6 +670,7 @@ type CreateTraderRequest struct {
 	UseOITop             bool   `json:"use_oi_top"`
 	IsDryRun             bool   `json:"is_dry_run"`
 	VirtualEquity        float64 `json:"virtual_equity"`
+	EnableLimitEntry     bool    `json:"enable_limit_entry"`
 }
 
 type CreateExperimentRequest struct {
@@ -585,17 +679,22 @@ type CreateExperimentRequest struct {
 }
 
 type ColliderVariantPayload struct {
-	TraderID           string                 `json:"trader_id"`
-	TraderName         string                 `json:"trader_name"`
-	IsShadow           bool                   `json:"is_shadow"`
-	IsRunning          bool                   `json:"is_running"`
-	ResetTimestamp     time.Time              `json:"reset_timestamp"`
-	CustomPrompt       string                 `json:"custom_prompt"`
-	SystemPromptTemplate string               `json:"system_prompt_template"`
-	InitialBalance     float64                `json:"initial_balance"`
-	VirtualEquity      float64                `json:"virtual_equity"`
-	Decisions          []*store.DecisionRecord `json:"decisions"`
-	EquitySnapshots    []*store.EquitySnapshot `json:"equity_snapshots"`
+	TraderID             string                    `json:"trader_id"`
+	TraderName           string                    `json:"trader_name"`
+	IsShadow             bool                      `json:"is_shadow"`
+	IsRunning            bool                      `json:"is_running"`
+	ResetTimestamp       time.Time                 `json:"reset_timestamp"`
+	CustomPrompt         string                    `json:"custom_prompt"`
+	SystemPromptTemplate string                    `json:"system_prompt_template"`
+	InitialBalance       float64                   `json:"initial_balance"`
+	VirtualEquity        float64                   `json:"virtual_equity"`
+	DecisionCount        int                       `json:"decision_count"`
+	EquityLast           float64                   `json:"equity_last"`
+	ReturnPct            float64                   `json:"return_pct"`
+	DrawdownPct          float64                   `json:"drawdown_pct"`
+	Decisions            []*store.DecisionRecord   `json:"decisions"`
+	EquitySnapshots      []*store.EquitySnapshot   `json:"equity_snapshots"`
+	CoachLogs            []*store.ExperimentLogRecord `json:"coach_logs"`
 }
 
 type ColliderExperimentPayload struct {
@@ -818,7 +917,8 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		ScanIntervalMinutes:  scanIntervalMinutes,
 		IsRunning:            false,
 		IsDryRun:             req.IsDryRun,
-		VirtualEquity:       req.VirtualEquity,
+		VirtualEquity:        req.VirtualEquity,
+		EnableLimitEntry:     req.EnableLimitEntry,
 	}
 	if traderRecord.VirtualEquity <= 0 && traderRecord.IsDryRun {
 		traderRecord.VirtualEquity = 10000
@@ -910,6 +1010,7 @@ func (s *Server) handleCreateExperiment(c *gin.Context) {
 			ShowInCompetition:    false,
 			IsDryRun:             false,
 			VirtualEquity:        virtualEquity,
+			EnableLimitEntry:     master.EnableLimitEntry,
 			ResetTimestamp:       master.ResetTimestamp,
 			BTCETHLeverage:       master.BTCETHLeverage,
 			AltcoinLeverage:      master.AltcoinLeverage,
@@ -971,7 +1072,7 @@ func (s *Server) handleListExperiments(c *gin.Context) {
 		return
 	}
 
-	window := 72 * time.Hour
+	window := variantLabDefaultWindow
 	if raw := strings.TrimSpace(c.Query("window")); raw != "" {
 		if parsed, parseErr := time.ParseDuration(raw); parseErr == nil && parsed > 0 {
 			window = parsed
@@ -984,6 +1085,11 @@ func (s *Server) handleListExperiments(c *gin.Context) {
 	for _, exp := range experiments {
 		traderIDs := append([]string{exp.MasterTraderID}, exp.ShadowTraderIDs...)
 		variants := make([]ColliderVariantPayload, 0, len(traderIDs))
+		experimentLogs, err := s.store.ExperimentLog().ListRecentByExperiment(exp.ID, variantLabCoachLogLimit)
+		if err != nil {
+			SafeInternalError(c, "Failed to list experiment logs", err)
+			return
+		}
 
 		for _, traderID := range traderIDs {
 			traderCfg, getErr := s.store.Trader().GetByID(traderID)
@@ -998,8 +1104,22 @@ func (s *Server) handleListExperiments(c *gin.Context) {
 				}
 			}
 
-			decisions, _ := s.store.Decision().GetByTimeRange(traderID, start, end)
-			equity, _ := s.store.Equity().GetByTimeRange(traderID, start, end)
+			equity, _ := s.store.Equity().GetByTimeRangeSince(traderID, start, end, traderCfg.ResetTimestamp)
+			decisionCount, _ := s.store.Decision().CountRecordsInRangeSince(traderID, start, end, traderCfg.ResetTimestamp)
+			equityLast, returnPct, drawdownPct := computeVariantPerformance(
+				equity,
+				traderCfg.InitialBalance,
+				traderCfg.VirtualEquity,
+			)
+			variantLogs := make([]*store.ExperimentLogRecord, 0)
+			for _, log := range experimentLogs {
+				for _, replacedID := range log.ReplacedTraderIDs {
+					if replacedID == traderID {
+						variantLogs = append(variantLogs, log)
+						break
+					}
+				}
+			}
 			variants = append(variants, ColliderVariantPayload{
 				TraderID:             traderCfg.ID,
 				TraderName:           traderCfg.Name,
@@ -1010,8 +1130,13 @@ func (s *Server) handleListExperiments(c *gin.Context) {
 				SystemPromptTemplate: traderCfg.SystemPromptTemplate,
 				InitialBalance:       traderCfg.InitialBalance,
 				VirtualEquity:        traderCfg.VirtualEquity,
-				Decisions:            decisions,
-				EquitySnapshots:      equity,
+				DecisionCount:        decisionCount,
+				EquityLast:           equityLast,
+				ReturnPct:            returnPct,
+				DrawdownPct:          drawdownPct,
+				Decisions:            []*store.DecisionRecord{},
+				EquitySnapshots:      []*store.EquitySnapshot{},
+				CoachLogs:            variantLogs,
 			})
 		}
 
@@ -1041,11 +1166,13 @@ type UpdateTraderRequest struct {
 	BTCETHLeverage       int    `json:"btc_eth_leverage"`
 	AltcoinLeverage      int    `json:"altcoin_leverage"`
 	TradingSymbols       string `json:"trading_symbols"`
-	CustomPrompt         string `json:"custom_prompt"`
-	OverrideBasePrompt   bool   `json:"override_base_prompt"`
+	CustomPrompt         *string `json:"custom_prompt"`
+	OverrideBasePrompt   *bool   `json:"override_base_prompt"`
 	SystemPromptTemplate string  `json:"system_prompt_template"`
-	IsDryRun             *bool   `json:"is_dry_run"`
+	IsDryRun             *bool    `json:"is_dry_run"`
+	IsShadow             *bool    `json:"is_shadow"`
 	VirtualEquity        *float64 `json:"virtual_equity"`
+	EnableLimitEntry     *bool    `json:"enable_limit_entry"`
 }
 
 type coachConfigPayload struct {
@@ -1168,6 +1295,14 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 	if systemPromptTemplate == "" {
 		systemPromptTemplate = existingTrader.SystemPromptTemplate // Keep original value
 	}
+	customPrompt := existingTrader.CustomPrompt
+	if req.CustomPrompt != nil {
+		customPrompt = *req.CustomPrompt
+	}
+	overrideBasePrompt := existingTrader.OverrideBasePrompt
+	if req.OverrideBasePrompt != nil {
+		overrideBasePrompt = *req.OverrideBasePrompt
+	}
 
 	// Handle strategy ID (if not provided, keep original value)
 	strategyID := req.StrategyID
@@ -1178,6 +1313,13 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 	isDryRun := existingTrader.IsDryRun
 	if req.IsDryRun != nil {
 		isDryRun = *req.IsDryRun
+	}
+	isShadow := existingTrader.IsShadow
+	if req.IsShadow != nil {
+		isShadow = *req.IsShadow
+	}
+	if req.IsDryRun != nil && !isDryRun {
+		isShadow = false
 	}
 
 	virtualEquity := existingTrader.VirtualEquity
@@ -1191,12 +1333,17 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		virtualEquity = 0
 	}
 
+	enableLimitEntry := existingTrader.EnableLimitEntry
+	if req.EnableLimitEntry != nil {
+		enableLimitEntry = *req.EnableLimitEntry
+	}
+
 	initialBalance := req.InitialBalance
 	if initialBalance <= 0 {
 		initialBalance = existingTrader.InitialBalance
 	}
 
-	// Mode switch: re-anchor initial balance to current equity
+	// Mode switch: entering dry_run re-anchors virtual capital to the current live account state.
 	if req.IsDryRun != nil && isDryRun != existingTrader.IsDryRun {
 		if isDryRun {
 			exchangeType := "binance"
@@ -1248,13 +1395,13 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		AIModelID:            req.AIModelID,
 		ExchangeID:           req.ExchangeID,
 		StrategyID:           strategyID, // Associated strategy ID
-		IsShadow:             existingTrader.IsShadow,
+		IsShadow:             isShadow,
 		InitialBalance:       initialBalance,
 		BTCETHLeverage:       btcEthLeverage,
 		AltcoinLeverage:      altcoinLeverage,
 		TradingSymbols:       req.TradingSymbols,
-		CustomPrompt:         req.CustomPrompt,
-		OverrideBasePrompt:   req.OverrideBasePrompt,
+		CustomPrompt:         customPrompt,
+		OverrideBasePrompt:   overrideBasePrompt,
 		SystemPromptTemplate: systemPromptTemplate,
 		IsCrossMargin:        isCrossMargin,
 		ShowInCompetition:    showInCompetition,
@@ -1262,6 +1409,7 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		IsRunning:            existingTrader.IsRunning, // Keep original value
 		IsDryRun:             isDryRun,
 		VirtualEquity:        virtualEquity,
+		EnableLimitEntry:     enableLimitEntry,
 	}
 
 	// Check if trader was running before update (we'll restart it after)
@@ -1278,12 +1426,12 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 	logger.Infof("🔄 Updating trader: ID=%s, Name=%s, AIModelID=%s, StrategyID=%s, ScanInterval=%d min, IsDryRun=%v, VirtualEquity=%.2f",
 		traderRecord.ID, traderRecord.Name, traderRecord.AIModelID, traderRecord.StrategyID, scanIntervalMinutes,
 		traderRecord.IsDryRun, traderRecord.VirtualEquity)
+	cleanupCutoff := normalizeResetTimestamp(time.Now())
 	err = s.store.Trader().Update(traderRecord)
 	if err != nil {
 		SafeInternalError(c, "Failed to update trader", err)
 		return
 	}
-
 	// Remove old trader from memory first (this also stops if running)
 	s.traderManager.RemoveTrader(traderID)
 
@@ -1306,6 +1454,7 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 	}
 
 	logger.Infof("✓ Trader updated successfully: %s (model: %s, exchange: %s, strategy: %s)", req.Name, req.AIModelID, req.ExchangeID, strategyID)
+	s.scheduleVariantCleanup(traderID, cleanupCutoff)
 
 	c.JSON(http.StatusOK, gin.H{
 		"trader_id":   traderID,
@@ -1603,6 +1752,7 @@ func (s *Server) handleUpdateTraderPrompt(c *gin.Context) {
 	}
 
 	// Update database
+	cleanupCutoff := normalizeResetTimestamp(time.Now())
 	err := s.store.Trader().UpdateCustomPrompt(userID, traderID, req.CustomPrompt, req.OverrideBasePrompt)
 	if err != nil {
 		SafeInternalError(c, "Failed to update custom prompt", err)
@@ -1616,6 +1766,7 @@ func (s *Server) handleUpdateTraderPrompt(c *gin.Context) {
 		trader.SetOverrideBasePrompt(req.OverrideBasePrompt)
 		logger.Infof("✓ Updated trader %s custom prompt (override base=%v)", trader.GetName(), req.OverrideBasePrompt)
 	}
+	s.scheduleVariantCleanup(traderID, cleanupCutoff)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Custom prompt updated"})
 }
@@ -2207,33 +2358,14 @@ func (s *Server) handleUpdateModelConfigs(c *gin.Context) {
 		logger.Infof("🔓 Decrypted model config data (UserID: %s)", userID)
 	}
 
-	// Update each model's configuration and track traders that need reload
-	tradersToReload := make(map[string]bool)
+	// Update each model's configuration in DB only.
+	// Running traders refresh AI config at the start of the next cycle, so current calls are not interrupted.
 	for modelID, modelData := range req.Models {
-		// Find traders using this AI model BEFORE updating
-		traders, _ := s.store.Trader().ListByAIModelID(userID, modelID)
-		for _, t := range traders {
-			tradersToReload[t.ID] = true
-		}
-
 		err := s.store.AIModel().Update(userID, modelID, modelData.Enabled, modelData.APIKey, modelData.CustomAPIURL, modelData.CustomModelName)
 		if err != nil {
 			SafeInternalError(c, fmt.Sprintf("Update model %s", modelID), err)
 			return
 		}
-	}
-
-	// Remove affected traders from memory BEFORE reloading to pick up new config
-	for traderID := range tradersToReload {
-		logger.Infof("🔄 Removing trader %s from memory to reload with new AI model config", traderID)
-		s.traderManager.RemoveTrader(traderID)
-	}
-
-	// Reload all traders for this user to make new config take effect immediately
-	err = s.traderManager.LoadUserTradersFromStore(s.store, userID)
-	if err != nil {
-		logger.Infof("⚠️ Failed to reload user traders into memory: %v", err)
-		// Don't return error here since model config was successfully updated to database
 	}
 
 	logger.Infof("✓ AI model config updated: %+v", req.Models)
@@ -2566,6 +2698,7 @@ func (s *Server) handleTraderList(c *gin.Context) {
 			"system_prompt_template": trader.SystemPromptTemplate,
 			"is_dry_run":          trader.IsDryRun,
 			"virtual_equity":      trader.VirtualEquity,
+			"enable_limit_entry":  trader.EnableLimitEntry,
 		})
 	}
 
@@ -2622,6 +2755,7 @@ func (s *Server) handleGetTraderConfig(c *gin.Context) {
 		"is_running":            isRunning,
 		"is_dry_run":            traderConfig.IsDryRun,
 		"virtual_equity":        traderConfig.VirtualEquity,
+		"enable_limit_entry":    traderConfig.EnableLimitEntry,
 	}
 
 	c.JSON(http.StatusOK, result)
@@ -2804,10 +2938,7 @@ func (s *Server) handlePositions(c *gin.Context) {
 			exchangeType = exchangeCfg.ExchangeType
 		}
 		out := make([]map[string]interface{}, 0, len(openPositions))
-		trailingActivationMode := "price_move"
-		if strategyTrailingActivationPct > 0 {
-			trailingActivationMode = "tp_progress"
-		}
+		trailingActivationMode := "tp_progress"
 		for _, pos := range openPositions {
 			markPrice := pos.EntryPrice
 			if data, errMarket := market.GetWithExchange(pos.Symbol, exchangeType, nil); errMarket == nil {
@@ -2922,18 +3053,28 @@ func normalizePositionsForFrontend(positions []map[string]interface{}, defaultTr
 		safetyFloorSL := toFloat64(p["safetyFloorSL"], p["safety_floor_sl"])
 		trailingActivationPct := toFloat64(p["trailingActivationPct"], p["trailing_activation_pct"])
 		trailingRetracePct := toFloat64(p["trailingRetracePct"], p["trailing_retrace_pct"])
-		trailingActivationMode, _ := p["trailing_activation_mode"].(string)
-		if trailingActivationPct <= 0 {
-			trailingActivationPct = defaultTrailingActivationPct
-			if trailingActivationPct > 0 {
-				trailingActivationMode = "tp_progress"
+		hasNativeTP, _ := p["has_native_tp"].(bool)
+		var tpOrderIDs []string
+		switch ids := p["tp_order_ids"].(type) {
+		case []string:
+			tpOrderIDs = append(tpOrderIDs, ids...)
+		case []interface{}:
+			for _, raw := range ids {
+				if s, ok := raw.(string); ok && s != "" {
+					tpOrderIDs = append(tpOrderIDs, s)
+				}
 			}
 		}
-		if trailingActivationMode == "" {
-			trailingActivationMode = "price_move"
+		if trailingActivationPct <= 0 {
+			trailingActivationPct = defaultTrailingActivationPct
 		}
 		if trailingRetracePct <= 0 {
 			trailingRetracePct = defaultTrailingRetracePct
+		}
+		hasTrailingTarget := takeProfit > 0
+		if !hasTrailingTarget {
+			trailingActivationPct = 0
+			trailingRetracePct = 0
 		}
 		side, _ := p["side"].(string)
 		if side == "" {
@@ -2957,8 +3098,10 @@ func normalizePositionsForFrontend(positions []map[string]interface{}, defaultTr
 			"margin_used":        marginUsed,
 			"stop_loss":          stopLoss,
 			"take_profit":        takeProfit,
+			"has_native_tp":      hasNativeTP || len(tpOrderIDs) > 0,
+			"tp_order_ids":       tpOrderIDs,
 			"safety_floor_sl":    safetyFloorSL,
-			"trailing_activation_mode": trailingActivationMode,
+			"trailing_activation_mode": "tp_progress",
 			"trailing_activation_pct": trailingActivationPct,
 			"trailing_retrace_pct":    trailingRetracePct,
 		})
@@ -4301,9 +4444,15 @@ func (s *Server) handleEquityHistory(c *gin.Context) {
 		return
 	}
 
-	// Get equity historical data from new equity table
-	// Every 3 minutes per cycle: 10000 records = about 20 days of data
-	snapshots, err := s.store.Equity().GetLatest(traderID, 10000)
+	hours := parseEquityWindowHours(c.Query("hours"), int(variantLabDefaultWindow.Hours()))
+	end := time.Now().UTC()
+	start := end.Add(-time.Duration(hours) * time.Hour)
+	resetAt := time.Time{}
+	if traderCfg, getErr := s.store.Trader().GetByID(traderID); getErr == nil && traderCfg != nil {
+		resetAt = traderCfg.ResetTimestamp
+	}
+
+	snapshots, err := s.store.Equity().GetByTimeRangeSince(traderID, start, end, resetAt)
 	if err != nil {
 		SafeInternalError(c, "Get historical data", err)
 		return
@@ -4331,7 +4480,7 @@ func (s *Server) handleEquityHistory(c *gin.Context) {
 		initialBalance = 1 // Avoid division by zero
 	}
 
-	var history []EquityPoint
+	history := make([]EquityPoint, 0, len(snapshots))
 	for _, snap := range snapshots {
 		// Calculate PnL percentage
 		totalPnLPct := 0.0
@@ -4350,7 +4499,7 @@ func (s *Server) handleEquityHistory(c *gin.Context) {
 		})
 	}
 
-	c.JSON(http.StatusOK, history)
+	c.JSON(http.StatusOK, sampleHistoryPoints(history, variantLabMaxCurvePoints))
 }
 
 // isLocalhost 是否为本地访问（127.0.0.1 或 ::1）
@@ -5022,14 +5171,18 @@ func (s *Server) handleEquityHistoryBatch(c *gin.Context) {
 // getEquityHistoryForTraders Get historical data for multiple traders
 // Query directly from database, not dependent on trader in memory (so historical data can be retrieved after restart)
 // Also appends current real-time data point to ensure chart matches leaderboard
-// hours: filter by last N hours (0 = use default limit of 500 records)
+// hours: filter by last N hours (0 = default 72h window)
 func (s *Server) getEquityHistoryForTraders(traderIDs []string, hours int) map[string]interface{} {
 	result := make(map[string]interface{})
 	histories := make(map[string]interface{})
 	errors := make(map[string]string)
 
 	// Use a single consistent timestamp for all real-time data points
-	now := time.Now()
+	now := time.Now().UTC()
+	if hours <= 0 {
+		hours = int(variantLabDefaultWindow.Hours())
+	}
+	startTime := now.Add(-time.Duration(hours) * time.Hour)
 
 	// Pre-fetch initial balances for all traders
 	initialBalances := make(map[string]float64)
@@ -5057,14 +5210,7 @@ func (s *Server) getEquityHistoryForTraders(traderIDs []string, hours int) map[s
 		var snapshots []*store.EquitySnapshot
 		var err error
 
-		if hours > 0 {
-			// Filter by time range
-			startTime := now.Add(-time.Duration(hours) * time.Hour)
-			snapshots, err = s.store.Equity().GetByTimeRangeSince(traderID, startTime, now, resetTimestamps[traderID])
-		} else {
-			// Default: get latest 500 records
-			snapshots, err = s.store.Equity().GetLatestSince(traderID, 500, resetTimestamps[traderID])
-		}
+		snapshots, err = s.store.Equity().GetByTimeRangeSince(traderID, startTime, now, resetTimestamps[traderID])
 		if err != nil {
 			logger.Errorf("[API] Failed to get equity history for %s: %v", traderID, err)
 			errors[traderID] = "Failed to get historical data"
@@ -5134,7 +5280,7 @@ func (s *Server) getEquityHistoryForTraders(traderIDs []string, hours int) map[s
 			}
 		}
 
-		histories[traderID] = history
+		histories[traderID] = sampleHistoryPoints(history, variantLabMaxCurvePoints)
 	}
 
 	result["histories"] = histories

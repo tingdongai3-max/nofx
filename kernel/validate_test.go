@@ -161,14 +161,14 @@ func TestValidateDecision_StagedTakeProfitMustBeTwoByFifty(t *testing.T) {
 	}
 }
 
-func TestValidateDecision_TrailingRetraceGuardrail(t *testing.T) {
+func TestValidateDecision_TrailingBounds(t *testing.T) {
 	tests := []struct {
 		name      string
 		decision   Decision
 		wantError bool
 	}{
 		{
-			name: "activation 5 retrace 2 allowed at 40 percent boundary",
+			name: "activation and retrace within 0 to 100 allowed",
 			decision: Decision{
 				Symbol:                "ETHUSDT",
 				Action:                "open_long",
@@ -176,13 +176,13 @@ func TestValidateDecision_TrailingRetraceGuardrail(t *testing.T) {
 				PositionSizeUSD:       100,
 				StopLoss:              2200,
 				TakeProfit:            2500,
-				TrailingActivationPct: 5,
-				TrailingRetracePct:    2,
+				TrailingActivationPct: 80,
+				TrailingRetracePct:    20,
 			},
 			wantError: false,
 		},
 		{
-			name: "activation 5 retrace 1 point 9 allowed",
+			name: "retrace 100 allowed",
 			decision: Decision{
 				Symbol:                "ETHUSDT",
 				Action:                "open_long",
@@ -190,13 +190,13 @@ func TestValidateDecision_TrailingRetraceGuardrail(t *testing.T) {
 				PositionSizeUSD:       100,
 				StopLoss:              2200,
 				TakeProfit:            2500,
-				TrailingActivationPct: 5,
-				TrailingRetracePct:    1.9,
+				TrailingActivationPct: 50,
+				TrailingRetracePct:    100,
 			},
 			wantError: false,
 		},
 		{
-			name: "activation 5 retrace 2 point 1 rejected",
+			name: "retrace above 100 rejected",
 			decision: Decision{
 				Symbol:                "ETHUSDT",
 				Action:                "open_long",
@@ -204,8 +204,22 @@ func TestValidateDecision_TrailingRetraceGuardrail(t *testing.T) {
 				PositionSizeUSD:       100,
 				StopLoss:              2200,
 				TakeProfit:            2500,
-				TrailingActivationPct: 5,
-				TrailingRetracePct:    2.1,
+				TrailingActivationPct: 50,
+				TrailingRetracePct:    100.1,
+			},
+			wantError: true,
+		},
+		{
+			name: "activation 100 rejected",
+			decision: Decision{
+				Symbol:                "ETHUSDT",
+				Action:                "open_long",
+				Leverage:              5,
+				PositionSizeUSD:       100,
+				StopLoss:              2200,
+				TakeProfit:            2500,
+				TrailingActivationPct: 100,
+				TrailingRetracePct:    20,
 			},
 			wantError: true,
 		},
@@ -221,6 +235,71 @@ func TestValidateDecision_TrailingRetraceGuardrail(t *testing.T) {
 				TrailingActivationPct: 5,
 			},
 			wantError: true,
+		},
+		{
+			name: "trailing requires explicit take profit target",
+			decision: Decision{
+				Symbol:                "ETHUSDT",
+				Action:                "open_long",
+				Leverage:              5,
+				PositionSizeUSD:       100,
+				StopLoss:              2200,
+				TrailingActivationPct: 60,
+				TrailingRetracePct:    25,
+			},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateDecision(&tt.decision, 1000, 10, 5, 10.0, 1.5, false)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("validateDecision() error = %v, wantError %v", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestValidateDecision_ATRTrailingRequiresTakeProfitMechanism(t *testing.T) {
+	tests := []struct {
+		name      string
+		decision   Decision
+		wantError bool
+	}{
+		{
+			name: "atr mode with sl only is rejected",
+			decision: Decision{
+				Symbol:          "ETHUSDT",
+				Action:          "open_long",
+				Leverage:        5,
+				PositionSizeUSD: 100,
+				ATRTrailingSlMult: 1.5,
+			},
+			wantError: true,
+		},
+		{
+			name: "atr mode with tp only is rejected",
+			decision: Decision{
+				Symbol:            "ETHUSDT",
+				Action:            "open_long",
+				Leverage:          5,
+				PositionSizeUSD:   100,
+				ATRTrailingTpMult: 3,
+			},
+			wantError: true,
+		},
+		{
+			name: "atr mode with both sl and tp is allowed",
+			decision: Decision{
+				Symbol:            "ETHUSDT",
+				Action:            "open_long",
+				Leverage:          5,
+				PositionSizeUSD:   100,
+				ATRTrailingSlMult: 1.5,
+				ATRTrailingTpMult: 3,
+			},
+			wantError: false,
 		},
 	}
 

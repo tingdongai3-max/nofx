@@ -37,6 +37,8 @@ interface FormState {
   initial_balance?: number
   is_dry_run: boolean
   virtual_equity: number
+  enable_limit_entry: boolean
+  custom_prompt: string
 }
 
 interface TraderConfigModalProps {
@@ -69,6 +71,8 @@ export function TraderConfigModal({
     scan_interval_minutes: 3,
     is_dry_run: false,
     virtual_equity: 10000,
+    enable_limit_entry: false,
+    custom_prompt: '',
   })
   const [isSaving, setIsSaving] = useState(false)
   const [strategies, setStrategies] = useState<Strategy[]>([])
@@ -109,6 +113,8 @@ export function TraderConfigModal({
         strategy_id: traderData.strategy_id || '',
         is_dry_run: traderData.is_dry_run ?? false,
         virtual_equity: traderData.virtual_equity ?? 10000,
+        enable_limit_entry: traderData.enable_limit_entry ?? false,
+        custom_prompt: traderData.custom_prompt ?? '',
       })
     } else if (!isEditMode) {
       setFormData({
@@ -121,6 +127,8 @@ export function TraderConfigModal({
         scan_interval_minutes: 3,
         is_dry_run: false,
         virtual_equity: 10000,
+        enable_limit_entry: false,
+        custom_prompt: '',
       })
     }
   }, [traderData, isEditMode, availableModels, availableExchanges])
@@ -177,6 +185,8 @@ export function TraderConfigModal({
         scan_interval_minutes: formData.scan_interval_minutes,
         is_dry_run: formData.is_dry_run,
         virtual_equity: formData.is_dry_run ? formData.virtual_equity : undefined,
+        enable_limit_entry: formData.enable_limit_entry,
+        custom_prompt: formData.custom_prompt,
       }
 
       // 只在编辑模式时包含initial_balance
@@ -489,6 +499,41 @@ export function TraderConfigModal({
                 </div>
                 <p className="text-xs text-[#848E9C] mt-1">
                   {language === 'zh' ? '开启后不向交易所发单，仅用当前价模拟成交并更新本地持仓与虚拟资金。' : 'When on, no real orders are sent; positions and virtual equity are updated locally.'}
+                </p>
+              </div>
+
+              <div>
+                <label className="text-sm text-[#EAECEF] block mb-2">
+                  挂单模式 (Limit Order Mode)
+                </label>
+                <label className="flex items-start gap-3 p-3 bg-[#1E2329] border border-[#2B3139] rounded-lg cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={formData.enable_limit_entry}
+                    onChange={(e) => handleInputChange('enable_limit_entry', e.target.checked)}
+                    className="mt-1 h-4 w-4 rounded border-[#404750] bg-[#0B0E11] text-[#F0B90B] focus:ring-[#F0B90B]"
+                  />
+                  <div>
+                    <div className="text-sm text-[#EAECEF]">挂单模式 (Limit Order Mode)</div>
+                    <p className="text-xs text-[#848E9C] mt-1">
+                      开启后，开单将使用限价单而非市价单
+                    </p>
+                  </div>
+                </label>
+              </div>
+
+              <div>
+                <label className="text-sm text-[#EAECEF] block mb-2">
+                  {language === 'zh' ? '自定义提示词 (Custom Prompt)' : 'Custom Prompt'}
+                </label>
+                <textarea
+                  value={formData.custom_prompt}
+                  onChange={(e) => handleInputChange('custom_prompt', e.target.value)}
+                  className="w-full min-h-[140px] px-3 py-2 bg-[#0B0E11] border border-[#2B3139] rounded text-[#EAECEF] focus:border-[#F0B90B] focus:outline-none resize-y"
+                  placeholder={language === 'zh' ? '可选：填写交易员专属提示词。切换模拟盘/实盘不会清空这里的内容。' : 'Optional: trader-specific prompt. Toggling dry-run/live will not clear this field.'}
+                />
+                <p className="text-xs text-[#848E9C] mt-1">
+                  {language === 'zh' ? '已配置的 custom_prompt 会持续显示，并在切换模拟盘/实盘时一并提交；如果你手动清空后保存，则表示显式移除。' : 'Existing custom prompts stay visible and are submitted together with dry-run/live mode changes. Clearing the field and saving removes it explicitly.'}
                 </p>
               </div>
 

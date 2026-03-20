@@ -106,8 +106,8 @@ func (pb *PromptBuilder) buildSystemPromptZH() string {
   - WAIT: 等待，不采取任何行动
 - **leverage**: 杠杆倍数（开新仓时必需）
 - **position_size_usd**: 仓位大小（USDT，开新仓时必需）
-- **stop_loss**: 止损价格（开新仓时建议提供）
-- **take_profit**: 止盈价格（开新仓时建议提供）
+- **stop_loss**: 止损价格（开新仓时必须提供，或改用 ATR 止损机制）
+- **take_profit**: 止盈价格（开新仓时必须提供，或改用 ATR 止盈机制）
 - **confidence**: 信心度（0-100）
 - **reasoning**: 推理过程（必需，必须详细说明决策依据）
 
@@ -241,8 +241,8 @@ func (pb *PromptBuilder) buildSystemPromptEN() string {
   - WAIT: Wait, take no action
 - **leverage**: Leverage multiplier (required for new positions)
 - **position_size_usd**: Position size in USDT (required for new positions)
-- **stop_loss**: Stop-loss price (recommended for new positions)
-- **take_profit**: Take-profit price (recommended for new positions)
+- **stop_loss**: Stop-loss price (required for new positions, unless using ATR stop-loss)
+- **take_profit**: Take-profit price (required for new positions, unless using ATR take-profit)
 - **confidence**: Confidence level (0-100)
 - **reasoning**: Detailed reasoning (required, must explain decision basis)
 

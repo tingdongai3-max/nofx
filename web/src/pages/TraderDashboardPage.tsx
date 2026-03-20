@@ -1049,14 +1049,17 @@ export function TraderDashboardPage({
                           const direction = side === 'short' ? -1 : 1
                           const trailingActivationPct =
                             Number(pos.trailing_activation_pct) || 0
-                          const trailingActivationMode =
-                            pos.trailing_activation_mode || 'price_move'
                           const trailingRetracePct =
                             Number(pos.trailing_retrace_pct) || 0
                           const stopLoss = Number(pos.stop_loss) || 0
                           const takeProfit = Number(pos.take_profit) || 0
                           const safetyFloorSL =
                             Number(pos.safety_floor_sl) || 0
+                          const nativeTpOrderIds = Array.isArray(pos.tp_order_ids)
+                            ? pos.tp_order_ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
+                            : []
+                          const hasNativeTP =
+                            Boolean(pos.has_native_tp) || nativeTpOrderIds.length > 0
                           const hasSafetyFloor =
                             safetyFloorSL > 0 &&
                             ((side === 'long' && safetyFloorSL > stopLoss) ||
@@ -1114,14 +1117,8 @@ export function TraderDashboardPage({
                                   {hasTrailing && (
                                     <span className="text-[10px] text-amber-400/80 font-medium whitespace-nowrap">
                                       {language === 'zh'
-                                        ? trailingActivationMode ===
-                                          'tp_progress'
-                                          ? `⚡ 追踪: TP进度 ${formatTrailingPct(trailingActivationPct)}% / 回撤 ${formatTrailingPct(trailingRetracePct)}%`
-                                          : `⚡ 追踪: 激活 ${formatTrailingPct(trailingActivationPct)}% / 回撤 ${formatTrailingPct(trailingRetracePct)}%`
-                                        : trailingActivationMode ===
-                                            'tp_progress'
-                                          ? `⚡ Trailing: TP progress ${formatTrailingPct(trailingActivationPct)}% / Retrace ${formatTrailingPct(trailingRetracePct)}%`
-                                          : `⚡ Trailing: Activation ${formatTrailingPct(trailingActivationPct)}% / Retrace ${formatTrailingPct(trailingRetracePct)}%`}
+                                        ? `⚡ 追踪: TP进度 ${formatTrailingPct(trailingActivationPct)}% / 回吐利润 ${formatTrailingPct(trailingRetracePct)}%`
+                                        : `⚡ Trailing: TP progress ${formatTrailingPct(trailingActivationPct)}% / Profit giveback ${formatTrailingPct(trailingRetracePct)}%`}
                                     </span>
                                   )}
                                   {(stopLoss > 0 || takeProfit > 0) && (
@@ -1129,6 +1126,13 @@ export function TraderDashboardPage({
                                       {language === 'zh'
                                         ? `TP ${takeProfit > 0 ? formatPrice(takeProfit) : '-'} / SL ${stopLoss > 0 ? formatPrice(stopLoss) : '-'}`
                                         : `TP ${takeProfit > 0 ? formatPrice(takeProfit) : '-'} / SL ${stopLoss > 0 ? formatPrice(stopLoss) : '-'}`}
+                                    </span>
+                                  )}
+                                  {hasNativeTP && (
+                                    <span className="text-[10px] text-emerald-300/80 font-medium whitespace-nowrap">
+                                      {language === 'zh'
+                                        ? `原生止盈单 ${nativeTpOrderIds.length > 0 ? nativeTpOrderIds.length : 2} 笔`
+                                        : `Native TP orders: ${nativeTpOrderIds.length > 0 ? nativeTpOrderIds.length : 2}`}
                                     </span>
                                   )}
                                   {hasSafetyFloor && (

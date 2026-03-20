@@ -87,14 +87,20 @@ type DecisionAction struct {
 	Price      float64   `json:"price"`
 	StopLoss   float64   `json:"stop_loss,omitempty"`   // Stop loss price
 	TakeProfit float64   `json:"take_profit,omitempty"` // Take profit price
-	TrailingActivationPct float64 `json:"trailing_activation_pct,omitempty"` // Underlying price move %, not leveraged ROI
-	TrailingRetracePct    float64 `json:"trailing_retrace_pct,omitempty"`    // Underlying price retrace %
+	TakeProfitStages []DecisionTakeProfitStage `json:"take_profit_stages,omitempty"`
+	TrailingActivationPct float64 `json:"trailing_activation_pct,omitempty"` // Take-profit target progress ratio (0-100)
+	TrailingRetracePct    float64 `json:"trailing_retrace_pct,omitempty"`    // Allowed giveback ratio of earned profit (0-100)
 	Confidence int       `json:"confidence,omitempty"`  // AI confidence (0-100)
 	Reasoning  string    `json:"reasoning,omitempty"`   // Brief reasoning
 	OrderID    int64     `json:"order_id"`
 	Timestamp  time.Time `json:"timestamp"`
 	Success    bool      `json:"success"`
 	Error      string    `json:"error"`
+}
+
+type DecisionTakeProfitStage struct {
+	Price    float64 `json:"price"`
+	ClosePct float64 `json:"close_pct"`
 }
 
 // Statistics statistics information
@@ -118,10 +124,25 @@ func (s *DecisionStore) initTables() error {
 		var tableExists int64
 		s.db.Raw(`SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'decision_records'`).Scan(&tableExists)
 		if tableExists > 0 {
-			return nil
+			return s.ensureIndexes()
 		}
 	}
-	return s.db.AutoMigrate(&DecisionRecordDB{})
+	if err := s.db.AutoMigrate(&DecisionRecordDB{}); err != nil {
+		return err
+	}
+	return s.ensureIndexes()
+}
+
+func (s *DecisionStore) ensureIndexes() error {
+	for _, sql := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_decision_records_trader_time ON decision_records(trader_id, timestamp DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_decision_records_trader_created ON decision_records(trader_id, created_at DESC)`,
+	} {
+		if err := s.db.Exec(sql).Error; err != nil {
+			return fmt.Errorf("failed to ensure decision index: %w", err)
+		}
+	}
+	return nil
 }
 
 // toRecord converts DB model to API struct
@@ -318,6 +339,19 @@ func (s *DecisionStore) GetRecordsInRangeSince(traderID string, fromTime, toTime
 	return records, nil
 }
 
+// CountRecordsInRangeSince counts decision records for a trader within [fromTime, toTime] and on/after resetAt.
+func (s *DecisionStore) CountRecordsInRangeSince(traderID string, fromTime, toTime, resetAt time.Time) (int, error) {
+	var count int64
+	q := s.db.Model(&DecisionRecordDB{}).Where("trader_id = ? AND timestamp >= ? AND timestamp <= ?", traderID, fromTime, toTime)
+	if !resetAt.IsZero() {
+		q = q.Where("timestamp >= ?", resetAt.UTC())
+	}
+	if err := q.Count(&count).Error; err != nil {
+		return 0, fmt.Errorf("failed to count decision records: %w", err)
+	}
+	return int(count), nil
+}
+
 // CleanOldRecords cleans old records from N days ago
 func (s *DecisionStore) CleanOldRecords(traderID string, days int) (int64, error) {
 	cutoffTime := time.Now().AddDate(0, 0, -days)
@@ -326,6 +360,16 @@ func (s *DecisionStore) CleanOldRecords(traderID string, days int) (int64, error
 		Delete(&DecisionRecordDB{})
 	if result.Error != nil {
 		return 0, fmt.Errorf("failed to clean old records: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
+// DeleteBeforeCreatedAt deletes stale decision rows created before the cutoff.
+func (s *DecisionStore) DeleteBeforeCreatedAt(traderID string, cutoff time.Time) (int64, error) {
+	result := s.db.Where("trader_id = ? AND created_at < ?", traderID, cutoff.UTC()).
+		Delete(&DecisionRecordDB{})
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to delete stale decision records: %w", result.Error)
 	}
 	return result.RowsAffected, nil
 }

@@ -37,34 +37,16 @@ type ATRTrailingState struct {
 	AIStopLoss       float64 // AI 通过 hold/wait 下发的 stop_loss 价；与 TrailingSLPrice 取并集（谁先触发听谁的）
 }
 
-// StagedTakeProfitState is the watchdog-owned two-stage TP and defense state.
-type StagedTakeProfitState struct {
-	Symbol               string
-	Side                 string
-	EntryPrice           float64
-	OriginalQty          float64
-	StopLoss             float64
-	Target1Price         float64
-	Target2Price         float64
-	TP1Triggered         bool
-	TP2Triggered         bool
-	BreakEvenStopPrice   float64
-	TrailActivationPrice float64
-	TrailingActive       bool
-	TrailingStopPrice    float64
-}
-
 type AIDynamicTrailingConfig struct {
 	Symbol                string
 	Side                  string
-	TrailingActivationPct float64 // Favorable underlying price move from entry (%), not leveraged ROI
-	TrailingRetracePct    float64 // Price retrace from post-activation extreme (%)
+	TrailingActivationPct float64 // Take-profit target progress ratio (0-100)
+	TrailingRetracePct    float64 // Allowed giveback ratio of earned profit (0-100)
 }
 
 type WatchdogHooks struct {
-	GetStagedTakeProfitStates   func() map[string]*StagedTakeProfitState
-	OnStagedPartialClose        func(symbol, side string, closedQty float64, stageIndex int)
-	OnStagedFullClose           func(symbol, side string)
+	GetPositions                func() ([]map[string]interface{}, error)
+	ClosePosition               func(symbol, side string, quantity float64) (map[string]interface{}, error)
 	GetAIDynamicTrailingConfigs func() map[string]*AIDynamicTrailingConfig
 	GetTakeProfitTargets        func() map[string]float64
 	GetStopLossTargets          func() map[string]float64
@@ -124,6 +106,7 @@ func RunRiskWatchdog(
 type watchdogPosition struct {
 	Symbol                string
 	Side                  string
+	Source                string
 	Quantity              float64
 	EntryPrice            float64
 	Leverage              float64
@@ -133,7 +116,8 @@ type watchdogPosition struct {
 	TrailingActivationPct float64
 	TrailingRetracePct    float64
 	TakeProfitPrice       float64
-	ActivationByTPProgress bool
+	HasNativeTP           bool
+	TPOrderIDs            []string
 	IsTrailingActive      bool
 	ExtremePrice          float64
 }
@@ -222,7 +206,9 @@ func syncWatchdogPositions(
 		positions []map[string]interface{}
 		err       error
 	)
-	if cachedTrader, ok := trader.(recentWatchdogPositionCache); ok {
+	if hooks != nil && hooks.GetPositions != nil {
+		positions, err = hooks.GetPositions()
+	} else if cachedTrader, ok := trader.(recentWatchdogPositionCache); ok {
 		if cached, hit := cachedTrader.GetPositionsFromCacheMaxAge(watchdogPositionCacheMaxAge); hit {
 			positions = cached
 		}
@@ -264,10 +250,11 @@ func syncWatchdogPositions(
 		}
 		if cfg.TrailingActivationPct > 0 {
 			pos.TrailingActivationPct = cfg.TrailingActivationPct
-			pos.ActivationByTPProgress = true
-			pos.TakeProfitPrice = takeProfitTargets[key]
 		} else if aiCfg := aiConfigs[key]; aiCfg != nil {
 			pos.TrailingActivationPct = aiCfg.TrailingActivationPct
+		}
+		if tp := takeProfitTargets[key]; tp > 0 {
+			pos.TakeProfitPrice = tp
 		}
 		if cfg.TrailingRetracePct > 0 {
 			pos.TrailingRetracePct = cfg.TrailingRetracePct
@@ -299,7 +286,7 @@ func watchdogEnabled(cfg *store.StrategyConfig) bool {
 	if cfg == nil {
 		return false
 	}
-	return watchdogClassicDefenseEnabled(cfg) || cfg.Indicators.EnableStagedTakeProfit || cfg.TrailingActivationPct > 0 || cfg.TrailingRetracePct > 0
+	return watchdogClassicDefenseEnabled(cfg) || cfg.TrailingActivationPct > 0 || cfg.TrailingRetracePct > 0
 }
 
 func watchdogClassicDefenseEnabled(cfg *store.StrategyConfig) bool {
@@ -345,6 +332,21 @@ func buildWatchdogPosition(posMap map[string]interface{}, stopLossTargets map[st
 	entryPrice, _ := posMap["entryPrice"].(float64)
 	markPrice, _ := posMap["markPrice"].(float64)
 	leverage, _ := posMap["leverage"].(float64)
+	source, _ := posMap["source"].(string)
+	takeProfitPrice, _ := posMap["take_profit"].(float64)
+	stopLossPrice, _ := posMap["stop_loss"].(float64)
+	hasNativeTP, _ := posMap["has_native_tp"].(bool)
+	var tpOrderIDs []string
+	switch ids := posMap["tp_order_ids"].(type) {
+	case []string:
+		tpOrderIDs = append(tpOrderIDs, ids...)
+	case []interface{}:
+		for _, raw := range ids {
+			if s, ok := raw.(string); ok && strings.TrimSpace(s) != "" {
+				tpOrderIDs = append(tpOrderIDs, s)
+			}
+		}
+	}
 	if entryPrice == 0 {
 		entryPrice = markPrice
 	}
@@ -381,6 +383,9 @@ func buildWatchdogPosition(posMap map[string]interface{}, stopLossTargets map[st
 	if stopLossTargets != nil {
 		initialStopLoss = stopLossTargets[key]
 	}
+	if initialStopLoss <= 0 {
+		initialStopLoss = stopLossPrice
+	}
 	safetyBuffer := 0.0
 	if initialStopLoss > 0 && entryPrice > 0 {
 		safetyBuffer = absFloat(entryPrice-initialStopLoss) * 1.5
@@ -388,10 +393,14 @@ func buildWatchdogPosition(posMap map[string]interface{}, stopLossTargets map[st
 	return watchdogPosition{
 		Symbol:          symbol,
 		Side:            side,
+		Source:          strings.ToLower(strings.TrimSpace(source)),
 		Quantity:        quantity,
 		EntryPrice:      entryPrice,
 		Leverage:        leverage,
 		InitialStopLoss: initialStopLoss,
+		TakeProfitPrice: takeProfitPrice,
+		HasNativeTP:     hasNativeTP || len(tpOrderIDs) > 0,
+		TPOrderIDs:      tpOrderIDs,
 		SafetyBuffer:    safetyBuffer,
 	}, true
 }
@@ -408,10 +417,58 @@ func handleWatchdogPriceEvent(
 	if pos == nil || currentPrice <= 0 || ctx.Err() != nil {
 		return false
 	}
-	if handleStagedTakeProfit(trader, *pos, currentPrice, onClose, hooks) {
-		return false
+	if handleDryRunHardTPSL(trader, pos, currentPrice, onClose, hooks) {
+		return true
+	}
+	if pos.HasNativeTP {
+		return handleDynamicTrailingStop(ctx, trader, getConfig(), pos, currentPrice, onClose, hooks)
 	}
 	return handleDynamicTrailingStop(ctx, trader, getConfig(), pos, currentPrice, onClose, hooks)
+}
+
+func handleDryRunHardTPSL(
+	trader Trader,
+	pos *watchdogPosition,
+	currentPrice float64,
+	onClose OnWatchdogClose,
+	hooks *WatchdogHooks,
+) bool {
+	if pos == nil || pos.Source != "dry_run" {
+		return false
+	}
+	isLong := pos.Side == "long"
+	triggered := false
+	logMsg := ""
+
+	switch {
+	case isLong && pos.TakeProfitPrice > 0 && currentPrice >= pos.TakeProfitPrice:
+		triggered = true
+		logMsg = "[模拟盘虚拟撮合] 多单触发硬止盈"
+	case isLong && pos.InitialStopLoss > 0 && currentPrice <= pos.InitialStopLoss:
+		triggered = true
+		logMsg = "[模拟盘虚拟撮合] 多单触发硬止损"
+	case !isLong && pos.TakeProfitPrice > 0 && currentPrice <= pos.TakeProfitPrice:
+		triggered = true
+		logMsg = "[模拟盘虚拟撮合] 空单触发硬止盈"
+	case !isLong && pos.InitialStopLoss > 0 && currentPrice >= pos.InitialStopLoss:
+		triggered = true
+		logMsg = "[模拟盘虚拟撮合] 空单触发硬止损"
+	}
+	if !triggered {
+		return false
+	}
+
+	order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0, hooks)
+	if err != nil {
+		logger.Warnf("🛡️ %s，但平仓失败: %s %s: %v", logMsg, pos.Symbol, closeAction(pos.Side), err)
+		return false
+	}
+	logger.Infof("🛡️ %s。symbol=%s side=%s price=%.6f tp=%.6f sl=%.6f",
+		logMsg, pos.Symbol, pos.Side, currentPrice, pos.TakeProfitPrice, pos.InitialStopLoss)
+	if onClose != nil {
+		onClose(pos.Symbol, closeAction(pos.Side), order, pos.Quantity, currentPrice, pos.EntryPrice)
+	}
+	return true
 }
 
 func handleWatchdogDefenseEvent(
@@ -438,14 +495,11 @@ func handleWatchdogDefenseEvent(
 	if !ok || currentPrice <= 0 {
 		currentPrice = klines[len(klines)-1].Close
 	}
-	if handleStagedTakeProfit(trader, *pos, currentPrice, onClose, hooks) {
-		return false
-	}
 	reason := evaluateDefenseTrigger(cfg, *pos, klines, currentPrice)
 	if reason == "" {
 		return false
 	}
-	order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0)
+	order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0, hooks)
 	if err != nil {
 		logger.Warnf("🛡️ [系统风控] %s 触发后平仓失败: %s %s: %v", reason, pos.Symbol, closeAction(pos.Side), err)
 		return false
@@ -477,7 +531,7 @@ func handleDynamicTrailingStop(
 		}
 		effectiveSafetyStop := effectiveWatchdogSafetyStop(*pos)
 		if effectiveSafetyStop > 0 && stopHit(pos.Side == "long", currentPrice, effectiveSafetyStop) {
-			order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0)
+			order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0, hooks)
 			if err != nil {
 				logger.Warnf("🛡️ [底层护盘] 被动动态止损触发但平仓失败: %s %s: %v", pos.Symbol, closeAction(pos.Side), err)
 				return false
@@ -495,17 +549,14 @@ func handleDynamicTrailingStop(
 	if activationPct <= 0 || retracePct <= 0 || pos.EntryPrice <= 0 || currentPrice <= 0 {
 		return false
 	}
-	if pos.ActivationByTPProgress && !watchdogHasValidTakeProfitTarget(*pos) {
+	if !watchdogHasValidTakeProfitTarget(*pos) {
 		return false
 	}
 
 	currentMovePct := calculateWatchdogFavorableMovePct(*pos, currentPrice)
-	activationMovePct := activationPct
-	if pos.ActivationByTPProgress {
-		activationMovePct = calculateWatchdogActivationMovePctFromTargetProgress(*pos)
-		if activationMovePct <= 0 {
-			return false
-		}
+	activationMovePct := calculateWatchdogActivationMovePctFromTargetProgress(*pos)
+	if activationMovePct <= 0 {
+		return false
 	}
 	if currentMovePct >= activationMovePct && !pos.IsTrailingActive {
 		pos.IsTrailingActive = true
@@ -513,13 +564,8 @@ func handleDynamicTrailingStop(
 		if hooks != nil && hooks.OnSafetyFloorClear != nil {
 			hooks.OnSafetyFloorClear(pos.Symbol, pos.Side)
 		}
-		if pos.ActivationByTPProgress {
-			logger.Infof("🛡️ [追踪止盈已激活] symbol=%s side=%s favorable_move=%.2f%% activation_progress=%.2f%% activation_move=%.2f%% tp=%.6f retrace=%.2f%% extreme=%.6f",
-				pos.Symbol, pos.Side, currentMovePct, activationPct, activationMovePct, pos.TakeProfitPrice, retracePct, pos.ExtremePrice)
-		} else {
-			logger.Infof("🛡️ [追踪止盈已激活] symbol=%s side=%s favorable_move=%.2f%% activation=%.2f%% retrace=%.2f%% extreme=%.6f",
-				pos.Symbol, pos.Side, currentMovePct, activationPct, retracePct, pos.ExtremePrice)
-		}
+		logger.Infof("🛡️ [追踪止盈已激活] symbol=%s side=%s favorable_move=%.2f%% activation_progress=%.2f%% activation_move=%.2f%% tp=%.6f retrace=%.2f%% extreme=%.6f",
+			pos.Symbol, pos.Side, currentMovePct, activationPct, activationMovePct, pos.TakeProfitPrice, retracePct, pos.ExtremePrice)
 	}
 	if !pos.IsTrailingActive {
 		return false
@@ -529,14 +575,17 @@ func handleDynamicTrailingStop(
 		if currentPrice > pos.ExtremePrice {
 			pos.ExtremePrice = currentPrice
 		}
-		if pos.ExtremePrice > 0 && currentPrice <= pos.ExtremePrice*(1-retracePct/100) {
-			order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0)
+		profitDistance := pos.ExtremePrice - pos.EntryPrice
+		dynamicRetraceAmount := profitDistance * (retracePct / 100)
+		closeLine := pos.ExtremePrice - dynamicRetraceAmount
+		if profitDistance > 0 && currentPrice <= closeLine {
+			order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0, hooks)
 			if err != nil {
 				logger.Warnf("🛡️ [毫秒风控] 追踪止盈触发但平仓失败: %s %s: %v", pos.Symbol, closeAction(pos.Side), err)
 				return false
 			}
-			logger.Infof("🚨 [毫秒风控] 触发追踪止盈回撤线，以市价强制抢跑平仓！ symbol=%s side=%s price=%.6f extreme=%.6f retrace=%.2f%%",
-				pos.Symbol, pos.Side, currentPrice, pos.ExtremePrice, retracePct)
+			logger.Infof("🚨 [毫秒风控] 触发追踪止盈利润回吐线，以市价强制抢跑平仓！ symbol=%s side=%s price=%.6f extreme=%.6f profit_distance=%.6f giveback=%.2f%% close_line=%.6f",
+				pos.Symbol, pos.Side, currentPrice, pos.ExtremePrice, profitDistance, retracePct, closeLine)
 			if onClose != nil {
 				onClose(pos.Symbol, closeAction(pos.Side), order, pos.Quantity, currentPrice, pos.EntryPrice)
 			}
@@ -548,14 +597,17 @@ func handleDynamicTrailingStop(
 	if pos.ExtremePrice == 0 || currentPrice < pos.ExtremePrice {
 		pos.ExtremePrice = currentPrice
 	}
-	if pos.ExtremePrice > 0 && currentPrice >= pos.ExtremePrice*(1+retracePct/100) {
-		order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0)
+	profitDistance := pos.EntryPrice - pos.ExtremePrice
+	dynamicRetraceAmount := profitDistance * (retracePct / 100)
+	closeLine := pos.ExtremePrice + dynamicRetraceAmount
+	if profitDistance > 0 && currentPrice >= closeLine {
+		order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0, hooks)
 		if err != nil {
 			logger.Warnf("🛡️ [毫秒风控] 追踪止盈触发但平仓失败: %s %s: %v", pos.Symbol, closeAction(pos.Side), err)
 			return false
 		}
-		logger.Infof("🚨 [毫秒风控] 触发追踪止盈回撤线，以市价强制抢跑平仓！ symbol=%s side=%s price=%.6f extreme=%.6f retrace=%.2f%%",
-			pos.Symbol, pos.Side, currentPrice, pos.ExtremePrice, retracePct)
+		logger.Infof("🚨 [毫秒风控] 触发追踪止盈利润回吐线，以市价强制抢跑平仓！ symbol=%s side=%s price=%.6f extreme=%.6f profit_distance=%.6f giveback=%.2f%% close_line=%.6f",
+			pos.Symbol, pos.Side, currentPrice, pos.ExtremePrice, profitDistance, retracePct, closeLine)
 		if onClose != nil {
 			onClose(pos.Symbol, closeAction(pos.Side), order, pos.Quantity, currentPrice, pos.EntryPrice)
 		}
@@ -606,6 +658,25 @@ func effectiveWatchdogSafetyStop(pos watchdogPosition) float64 {
 	return maxStopForState(false, pos.InitialStopLoss, pos.SafetyFloorSL)
 }
 
+func maxStopForState(isLong bool, a, b float64) float64 {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 {
+		return a
+	}
+	if isLong {
+		if a > b {
+			return a
+		}
+		return b
+	}
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func watchdogHasValidTakeProfitTarget(pos watchdogPosition) bool {
 	if pos.EntryPrice <= 0 || pos.TakeProfitPrice <= 0 {
 		return false
@@ -627,139 +698,6 @@ func calculateWatchdogActivationMovePctFromTargetProgress(pos watchdogPosition) 
 	return targetMovePct * pos.TrailingActivationPct / 100
 }
 
-func handleStagedTakeProfit(
-	trader Trader,
-	pos watchdogPosition,
-	currentPrice float64,
-	onClose OnWatchdogClose,
-	hooks *WatchdogHooks,
-) bool {
-	if hooks == nil || hooks.GetStagedTakeProfitStates == nil {
-		return false
-	}
-	states := hooks.GetStagedTakeProfitStates()
-	if len(states) == 0 {
-		return false
-	}
-	state := states[pos.Symbol+"_"+strings.ToLower(pos.Side)]
-	if state == nil {
-		return false
-	}
-
-	isLong := pos.Side == "long"
-	remainingQty := pos.Quantity
-	if remainingQty <= 0 {
-		if hooks.OnStagedFullClose != nil {
-			hooks.OnStagedFullClose(pos.Symbol, pos.Side)
-		}
-		return true
-	}
-
-	if !state.TP1Triggered && targetHit(isLong, currentPrice, state.Target1Price) {
-		closeQty := state.OriginalQty * 0.5
-		if closeQty > remainingQty {
-			closeQty = remainingQty
-		}
-		if closeQty > 0 {
-			order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, closeQty)
-			if err != nil {
-				logger.Warnf("🛡️ [系统防御] %s 触达 TP1 但分批止盈失败: %v", pos.Symbol, err)
-				return true
-			}
-			if onClose != nil {
-				onClose(pos.Symbol, closeAction(pos.Side), order, closeQty, currentPrice, pos.EntryPrice)
-			}
-			if hooks.OnStagedPartialClose != nil {
-				hooks.OnStagedPartialClose(pos.Symbol, pos.Side, closeQty, 0)
-			}
-		}
-
-		state.TP1Triggered = true
-		state.BreakEvenStopPrice = breakEvenStopPrice(isLong, pos.EntryPrice)
-		remainingQty -= closeQty
-		if remainingQty > 0 {
-			if err := replaceStopLoss(trader, pos.Symbol, pos.Side, remainingQty, state.BreakEvenStopPrice); err != nil {
-				logger.Warnf("🛡️ [系统防御] %s TP1 后保本止损设置失败: %v", pos.Symbol, err)
-			} else {
-				logger.Infof("🛡️ [系统防御] 触达 TP1，止损已锁定保本价。symbol=%s side=%s stop=%.6f", pos.Symbol, pos.Side, state.BreakEvenStopPrice)
-			}
-		}
-	}
-
-	if !state.TrailingActive && targetHit(isLong, currentPrice, trailingActivationPrice(isLong, pos.EntryPrice, state.Target2Price)) {
-		state.TrailingActive = true
-		state.TrailActivationPrice = trailingActivationPrice(isLong, pos.EntryPrice, state.Target2Price)
-		state.TrailingStopPrice = trailingStopPrice(isLong, currentPrice)
-		if err := replaceStopLoss(trader, pos.Symbol, pos.Side, remainingQty, maxStopForState(isLong, state.BreakEvenStopPrice, state.TrailingStopPrice)); err != nil {
-			logger.Warnf("🛡️ [系统防御] %s 启动 80%% 追踪止损失败: %v", pos.Symbol, err)
-		} else {
-			logger.Infof("🛡️ [系统防御] 已到 TP2 80%% 区间，10%% 动态追踪止损启动。symbol=%s side=%s stop=%.6f", pos.Symbol, pos.Side, maxStopForState(isLong, state.BreakEvenStopPrice, state.TrailingStopPrice))
-		}
-	}
-
-	if state.TrailingActive {
-		nextStop := trailingStopPrice(isLong, currentPrice)
-		if isLong {
-			if nextStop > state.TrailingStopPrice {
-				state.TrailingStopPrice = nextStop
-			}
-		} else if state.TrailingStopPrice == 0 || nextStop < state.TrailingStopPrice {
-			state.TrailingStopPrice = nextStop
-		}
-
-		effectiveStop := maxStopForState(isLong, state.BreakEvenStopPrice, state.TrailingStopPrice)
-		if effectiveStop > 0 {
-			if err := replaceStopLoss(trader, pos.Symbol, pos.Side, remainingQty, effectiveStop); err != nil {
-				logger.Warnf("🛡️ [系统防御] %s 更新追踪止损失败: %v", pos.Symbol, err)
-			}
-			if stopHit(isLong, currentPrice, effectiveStop) {
-				order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0)
-				if err != nil {
-					logger.Warnf("🛡️ [系统防御] %s 追踪止损触发但平仓失败: %v", pos.Symbol, err)
-					return true
-				}
-				logger.Infof("🛡️ [系统防御] 10%% 动态追踪止损触发。symbol=%s side=%s price=%.6f stop=%.6f", pos.Symbol, pos.Side, currentPrice, effectiveStop)
-				if onClose != nil {
-					onClose(pos.Symbol, closeAction(pos.Side), order, remainingQty, currentPrice, pos.EntryPrice)
-				}
-				if hooks.OnStagedFullClose != nil {
-					hooks.OnStagedFullClose(pos.Symbol, pos.Side)
-				}
-				return true
-			}
-		}
-	}
-
-	if !state.TP2Triggered && targetHit(isLong, currentPrice, state.Target2Price) {
-		order, err := closeWatchdogPosition(trader, pos.Symbol, pos.Side, 0)
-		if err != nil {
-			logger.Warnf("🛡️ [系统防御] %s 触达 TP2 但平仓失败: %v", pos.Symbol, err)
-			return true
-		}
-		state.TP2Triggered = true
-		logger.Infof("🛡️ [系统防御] 触达 TP2，剩余仓位已全部止盈。symbol=%s side=%s price=%.6f", pos.Symbol, pos.Side, currentPrice)
-		if onClose != nil {
-			onClose(pos.Symbol, closeAction(pos.Side), order, remainingQty, currentPrice, pos.EntryPrice)
-		}
-		if hooks.OnStagedFullClose != nil {
-			hooks.OnStagedFullClose(pos.Symbol, pos.Side)
-		}
-		return true
-	}
-
-	return false
-}
-
-func targetHit(isLong bool, price, target float64) bool {
-	if target <= 0 {
-		return false
-	}
-	if isLong {
-		return price >= target
-	}
-	return price <= target
-}
-
 func stopHit(isLong bool, price, stop float64) bool {
 	if stop <= 0 {
 		return false
@@ -770,58 +708,13 @@ func stopHit(isLong bool, price, stop float64) bool {
 	return price >= stop
 }
 
-func breakEvenStopPrice(isLong bool, entry float64) float64 {
-	if isLong {
-		return entry * 1.0015
+func closeWatchdogPosition(trader Trader, symbol, side string, quantity float64, hooks *WatchdogHooks) (map[string]interface{}, error) {
+	if err := trader.CancelAllOrders(symbol); err != nil {
+		logger.Warnf("🛡️ [系统风控] cancel all orders before close failed: %s: %v", symbol, err)
 	}
-	return entry * 0.9985
-}
-
-func trailingActivationPrice(isLong bool, entry, target2 float64) float64 {
-	distance := target2 - entry
-	if isLong {
-		return entry + distance*0.8
+	if hooks != nil && hooks.ClosePosition != nil {
+		return hooks.ClosePosition(symbol, side, quantity)
 	}
-	return entry + distance*0.8
-}
-
-func trailingStopPrice(isLong bool, current float64) float64 {
-	if isLong {
-		return current * 0.9
-	}
-	return current * 1.1
-}
-
-func maxStopForState(isLong bool, a, b float64) float64 {
-	if a <= 0 {
-		return b
-	}
-	if b <= 0 {
-		return a
-	}
-	if isLong {
-		if a > b {
-			return a
-		}
-		return b
-	}
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func replaceStopLoss(trader Trader, symbol, side string, quantity, stopPrice float64) error {
-	if quantity <= 0 || stopPrice <= 0 {
-		return nil
-	}
-	if err := trader.CancelStopLossOrders(symbol); err != nil {
-		return err
-	}
-	return trader.SetStopLoss(symbol, strings.ToUpper(side), quantity, stopPrice)
-}
-
-func closeWatchdogPosition(trader Trader, symbol, side string, quantity float64) (map[string]interface{}, error) {
 	if side == "long" {
 		return trader.CloseLong(symbol, quantity)
 	}
@@ -935,13 +828,6 @@ func detectShortFractalDefense(klines []market.Kline) (bool, float64) {
 	return true, refLow
 }
 
-func absFloat(v float64) float64 {
-	if v < 0 {
-		return -v
-	}
-	return v
-}
-
 func minFloat(a, b float64) float64 {
 	if a < b {
 		return a
@@ -958,11 +844,10 @@ func maxFloat(a, b float64) float64 {
 
 // tryLogWatchdogParams 仅首次检测到持仓或配置参数变更时打印，避免刷屏
 func tryLogWatchdogParams(cfg *store.StrategyConfig, exchange string) {
-	fp := fmt.Sprintf("fractal=%t|ema_gap=%t|bar3=%t|staged=%t|trail_act=%.4f|trail_ret=%.4f|tf=%s|ex=%s",
+	fp := fmt.Sprintf("fractal=%t|ema_gap=%t|bar3=%t|trail_act=%.4f|trail_ret=%.4f|tf=%s|ex=%s",
 		cfg.Indicators.EnableFractalDefense,
 		cfg.Indicators.EnableEMA20GapDefense,
 		cfg.Indicators.Enable3BarTrailing,
-		cfg.Indicators.EnableStagedTakeProfit,
 		cfg.TrailingActivationPct,
 		cfg.TrailingRetracePct,
 		defenseTimeframe,
@@ -975,11 +860,10 @@ func tryLogWatchdogParams(cfg *store.StrategyConfig, exchange string) {
 	}
 	watchdogLastPrint = fp
 	watchdogLogMu.Unlock()
-	logger.Infof("🛡️ System Risk Watchdog armed | fractal=%t | ema20_gap=%t | 3bar=%t | staged_tp=%t | trailing_activation(price_move)=%.2f%% | trailing_retrace(price_move)=%.2f%% | tf=%s | exchange=%s",
+	logger.Infof("🛡️ System Risk Watchdog armed | fractal=%t | ema20_gap=%t | 3bar=%t | trailing_activation(tp_progress)=%.2f%% | trailing_retrace(profit_giveback)=%.2f%% | tf=%s | exchange=%s",
 		cfg.Indicators.EnableFractalDefense,
 		cfg.Indicators.EnableEMA20GapDefense,
 		cfg.Indicators.Enable3BarTrailing,
-		cfg.Indicators.EnableStagedTakeProfit,
 		cfg.TrailingActivationPct,
 		cfg.TrailingRetracePct,
 		defenseTimeframe,

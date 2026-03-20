@@ -42,8 +42,6 @@ var (
 	reThousandSep = regexp.MustCompile(`(\d),(\d)`)
 )
 
-const maxTrailingRetraceToActivationRatio = 0.4
-
 // ============================================================================
 // Type Definitions
 // ============================================================================
@@ -152,6 +150,7 @@ type Context struct {
 	CallCount       int                                `json:"call_count"`
 	Account         AccountInfo                        `json:"account"`
 	Positions       []PositionInfo                     `json:"positions"`
+	PendingOrders   []PendingOrderInfo                 `json:"pending_orders,omitempty"`
 	CandidateCoins  []CandidateCoin                    `json:"candidate_coins"`
 	PromptVariant   string                             `json:"prompt_variant,omitempty"`
 	TradingStats    *TradingStats                      `json:"trading_stats,omitempty"`
@@ -171,6 +170,14 @@ type Context struct {
 	BTCETHLeverage     int                          `json:"-"`
 	AltcoinLeverage int                                `json:"-"`
 	Timeframes      []string                           `json:"-"`
+}
+
+type PendingOrderInfo struct {
+	OrderID string  `json:"order_id"`
+	Symbol  string  `json:"symbol"`
+	Side    string  `json:"side"`
+	Price   float64 `json:"price"`
+	Status  string  `json:"status"`
 }
 
 // CZSCLabels 缠论分析结果：笔、笔中枢、MACD动力学（由 CZSC 中间件返回，原样注入 Prompt）
@@ -219,7 +226,7 @@ type CZSCBcSignal struct {
 // Decision AI trading decision
 type Decision struct {
 	Symbol string `json:"symbol"`
-	Action string `json:"action"` // Allowed: "open_long", "open_short", "close_long", "close_short", "hold", "wait"
+	Action string `json:"action"` // Allowed: "open_long", "open_short", "open_long_limit", "open_short_limit", "close_long", "close_short", "cancel_order", "hold", "wait"
 	// Grid actions: "place_buy_limit", "place_sell_limit", "cancel_order", "cancel_all_orders", "pause_grid", "resume_grid", "adjust_grid"
 
 	// Opening position parameters
@@ -233,8 +240,8 @@ type Decision struct {
 	ATRTrailingSlMult   float64             `json:"atr_sl_mult,omitempty"`   // 止损：entry ± atr_sl_mult * ATR
 	ATRTrailingTpMult   float64             `json:"atr_tp_mult,omitempty"`   // 止盈：entry ± atr_tp_mult * ATR（可与 atr_tp_stages 二选一或同时用）
 	ATRTrailingTpStages []ATRTrailingStage `json:"atr_tp_stages,omitempty"` // 分批止盈，最多 3 阶段：每阶段 atr_mult + close_pct(0-100)
-	TrailingActivationPct float64           `json:"trailing_activation_pct,omitempty"` // Favorable underlying price move from entry (%), not leveraged ROI
-	TrailingRetracePct    float64           `json:"trailing_retrace_pct,omitempty"`    // Price retrace from post-activation extreme (%)
+	TrailingActivationPct float64           `json:"trailing_activation_pct,omitempty"` // Take-profit target progress ratio (0-100)
+	TrailingRetracePct    float64           `json:"trailing_retrace_pct,omitempty"`    // Allowed giveback ratio of earned profit after activation (0-100)
 
 	// Grid trading parameters
 	Price      float64 `json:"price,omitempty"`       // Limit order price (for grid)
@@ -308,8 +315,15 @@ type OIDeltaData struct {
 
 // StrategyEngine strategy execution engine
 type StrategyEngine struct {
-	config       *store.StrategyConfig
-	nofxosClient *nofxos.Client
+	config              *store.StrategyConfig
+	nofxosClient        *nofxos.Client
+	handover            AccountHandoverState
+	enableLimitEntry    bool
+}
+
+type AccountHandoverState struct {
+	ResetTimestamp time.Time
+	LiveTradeCount int
 }
 
 // NewStrategyEngine creates strategy execution engine
@@ -357,6 +371,24 @@ func (e *StrategyEngine) GetLanguage() Language {
 // GetConfig gets complete strategy configuration
 func (e *StrategyEngine) GetConfig() *store.StrategyConfig {
 	return e.config
+}
+
+// SetAccountHandoverState updates runtime-only account handover metadata for prompt generation.
+func (e *StrategyEngine) SetAccountHandoverState(resetAt time.Time, liveTradeCount int) {
+	if e == nil {
+		return
+	}
+	e.handover = AccountHandoverState{
+		ResetTimestamp: resetAt.UTC(),
+		LiveTradeCount: liveTradeCount,
+	}
+}
+
+func (e *StrategyEngine) SetLimitEntryMode(enabled bool) {
+	if e == nil {
+		return
+	}
+	e.enableLimitEntry = enabled
 }
 
 // ============================================================================
@@ -1389,15 +1421,23 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 	if e.config.TrailingActivationPct == 0 && e.config.TrailingRetracePct == 0 {
 		sb.WriteString("## DYNAMIC TRAILING TAKE-PROFIT REQUIRED\n\n")
 		sb.WriteString("注意：全局未配置追踪止盈，你必须在 JSON 中提供 `trailing_activation_pct` 和 `trailing_retrace_pct`。\n")
-		sb.WriteString("⚠️ 极其致命的警告：这两个参数代表的是**标的价格百分比**，不是带杠杆收益率，不是 ROI，不要乘杠杆。\n")
-		sb.WriteString("- `trailing_activation_pct`: 价格相对入场价的有利变动百分比。例如多头从 100 涨到 106，则 activation move = 6%。\n")
-		sb.WriteString("- `trailing_retrace_pct`: 激活后，价格从极值回撤的百分比。例如多头最高到 110，retrace=3 表示跌到 106.7 触发。\n")
-		sb.WriteString(fmt.Sprintf("- 风控硬约束：`trailing_retrace_pct` 必须 ≤ `trailing_activation_pct` 的 %.0f%%，也就是激活后利润回吐不得超过 %.0f%%。例如 activation=5 时，retrace 最大只能是 2；可填 1.9、1.5、0.5，但不能填 2.1。\n", maxTrailingRetraceToActivationRatio*100, maxTrailingRetraceToActivationRatio*100))
-		sb.WriteString("【计算范例】：5x 杠杆多头，入场 100，若你希望价格上涨 4% 后启动追踪，随后从高点回撤 1.5% 平仓，则应设置 activation=4，retrace=1.5，而不是 20 和 7.5。\n")
-		sb.WriteString("绝不要把杠杆 ROI 数值直接填进 trailing 字段，否则会导致触发条件严重失真。\n\n")
+		sb.WriteString("⚠️ 极其致命的警告：`trailing_activation_pct` 现在代表的是**止盈目标进度百分比 (0-100)**，不是价格绝对涨跌幅，不是带杠杆收益率，不是 ROI。\n")
+		sb.WriteString("- `trailing_activation_pct`: 该字段现在代表止盈目标的进度百分比 (0-100)。\n")
+		sb.WriteString("- 【严令】：禁止输出价格变动绝对值！如果你设置止盈位在 +10%，希望在价格达到 +8% 时开启追踪，请输出 80。如果你希望在价格走完一半距离时就开启护盘，请输出 50。\n")
+		sb.WriteString("- `trailing_retrace_pct`: 激活后，允许从利润极值回吐的比例 (0-100)。\n")
+		sb.WriteString("- 【范例】：如果你设置 20，代表价格从最高点回撤掉“已获利润的 20%”时平仓。如果你已经浮盈 10%，那么当浮盈掉到 8% 时（回吐了 2%），系统将执行平仓。\n")
+		sb.WriteString("【计算范例】：多头入场 100，止盈 110。若你希望价格到 108 时启动追踪，应输出 activation=80；若你希望价格到 105 时就启动，应输出 activation=50。\n")
+		sb.WriteString("绝不要把价格绝对涨跌幅或杠杆 ROI 数值直接填进 `trailing_activation_pct`；也不要把价格绝对回撤幅度填进 `trailing_retrace_pct`。\n\n")
+	}
+	if e.enableLimitEntry {
+		sb.WriteString("## LIMIT ORDER MODE ENABLED\n")
+		sb.WriteString("- 你现在处于限价挂单模式。开仓决策时，你必须使用 `open_long_limit` 或 `open_short_limit`。\n")
+		sb.WriteString("- 你必须额外提供一个 `price` 字段，明确指定你的入场挂单价格。\n")
+		sb.WriteString("- 限价开仓示例必须包含 `position_size_usd`：{\"action\": \"open_long_limit\", \"symbol\": \"BTCUSDT\", \"position_size_usd\": 500, \"price\": 68000, \"leverage\": 10, \"stop_loss\": 67200, \"take_profit\": 69600, \"confidence\": 82, \"risk_usd\": 25}\n\n")
 	}
 	sb.WriteString("# Output Format (Strictly Follow)\n\n")
 	sb.WriteString("**Must use XML tags <reasoning> and <decision> to separate chain of thought and decision JSON, avoiding parsing errors**\n\n")
+	sb.WriteString("**CRITICAL RULE**: The field `position_size_usd` MUST be a positive number reflecting the NOTIONAL VALUE of the position (`Equity × Leverage × Allocation%`, capped by the Position Value Limits in the **This period** section). It MUST match your calculation in the reasoning. NEVER output `0`, `0.0`, or `null` for `position_size_usd` when the action is `open_long`, `open_short`, `open_long_limit`, or `open_short_limit`.\n\n")
 	sb.WriteString("## Format Requirements\n\n")
 	sb.WriteString("<reasoning>\n")
 	sb.WriteString("Your chain of thought analysis...\n")
@@ -1466,14 +1506,17 @@ func (e *StrategyEngine) BuildSystemPromptStatic(variant string) string {
 
 	sb.WriteString("## Field Description\n\n")
 	if enableAIClose {
-		sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
+		sb.WriteString("- `action`: open_long | open_short | open_long_limit | open_short_limit | close_long | close_short | cancel_order | hold | wait\n")
 	} else {
-		sb.WriteString("- `action`: open_long | open_short | hold | wait\n")
+		sb.WriteString("- `action`: open_long | open_short | open_long_limit | open_short_limit | cancel_order | hold | wait\n")
 		sb.WriteString("- **You MUST NOT** output `close_long` or `close_short`; closing is handled by the backend system defense engine. Any close_* actions will be discarded.\n")
 	}
 	sb.WriteString(fmt.Sprintf("- `confidence`: 0-100 (opening recommended ≥ %d)\n", riskControl.MinConfidence))
 	sb.WriteString("- Required when opening: leverage, position_size_usd (use max from **This period** section; example shows 5000 as placeholder), stop_loss, **either** take_profit **or** take_profit_stages, confidence, risk_usd\n")
-	sb.WriteString("- Optional trailing watchdog fields: `trailing_activation_pct` (favorable underlying price move % from entry that activates trailing) and `trailing_retrace_pct` (underlying price retrace % from the post-activation extreme that forces market exit). These are price-based percentages, not leveraged ROI.\n")
+	sb.WriteString("- Required for `open_long_limit` / `open_short_limit`: same as opening fields above, plus `price`.\n")
+	sb.WriteString("- `position_size_usd` must be the final calculated notional position value in USDT. It must be a single positive JSON number, and it must match the sizing logic stated in `<reasoning>`.\n")
+	sb.WriteString("- Required for `cancel_order`: `order_id` plus `symbol`.\n")
+	sb.WriteString("- Optional trailing watchdog fields: `trailing_activation_pct` (take-profit target progress ratio, 0-100; e.g. 80 = activate after 80% of the path to TP is completed) and `trailing_retrace_pct` (allowed giveback ratio of earned profit after activation, 0-100; e.g. 20 = close after giving back 20% of the profit gained since entry).\n")
 	if !e.config.Indicators.EnableStagedTakeProfit {
 		sb.WriteString("- **Staged take profit is OFF**: Do NOT use `take_profit_stages`. Use only single `take_profit` for full position close.\n")
 	} else {
@@ -1523,7 +1566,17 @@ func (e *StrategyEngine) BuildSystemPromptDynamic(accountEquity float64) string 
 	btcEthMax := accountEquity * btcEthPosValueRatio
 	examplePositionSize := accountEquity * btcEthPosValueRatio
 	var sb strings.Builder
-	sb.WriteString("# This period (current session — use these numbers)\n\n")
+	if resetAt := e.handover.ResetTimestamp; !resetAt.IsZero() {
+		handoverAge := time.Since(resetAt)
+		if handoverAge >= 0 && handoverAge < 24*time.Hour && e.handover.LiveTradeCount < 3 {
+			sb.WriteString("## MANDATE PROMOTION & ACCOUNT HANDOVER (CRITICAL)\n")
+			sb.WriteString("- 晋升通知：由于你在模拟测试（Simulation Phase）中表现出卓越的盈利能力和一致性，你已被正式提拔为实盘执行官。\n")
+			sb.WriteString("- 记忆继承：下方的“近期交易历史”包含了你在此前测试阶段的成功记录。请继续保持这一逻辑，不要因为进入实盘而改变节奏。\n")
+			sb.WriteString("- 屏蔽历史烂账：该实盘账号此前的累计盈亏（PnL）是由前任操作员（Legacy User）手动操作产生的亏损。严禁将这些亏损视为你的负担，严禁尝试“回本”。你只需要对从现在开始的每一笔订单负责。\n")
+			sb.WriteString("- 资金说明：目前的 Equity 反映的是真实的实盘资金。请视其为你的新起点。\n\n")
+		}
+	}
+	sb.WriteString("# Current Mandate (use these numbers)\n\n")
 	sb.WriteString(fmt.Sprintf("- Equity: %.0f USDT\n", accountEquity))
 	sb.WriteString(fmt.Sprintf("- Position Value Limit (Altcoins): max %.0f USDT (= equity × %.1fx)\n", altcoinMax, altcoinPosValueRatio))
 	sb.WriteString(fmt.Sprintf("- Position Value Limit (BTC/ETH): max %.0f USDT (= equity × %.1fx)\n", btcEthMax, btcEthPosValueRatio))
@@ -1673,6 +1726,9 @@ func loadErrorPatterns() []string {
 // BuildUserPrompt builds User Prompt based on strategy configuration
 func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 	var sb strings.Builder
+	riskControl := e.config.RiskControl
+	enableAIClose := riskControl.EnableAIClose
+	enableAIMoveTPSL := riskControl.EnableAIMoveTPSL
 
 	// 未决策期间空档复盘：强制 AI 先看结果再做新动作
 	if ctx.ClosedCountSinceLastDecision > 0 {
@@ -1688,6 +1744,17 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 		ctx.Account.TotalPnLPct,
 		ctx.Account.MarginUsedPct,
 		ctx.Account.PositionCount))
+
+	if len(ctx.PendingOrders) > 0 {
+		sb.WriteString("## PENDING ORDERS (UNFILLED)\n")
+		for _, order := range ctx.PendingOrders {
+			sb.WriteString(fmt.Sprintf("- OrderID: %s | Symbol: %s | Side: %s | Price: %.4f | Status: UNFILLED\n",
+				order.OrderID, order.Symbol, order.Side, order.Price))
+		}
+		sb.WriteString("- 该订单尚未成交。请评估当前行情：\n")
+		sb.WriteString("  1. 如果挂单价格仍然合理，请在 JSON 中输出 {\"action\": \"wait\"} 继续等待。\n")
+		sb.WriteString("  2. 如果你认为价格已偏离或错失机会，请输出 {\"action\": \"cancel_order\", \"order_id\": \"<id>\", \"symbol\": \"<symbol>\"} 撤单并重新寻找机会。\n\n")
+	}
 
 	// 开仓逻辑优先：紧接 Account 之后、Candidate Coins 之前，强制与当前市场事实对标
 	if len(ctx.OpenPositionReasoning) > 0 {
@@ -2896,19 +2963,22 @@ func validateDecisions(decisions []Decision, accountEquity float64, btcEthLevera
 
 func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64, allowStagedTakeProfit bool) error {
 	validActions := map[string]bool{
-		"open_long":  true,
-		"open_short": true,
-		"hold":       true,
-		"wait":       true,
-		"close_long":  true,
-		"close_short": true,
+		"open_long":       true,
+		"open_short":      true,
+		"open_long_limit": true,
+		"open_short_limit": true,
+		"hold":            true,
+		"wait":            true,
+		"close_long":      true,
+		"close_short":     true,
+		"cancel_order":    true,
 	}
 
 	if !validActions[d.Action] {
 		return fmt.Errorf("invalid action: %s", d.Action)
 	}
 
-	if d.Action == "open_long" || d.Action == "open_short" {
+	if d.Action == "open_long" || d.Action == "open_short" || d.Action == "open_long_limit" || d.Action == "open_short_limit" {
 		maxLeverage := altcoinLeverage
 		posRatio := altcoinPosRatio
 		maxPositionValue := accountEquity * posRatio
@@ -2987,7 +3057,7 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			}
 
 			if hasSingleTP {
-				if d.Action == "open_long" {
+				if d.Action == "open_long" || d.Action == "open_long_limit" {
 					if d.StopLoss >= d.TakeProfit {
 						return fmt.Errorf("for long positions, stop loss price must be less than take profit price")
 					}
@@ -3020,11 +3090,11 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 						prevPrice = st.Price
 						continue
 					}
-					if d.Action == "open_long" {
+					if d.Action == "open_long" || d.Action == "open_long_limit" {
 						if st.Price <= prevPrice {
 							return fmt.Errorf("for long positions, take_profit_stages prices must be strictly increasing")
 						}
-					} else { // open_short
+					} else { // open_short / open_short_limit
 						if st.Price >= prevPrice {
 							return fmt.Errorf("for short positions, take_profit_stages prices must be strictly decreasing")
 						}
@@ -3035,6 +3105,16 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 					return fmt.Errorf("sum of take_profit_stages.close_pct must be ≤ 100, got %.2f", sumPct)
 				}
 			}
+		} else {
+			// ATR 模式也必须同时具备止损与止盈机制，禁止只给 SL 不给 TP。
+			hasATRStopLoss := d.ATRTrailingSlMult > 0 || d.StopLoss > 0
+			hasATRTakeProfit := d.ATRTrailingTpMult > 0 || len(d.ATRTrailingTpStages) > 0
+			if !hasATRStopLoss {
+				return fmt.Errorf("ATR trailing mode requires a stop-loss mechanism: provide atr_sl_mult or stop_loss")
+			}
+			if !hasATRTakeProfit {
+				return fmt.Errorf("ATR trailing mode requires a take-profit mechanism: provide atr_tp_mult or atr_tp_stages")
+			}
 		}
 
 		if d.TrailingActivationPct < 0 || d.TrailingRetracePct < 0 {
@@ -3044,14 +3124,32 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			return fmt.Errorf("trailing_activation_pct and trailing_retrace_pct must be provided together")
 		}
 		if d.TrailingActivationPct > 0 {
-			maxRetracePct := d.TrailingActivationPct * maxTrailingRetraceToActivationRatio
-			if d.TrailingRetracePct > maxRetracePct+1e-9 {
-				return fmt.Errorf("trailing_retrace_pct must be ≤ %.4f (%.0f%% of trailing_activation_pct %.4f), got %.4f",
-					maxRetracePct, maxTrailingRetraceToActivationRatio*100, d.TrailingActivationPct, d.TrailingRetracePct)
+			if d.TrailingActivationPct >= 100 {
+				return fmt.Errorf("trailing_activation_pct must be < 100, got %.4f", d.TrailingActivationPct)
+			}
+			if d.TrailingRetracePct > 100 {
+				return fmt.Errorf("trailing_retrace_pct must be ≤ 100, got %.4f", d.TrailingRetracePct)
+			}
+			if d.TakeProfit <= 0 && len(d.TakeProfitStages) == 0 {
+				return fmt.Errorf("trailing take profit requires take_profit or take_profit_stages to define the TP target")
+			}
+		}
+		if d.Action == "open_long_limit" || d.Action == "open_short_limit" {
+			if d.Price <= 0 {
+				return fmt.Errorf("limit entry price must be greater than 0")
 			}
 		}
 
 		// No minimum risk-reward ratio enforced: 1:1 or below is allowed (user may prefer tight TP for scalping).
+	}
+
+	if d.Action == "cancel_order" {
+		if strings.TrimSpace(d.OrderID) == "" {
+			return fmt.Errorf("cancel_order requires order_id")
+		}
+		if strings.TrimSpace(d.Symbol) == "" {
+			return fmt.Errorf("cancel_order requires symbol")
+		}
 	}
 
 	return nil

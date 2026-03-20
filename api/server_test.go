@@ -92,6 +92,12 @@ func TestUpdateTraderRequest_SystemPromptTemplate(t *testing.T) {
 			if req.AIModelID != "gpt-4" {
 				t.Errorf("AIModelID not parsed correctly")
 			}
+			if req.CustomPrompt == nil || *req.CustomPrompt != "test" {
+				t.Errorf("CustomPrompt not parsed correctly")
+			}
+			if req.OverrideBasePrompt == nil || *req.OverrideBasePrompt {
+				t.Errorf("OverrideBasePrompt not parsed correctly")
+			}
 		})
 	}
 }
@@ -203,6 +209,7 @@ func TestUpdateTraderRequest_CompleteFields(t *testing.T) {
 		"custom_prompt": "test",
 		"override_base_prompt": false,
 		"is_cross_margin": true,
+		"is_shadow": false,
 		"system_prompt_template": "nof1"
 	}`
 
@@ -223,6 +230,15 @@ func TestUpdateTraderRequest_CompleteFields(t *testing.T) {
 	// Verify SystemPromptTemplate field has been correctly added to struct
 	if req.SystemPromptTemplate != "nof1" {
 		t.Errorf("SystemPromptTemplate mismatch: expected %q, got %q", "nof1", req.SystemPromptTemplate)
+	}
+	if req.IsShadow == nil || *req.IsShadow {
+		t.Errorf("IsShadow mismatch: expected false pointer, got %+v", req.IsShadow)
+	}
+	if req.CustomPrompt == nil || *req.CustomPrompt != "test" {
+		t.Errorf("CustomPrompt mismatch: got %+v", req.CustomPrompt)
+	}
+	if req.OverrideBasePrompt == nil || *req.OverrideBasePrompt {
+		t.Errorf("OverrideBasePrompt mismatch: got %+v", req.OverrideBasePrompt)
 	}
 }
 
@@ -314,6 +330,7 @@ func TestNormalizePositionsForFrontend_TrailingActivationMode(t *testing.T) {
 			"positionAmt":             1.0,
 			"unRealizedProfit":        8.0,
 			"leverage":                5.0,
+			"take_profit":             120.0,
 			"trailing_activation_pct": 6.0,
 			"trailing_retrace_pct":    2.0,
 		},
@@ -329,13 +346,19 @@ func TestNormalizePositionsForFrontend_TrailingActivationMode(t *testing.T) {
 	}
 
 	out := normalizePositionsForFrontend(positions, 80, 2)
-	if got := out[0]["trailing_activation_mode"]; got != "price_move" {
-		t.Fatalf("expected AI trailing mode price_move, got %v", got)
+	if got := out[0]["trailing_activation_mode"]; got != "tp_progress" {
+		t.Fatalf("expected AI trailing mode tp_progress, got %v", got)
 	}
 	if got := out[1]["trailing_activation_mode"]; got != "tp_progress" {
 		t.Fatalf("expected global trailing mode tp_progress, got %v", got)
 	}
-	if got := out[1]["trailing_activation_pct"]; got != 80.0 {
-		t.Fatalf("expected global trailing activation pct 80, got %v", got)
+	if got := out[0]["trailing_activation_pct"]; got != 6.0 {
+		t.Fatalf("expected explicit trailing activation pct 6, got %v", got)
+	}
+	if got := out[1]["trailing_activation_pct"]; got != 0.0 {
+		t.Fatalf("expected trailing activation pct hidden without TP target, got %v", got)
+	}
+	if got := out[1]["trailing_retrace_pct"]; got != 0.0 {
+		t.Fatalf("expected trailing retrace pct hidden without TP target, got %v", got)
 	}
 }

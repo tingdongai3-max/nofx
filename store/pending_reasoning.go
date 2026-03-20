@@ -72,3 +72,28 @@ func (s *PositionStore) TakeLatestPendingReasoning(traderID, symbol, side string
 	}
 	return "", nil
 }
+
+// RemoveLatestPendingReasoning removes the most recent pending reasoning for a symbol+side pair.
+func (s *PositionStore) RemoveLatestPendingReasoning(traderID, symbol, side string) error {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	side = strings.ToUpper(strings.TrimSpace(side))
+	targetNorm := normalizeSymbolForMatch(symbol)
+	var candidates []PendingReasoning
+	err := s.db.Where("trader_id = ? AND side = ?", traderID, side).
+		Order("created_at DESC").
+		Find(&candidates).Error
+	if err != nil {
+		return err
+	}
+	for _, r := range candidates {
+		if normalizeSymbolForMatch(r.Symbol) == targetNorm {
+			return s.db.Delete(&r).Error
+		}
+	}
+	return nil
+}
+
+// ClearPendingReasonings deletes all outstanding pending reasonings for a trader.
+func (s *PositionStore) ClearPendingReasonings(traderID string) error {
+	return s.db.Where("trader_id = ?", traderID).Delete(&PendingReasoning{}).Error
+}

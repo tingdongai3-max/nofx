@@ -223,8 +223,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   const filteredTraders = useMemo(() => {
     if (!traders) return []
     if (filterMode === 'all') return traders
-    if (filterMode === 'live') return traders.filter(t => !t.is_dry_run)
-    return traders.filter(t => t.is_dry_run)
+    if (filterMode === 'live') return traders.filter(t => !t.is_dry_run && !t.is_shadow)
+    return traders.filter(t => t.is_dry_run || t.is_shadow)
   }, [traders, filterMode])
 
   // Persist filter mode selection for return/refresh
@@ -320,11 +320,6 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
       // 其他交易所：如果已启用，说明已配置完整（后端只返回已配置的交易所）
       return true
     }) || []
-
-  // 检查模型是否正在被运行中的交易员使用（用于UI禁用）
-  const isModelInUse = (modelId: string) => {
-    return traders?.some((t) => t.ai_model === modelId && t.is_running)
-  }
 
   // 检查模型被哪些交易员使用
   const getModelUsageInfo = (modelId: string) => {
@@ -435,7 +430,10 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
         is_cross_margin: data.is_cross_margin,
         show_in_competition: data.show_in_competition,
         is_dry_run: data.is_dry_run,
+        is_shadow: data.is_dry_run ? editingTrader.is_shadow : false,
         virtual_equity: data.virtual_equity,
+        enable_limit_entry: data.enable_limit_entry,
+        custom_prompt: data.custom_prompt,
       }
 
       console.log('🔥 handleSaveEditTrader - data:', data)
@@ -520,10 +518,8 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
   }
 
   const handleModelClick = (modelId: string) => {
-    if (!isModelInUse(modelId)) {
-      setEditingModel(modelId)
-      setShowModelModal(true)
-    }
+    setEditingModel(modelId)
+    setShowModelModal(true)
   }
 
   const handleExchangeClick = (exchangeId: string) => {
@@ -960,13 +956,11 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
 
             <div className="p-4 space-y-3">
               {configuredModels.map((model) => {
-                const inUse = isModelInUse(model.id)
                 const usageInfo = getModelUsageInfo(model.id)
                 return (
                   <div
                     key={model.id}
-                    className={`group relative flex items-center justify-between p-3 rounded-md transition-all border border-transparent ${inUse ? 'opacity-80' : 'hover:bg-white/5 hover:border-white/10 cursor-pointer'
-                      } bg-black/20`}
+                    className="group relative flex items-center justify-between p-3 rounded-md transition-all border border-transparent hover:bg-white/5 hover:border-white/10 cursor-pointer bg-black/20"
                     onClick={() => handleModelClick(model.id)}
                   >
                     <div className="flex items-center gap-4">
@@ -1180,13 +1174,13 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
                         >
                           {trader.trader_name}
                         </span>
-                        {trader.is_dry_run && (
+                        {(trader.is_dry_run || trader.is_shadow) && (
                           <span
                             className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider whitespace-nowrap"
                             style={{ background: 'rgba(245, 158, 11, 0.2)', color: '#f59e0b' }}
-                            title={language === 'zh' ? '模拟盘 / Paper Trading' : 'Paper Trading'}
+                            title={trader.is_shadow ? (language === 'zh' ? '影子变体 / Shadow Variant' : 'Shadow Variant') : (language === 'zh' ? '模拟盘 / Paper Trading' : 'Paper Trading')}
                           >
-                            {language === 'zh' ? '模拟盘' : 'Paper'}
+                            {trader.is_shadow ? (language === 'zh' ? '影子' : 'Shadow') : (language === 'zh' ? '模拟盘' : 'Paper')}
                           </span>
                         )}
                       </div>

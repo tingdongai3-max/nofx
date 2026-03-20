@@ -50,7 +50,7 @@ type StrategyConfig struct {
 	PromptSections PromptSectionsConfig `json:"prompt_sections,omitempty"`
 	// Global trailing take-profit fallback; when 0, watchdog falls back to AI decision JSON.
 	// TrailingActivationPct means "percentage of the take-profit target progress" for global config.
-	// TrailingRetracePct remains the underlying price retrace from the post-activation extreme.
+	// TrailingRetracePct means the allowed giveback ratio of earned profit after activation.
 	TrailingActivationPct float64 `json:"trailing_activation_pct,omitempty"`
 	TrailingRetracePct    float64 `json:"trailing_retrace_pct,omitempty"`
 

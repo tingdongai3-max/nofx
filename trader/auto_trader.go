@@ -30,9 +30,10 @@ import (
 // AutoTraderConfig auto trading configuration (simplified version - AI makes all decisions)
 type AutoTraderConfig struct {
 	// Trader identification
-	ID      string // Trader unique identifier (for log directory, etc.)
-	Name    string // Trader display name
-	AIModel string // AI model: "qwen" or "deepseek"
+	ID        string // Trader unique identifier (for log directory, etc.)
+	Name      string // Trader display name
+	AIModelID string // AI model config ID stored in DB
+	AIModel   string // AI model provider: "qwen" or "deepseek"
 
 	// Trading platform selection
 	Exchange   string // Exchange type: "binance", "bybit", "okx", "bitget", "gate", "hyperliquid", "aster" or "lighter"
@@ -104,6 +105,7 @@ type AutoTraderConfig struct {
 	IsDryRun      bool    // 模拟盘开关，默认 false
 	IsShadow      bool    // 影子执行：不触达交易所，只记录本地虚拟仓位
 	VirtualEquity float64 // 模拟盘本金 USDT，IsDryRun 时传给 AI 的 Equity
+	EnableLimitEntry bool
 	ResetTimestamp time.Time
 
 	// Risk control (only as hints, AI can make autonomous decisions)
@@ -146,6 +148,8 @@ type AutoTrader struct {
 	startTime             time.Time          // System start time
 	callCount             int                // AI call count
 	positionFirstSeenTime map[string]int64   // Position first seen time (symbol_side -> timestamp in milliseconds)
+	pendingEntryOrders   map[string]*PendingEntryOrder
+	pendingEntryOrdersMu sync.RWMutex
 	stopMonitorCh         chan struct{}      // Used to stop monitoring goroutine
 	stopMonitorClosed     bool
 	stopMonitorMu         sync.Mutex
@@ -159,8 +163,8 @@ type AutoTrader struct {
 	gridState             *GridState         // Grid trading state (only used when StrategyType == "grid_trading")
 	watchdogCtx           context.Context    // Context for risk watchdog (cancelled on Stop)
 	watchdogCancel        context.CancelFunc // Cancel risk watchdog on Stop
-	stagedTakeProfitState map[string]*StagedTakeProfitState
-	stagedTakeProfitMu    sync.RWMutex
+	nativeTPOrderIDs      map[string][]string
+	nativeTPOrderIDsMu    sync.RWMutex
 	takeProfitTargets     map[string]float64
 	takeProfitTargetsMu   sync.RWMutex
 	stopLossTargets       map[string]float64
@@ -182,6 +186,19 @@ type peakBottomUpdate struct {
 	Symbol  string
 	Side    string
 	PnlPct  float64
+}
+
+type PendingEntryOrder struct {
+	OrderID           string
+	Symbol            string
+	Side              string
+	Price             float64
+	StopLoss          float64
+	TakeProfit        float64
+	TakeProfitStages  []kernel.TakeProfitStage
+	Leverage          int
+	TrailingActivationPct float64
+	TrailingRetracePct    float64
 }
 
 // resolveInitialBalanceForConfig 确定 PnL 分母（初始本金）：模拟盘必须用 VirtualEquity，禁止用实盘余额
@@ -211,6 +228,42 @@ func (at *AutoTrader) virtualModeLabel() string {
 		return "Shadow"
 	}
 	return "DryRun"
+}
+
+func (at *AutoTrader) refreshAIModelConfig() error {
+	if at.store == nil || at.userID == "" || at.config.AIModelID == "" || at.mcpClient == nil {
+		return nil
+	}
+
+	model, err := at.store.AIModel().Get(at.userID, at.config.AIModelID)
+	if err != nil {
+		return fmt.Errorf("failed to load AI model config %s: %w", at.config.AIModelID, err)
+	}
+	if !model.Enabled {
+		logger.Warnf("⚠️ [%s] AI model %s is disabled; keeping current in-memory config for this cycle", at.name, at.config.AIModelID)
+		return nil
+	}
+
+	at.config.AIModel = model.Provider
+	at.aiModel = model.Provider
+	at.config.CustomAPIURL = model.CustomAPIURL
+	at.config.CustomModelName = model.CustomModelName
+	at.config.DeepSeekKey = ""
+	at.config.QwenKey = ""
+	at.config.CustomAPIKey = ""
+
+	apiKey := string(model.APIKey)
+	switch model.Provider {
+	case "qwen":
+		at.config.QwenKey = apiKey
+	case "deepseek":
+		at.config.DeepSeekKey = apiKey
+	default:
+		at.config.CustomAPIKey = apiKey
+	}
+
+	at.mcpClient.SetAPIKey(apiKey, model.CustomAPIURL, model.CustomModelName)
+	return nil
 }
 
 // NewAutoTrader creates an automatic trader
@@ -444,7 +497,8 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		callCount:             0,
 		isRunning:             false,
 		positionFirstSeenTime: make(map[string]int64),
-		stagedTakeProfitState: make(map[string]*StagedTakeProfitState),
+		pendingEntryOrders:    make(map[string]*PendingEntryOrder),
+		nativeTPOrderIDs:      make(map[string][]string),
 		takeProfitTargets:     make(map[string]float64),
 		stopLossTargets:       make(map[string]float64),
 		safetyFloorTargets:    make(map[string]float64),
@@ -465,11 +519,185 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 
 // ApplyDataReset updates in-memory generation state without stopping the trader.
 func (at *AutoTrader) ApplyDataReset(resetAt time.Time) {
+	at.cancelAllPendingEntryOrders()
 	if resetAt.IsZero() {
 		resetAt = time.Now().UTC()
 	}
 	at.lastResetTime = resetAt.UTC()
 	at.cycleNumber = 0
+	at.peakPnLCacheMutex.Lock()
+	at.peakPnLCache = make(map[string]float64)
+	at.peakPnLCacheMutex.Unlock()
+	at.bottomPnLCacheMutex.Lock()
+	at.bottomPnLCache = make(map[string]float64)
+	at.bottomPnLCacheMutex.Unlock()
+}
+
+func (at *AutoTrader) registerPendingEntryOrder(order *PendingEntryOrder) {
+	if order == nil || strings.TrimSpace(order.OrderID) == "" {
+		return
+	}
+	at.pendingEntryOrdersMu.Lock()
+	defer at.pendingEntryOrdersMu.Unlock()
+	cp := *order
+	cp.Symbol = market.Normalize(cp.Symbol)
+	cp.Side = strings.ToUpper(strings.TrimSpace(cp.Side))
+	if len(order.TakeProfitStages) > 0 {
+		cp.TakeProfitStages = append([]kernel.TakeProfitStage(nil), order.TakeProfitStages...)
+	}
+	at.pendingEntryOrders[cp.OrderID] = &cp
+}
+
+func (at *AutoTrader) removePendingEntryOrder(orderID string) {
+	if strings.TrimSpace(orderID) == "" {
+		return
+	}
+	at.pendingEntryOrdersMu.Lock()
+	delete(at.pendingEntryOrders, orderID)
+	at.pendingEntryOrdersMu.Unlock()
+}
+
+func (at *AutoTrader) snapshotPendingEntryOrders() []*PendingEntryOrder {
+	at.pendingEntryOrdersMu.RLock()
+	defer at.pendingEntryOrdersMu.RUnlock()
+	out := make([]*PendingEntryOrder, 0, len(at.pendingEntryOrders))
+	for _, order := range at.pendingEntryOrders {
+		cp := *order
+		out = append(out, &cp)
+	}
+	return out
+}
+
+func decisionTakeProfitStagesForRecord(stages []kernel.TakeProfitStage) []store.DecisionTakeProfitStage {
+	if len(stages) == 0 {
+		return nil
+	}
+	out := make([]store.DecisionTakeProfitStage, 0, len(stages))
+	for _, st := range stages {
+		if st.Price <= 0 || st.ClosePct <= 0 {
+			continue
+		}
+		out = append(out, store.DecisionTakeProfitStage{
+			Price:    st.Price,
+			ClosePct: st.ClosePct,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (at *AutoTrader) cancelAllPendingEntryOrders() {
+	pending := at.snapshotPendingEntryOrders()
+	if len(pending) == 0 {
+		if at.store != nil {
+			if err := at.store.Position().ClearPendingReasonings(at.id); err != nil {
+				logger.Infof("⚠️ [%s] Failed to clear pending reasonings on reset: %v", at.name, err)
+			}
+		}
+		return
+	}
+	gridTrader, ok := at.trader.(GridTrader)
+	if !ok {
+		gridTrader = NewGridTraderAdapter(at.trader)
+	}
+	for _, order := range pending {
+		if err := gridTrader.CancelOrder(order.Symbol, order.OrderID); err != nil {
+			logger.Infof("⚠️ [%s] Failed to cancel pending entry order %s %s: %v", at.name, order.Symbol, order.OrderID, err)
+			continue
+		}
+		at.removePendingEntryOrder(order.OrderID)
+		if at.store != nil {
+			if err := at.store.Position().RemoveLatestPendingReasoning(at.id, order.Symbol, order.Side); err != nil {
+				logger.Infof("⚠️ [%s] Failed to remove pending reasoning for %s %s: %v", at.name, order.Symbol, order.Side, err)
+			}
+		}
+	}
+	if at.store != nil {
+		if err := at.store.Position().ClearPendingReasonings(at.id); err != nil {
+			logger.Infof("⚠️ [%s] Failed to clear pending reasonings after cancel sweep: %v", at.name, err)
+		}
+	}
+}
+
+func (at *AutoTrader) startPendingEntryProtectionMonitor() {
+	at.monitorWg.Add(1)
+	go func() {
+		defer at.monitorWg.Done()
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-at.stopMonitorCh:
+				return
+			case <-ticker.C:
+				at.checkPendingEntryProtections()
+			}
+		}
+	}()
+}
+
+func (at *AutoTrader) checkPendingEntryProtections() {
+	pending := at.snapshotPendingEntryOrders()
+	if len(pending) == 0 {
+		return
+	}
+	for _, order := range pending {
+		status, err := at.trader.GetOrderStatus(order.Symbol, order.OrderID)
+		if err != nil {
+			continue
+		}
+		statusStr, _ := status["status"].(string)
+		switch strings.ToUpper(strings.TrimSpace(statusStr)) {
+		case "FILLED":
+			qty, _ := status["executedQty"].(float64)
+			if qty <= 0 {
+				qty = at.resolvePositionQuantity(order.Symbol, order.Side)
+			}
+			if qty <= 0 {
+				logger.Infof("  ⚠️ [pending entry] %s %s filled but quantity unavailable, skip protection", order.Symbol, order.OrderID)
+				continue
+			}
+				logger.Infof("  ✅ [pending entry] %s %s filled, applying cached protection orders", order.Symbol, order.OrderID)
+				if err := at.applyProtectionForFilledEntry(order, qty); err != nil {
+					logger.Infof("  ⚠️ [pending entry] protection apply failed, will retry: %s %s: %v", order.Symbol, order.OrderID, err)
+					continue
+				}
+				at.removePendingEntryOrder(order.OrderID)
+		case "CANCELED", "CANCELLED", "EXPIRED", "REJECTED":
+			at.removePendingEntryOrder(order.OrderID)
+			if at.store != nil {
+				if err := at.store.Position().RemoveLatestPendingReasoning(at.id, order.Symbol, order.Side); err != nil {
+					logger.Infof("  ⚠️ [pending entry] remove pending reasoning: %v", err)
+				}
+			}
+		}
+	}
+}
+
+func (at *AutoTrader) resolvePositionQuantity(symbol, side string) float64 {
+	positions, err := at.trader.GetPositions()
+	if err != nil {
+		return 0
+	}
+	symbol = market.Normalize(symbol)
+	side = strings.ToLower(strings.TrimSpace(side))
+	for _, pos := range positions {
+		posSymbol, _ := pos["symbol"].(string)
+		posSide, _ := pos["side"].(string)
+		if market.Normalize(posSymbol) != symbol || strings.ToLower(strings.TrimSpace(posSide)) != side {
+			continue
+		}
+		amt, _ := pos["positionAmt"].(float64)
+		if amt < 0 {
+			amt = -amt
+		}
+		if amt > 0 {
+			return amt
+		}
+	}
+	return 0
 }
 
 // Run runs the automatic trading main loop
@@ -497,6 +725,7 @@ func (at *AutoTrader) Run() error {
 
 	// Start drawdown monitoring
 	at.startDrawdownMonitor()
+	at.startPendingEntryProtectionMonitor()
 
 	// Start Lighter order sync if using Lighter exchange
 	if at.exchange == "lighter" {
@@ -606,11 +835,14 @@ func (at *AutoTrader) Run() error {
 	if !isGridStrategy && at.config.StrategyConfig != nil {
 		at.watchdogCtx, at.watchdogCancel = context.WithCancel(context.Background())
 		RunRiskWatchdog(at.watchdogCtx, at.trader, func() *store.StrategyConfig { return at.config.StrategyConfig }, func() string { return at.GetExchange() }, func(symbol, action string, order map[string]interface{}, quantity, exitPrice, entryPrice float64) {
+			if at.usesVirtualExecution() {
+				at.recordVirtualWatchdogClose(symbol, action, quantity, exitPrice, entryPrice)
+				return
+			}
 			at.recordAndConfirmOrder(order, symbol, action, quantity, exitPrice, 0, entryPrice)
 		}, &WatchdogHooks{
-			GetStagedTakeProfitStates:   at.getStagedTakeProfitStateSnapshot,
-			OnStagedPartialClose:        at.onStagedTakeProfitPartialClose,
-			OnStagedFullClose:           at.onStagedTakeProfitFullClose,
+			GetPositions:                at.getWatchdogPositions,
+			ClosePosition:               at.closeManagedWatchdogPosition,
 			GetAIDynamicTrailingConfigs: at.getAIDynamicTrailingStateSnapshot,
 			GetTakeProfitTargets:        at.getTakeProfitTargetSnapshot,
 			GetStopLossTargets:          at.getStopLossTargetSnapshot,
@@ -800,6 +1032,10 @@ func (at *AutoTrader) runCycle() error {
 		return nil
 	}
 
+	if err := at.refreshAIModelConfig(); err != nil {
+		logger.Warnf("⚠️ [%s] Failed to refresh AI config; using previous in-memory config this cycle: %v", at.name, err)
+	}
+
 	// Create decision record
 	record := &store.DecisionRecord{
 		ExecutionLog: []string{},
@@ -865,6 +1101,9 @@ func (at *AutoTrader) runCycle() error {
 
 	logger.Infof("📊 Account equity: %.2f USDT | Available: %.2f USDT | Positions: %d",
 		ctx.Account.TotalEquity, ctx.Account.AvailableBalance, ctx.Account.PositionCount)
+
+	at.refreshAccountHandoverState()
+	at.strategyEngine.SetLimitEntryMode(at.config.EnableLimitEntry)
 
 	// 5. Use strategy engine to call AI for decision
 	logger.Infof("🤖 Requesting AI analysis and decision... [Strategy Engine]")
@@ -979,6 +1218,7 @@ func (at *AutoTrader) runCycle() error {
 			Price:                 0,
 			StopLoss:              d.StopLoss,
 			TakeProfit:            d.TakeProfit,
+			TakeProfitStages:      decisionTakeProfitStagesForRecord(d.TakeProfitStages),
 			TrailingActivationPct: d.TrailingActivationPct,
 			TrailingRetracePct:    d.TrailingRetracePct,
 			Confidence:            d.Confidence,
@@ -1009,6 +1249,109 @@ func (at *AutoTrader) runCycle() error {
 	return nil
 }
 
+func (at *AutoTrader) refreshAccountHandoverState() {
+	if at.strategyEngine == nil {
+		return
+	}
+	if at.usesVirtualExecution() || at.store == nil || at.config.ResetTimestamp.IsZero() {
+		at.strategyEngine.SetAccountHandoverState(time.Time{}, 0)
+		return
+	}
+
+	liveTradeCount, err := at.store.Position().CountNonVirtualPositionsSince(at.id, at.config.ResetTimestamp)
+	if err != nil {
+		logger.Infof("⚠️ [%s] Failed to count live trades since reset: %v", at.name, err)
+		at.strategyEngine.SetAccountHandoverState(at.config.ResetTimestamp, 0)
+		return
+	}
+	at.strategyEngine.SetAccountHandoverState(at.config.ResetTimestamp, liveTradeCount)
+}
+
+func (at *AutoTrader) buildPendingEntryOrderContext() []kernel.PendingOrderInfo {
+	if at.usesVirtualExecution() {
+		return nil
+	}
+	pending := at.snapshotPendingEntryOrders()
+	if at.store != nil {
+		resetMs := int64(0)
+		if !at.config.ResetTimestamp.IsZero() {
+			resetMs = at.config.ResetTimestamp.UTC().UnixMilli()
+		}
+		if orders, err := at.store.Order().GetTraderOrdersFilteredSince(at.id, "", "NEW", 200, resetMs); err == nil {
+			for _, order := range orders {
+				if order == nil || order.ReduceOnly {
+					continue
+				}
+				if order.OrderAction != "open_long" && order.OrderAction != "open_short" {
+					continue
+				}
+				if !strings.Contains(strings.ToUpper(order.Type), "LIMIT") {
+					continue
+				}
+				side := "LONG"
+				if order.OrderAction == "open_short" {
+					side = "SHORT"
+				}
+				pending = append(pending, &PendingEntryOrder{
+					OrderID: order.ExchangeOrderID,
+					Symbol:  market.Normalize(order.Symbol),
+					Side:    side,
+					Price:   order.Price,
+				})
+			}
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	bySymbol := make(map[string]map[string]*PendingEntryOrder)
+	for _, order := range pending {
+		if _, ok := bySymbol[order.Symbol]; !ok {
+			bySymbol[order.Symbol] = make(map[string]*PendingEntryOrder)
+		}
+		bySymbol[order.Symbol][order.OrderID] = order
+	}
+	out := make([]kernel.PendingOrderInfo, 0, len(pending))
+	liveIDs := make(map[string]struct{})
+	for symbol, tracked := range bySymbol {
+		openOrders, err := at.trader.GetOpenOrders(symbol)
+		if err != nil {
+			logger.Infof("⚠️ [%s] Failed to query open orders for %s: %v", at.name, symbol, err)
+			continue
+		}
+		for _, openOrder := range openOrders {
+			if pendingOrder, ok := tracked[openOrder.OrderID]; ok {
+				liveIDs[openOrder.OrderID] = struct{}{}
+				price := openOrder.Price
+				if price <= 0 {
+					price = pendingOrder.Price
+				}
+				openSymbol := openOrder.Symbol
+				if openSymbol == "" {
+					openSymbol = pendingOrder.Symbol
+				}
+				openSide := openOrder.Side
+				if openSide == "" {
+					openSide = pendingOrder.Side
+				}
+				out = append(out, kernel.PendingOrderInfo{
+					OrderID: openOrder.OrderID,
+					Symbol:  openSymbol,
+					Side:    openSide,
+					Price:   price,
+					Status:  openOrder.Status,
+				})
+			}
+		}
+	}
+	for _, order := range pending {
+		if _, ok := liveIDs[order.OrderID]; !ok {
+			at.removePendingEntryOrder(order.OrderID)
+		}
+	}
+	return out
+}
+
 // buildDryRunTradingContext 虚拟执行专用：资金用 VirtualEquity，持仓从 DB 取并用当前行情算浮盈（绝不调用交易所 GetBalance）
 func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 	totalEquity := at.config.VirtualEquity
@@ -1025,7 +1368,7 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 	}
 	logger.Infof("[%s] Using virtual equity: %.2f", at.virtualModeLabel(), totalEquity)
 
-	openPositions, err := at.store.Position().GetOpenPositionsBySource(at.id, at.virtualPositionSource())
+	openPositions, err := at.store.Position().GetOpenPositionsBySourceSince(at.id, at.virtualPositionSource(), at.config.ResetTimestamp)
 	if err != nil {
 		return nil, fmt.Errorf("%s get open positions: %w", strings.ToLower(at.virtualModeLabel()), err)
 	}
@@ -1133,9 +1476,10 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 		Positions:      positionInfos,
 		CandidateCoins: candidateCoins,
 	}
+	ctx.PendingOrders = at.buildPendingEntryOrderContext()
 
 	if at.store != nil {
-		tradesWithReasoning, _ := at.store.Position().GetRecentTradesWithReasoningBySource(at.id, 10, at.virtualPositionSource())
+		tradesWithReasoning, _ := at.store.Position().GetRecentTradesWithReasoningBySourceSince(at.id, 10, at.virtualPositionSource(), at.config.ResetTimestamp)
 		for _, tr := range tradesWithReasoning {
 			trade := tr.RecentTrade
 			entryTimeStr := ""
@@ -1165,7 +1509,7 @@ func (at *AutoTrader) buildDryRunTradingContext() (*kernel.Context, error) {
 				CloseReason:  tr.CloseReason,
 			})
 		}
-		if lastMs, ok := at.store.Decision().GetLatestDecisionTimeMs(at.id); ok {
+		if lastMs, ok := at.store.Decision().GetLatestDecisionTimeMsSince(at.id, at.config.ResetTimestamp); ok {
 			ctx.ClosedCountSinceLastDecision, _ = at.store.Position().GetClosedCountSinceBySource(at.id, lastMs, at.virtualPositionSource())
 		}
 		for _, op := range openPositions {
@@ -1292,7 +1636,7 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 	allowedPositionKeys := make(map[string]struct{})
 	allowPositions := false
 	if at.store != nil {
-		if dbPositions, err := at.store.Position().GetOpenPositions(at.id); err != nil {
+		if dbPositions, err := at.store.Position().GetOpenPositionsBySourceSince(at.id, "", at.config.ResetTimestamp); err != nil {
 			logger.Infof("⚠️ [%s] Failed to load local open positions for isolation: %v (positions will be hidden)", at.name, err)
 		} else {
 			for _, p := range dbPositions {
@@ -1479,16 +1823,22 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 		Positions:      positionInfos,
 		CandidateCoins: candidateCoins,
 	}
+	ctx.PendingOrders = at.buildPendingEntryOrderContext()
 
 	// 7. Add recent closed trades (if store is available)
 	if at.store != nil {
-		// Get recent 10 closed trades with AI reasoning for AI context
-		tradesWithReasoning, err := at.store.Position().GetRecentTradesWithReasoning(at.id, 10)
+		// Keep this trader's own recent trade memory across dry_run -> live promotion.
+		// Imported legacy orders from other trader_id values must never leak into the AI context.
+		tradesWithReasoning, err := at.store.Position().GetRecentTradesWithReasoningSince(at.id, 10, at.config.ResetTimestamp)
 		if err != nil {
 			logger.Infof("⚠️ [%s] Failed to get recent trades: %v", at.name, err)
 		} else {
 			logger.Infof("📊 [%s] Found %d recent closed trades for AI context", at.name, len(tradesWithReasoning))
 			for _, tr := range tradesWithReasoning {
+				if tr.TraderID != "" && tr.TraderID != at.id {
+					logger.Infof("⚠️ [%s] Skip recent trade from foreign trader context: trader_id=%s position_id=%d source=%s", at.name, tr.TraderID, tr.PositionID, tr.Source)
+					continue
+				}
 				trade := tr.RecentTrade
 				entryTimeStr := ""
 				if trade.EntryTime > 0 {
@@ -1525,11 +1875,11 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 			}
 		}
 		// 未决策期间空档复盘：自上次 AI 决策以来被系统平仓的数量
-		if lastMs, ok := at.store.Decision().GetLatestDecisionTimeMs(at.id); ok {
+		if lastMs, ok := at.store.Decision().GetLatestDecisionTimeMsSince(at.id, at.config.ResetTimestamp); ok {
 			ctx.ClosedCountSinceLastDecision, _ = at.store.Position().GetClosedCountSince(at.id, lastMs)
 		}
 		// 当前持仓的开仓逻辑（你正在为什么而坚持）
-		openPositions, errOpen := at.store.Position().GetOpenPositions(at.id)
+		openPositions, errOpen := at.store.Position().GetOpenPositionsBySourceSince(at.id, "", at.config.ResetTimestamp)
 		if errOpen == nil {
 			for _, op := range openPositions {
 				ctx.OpenPositionReasoning = append(ctx.OpenPositionReasoning, kernel.OpenPositionReasoning{
@@ -1667,6 +2017,10 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *kernel.Decision, actio
 		return at.executeOpenLongWithRecord(decision, actionRecord, aiReasoning)
 	case "open_short":
 		return at.executeOpenShortWithRecord(decision, actionRecord, aiReasoning)
+	case "open_long_limit":
+		return at.executeOpenLongLimitWithRecord(decision, actionRecord, aiReasoning)
+	case "open_short_limit":
+		return at.executeOpenShortLimitWithRecord(decision, actionRecord, aiReasoning)
 	case "close_long":
 		if !enableAIClose {
 			logger.Infof("  ⛔ [RISK CONTROL] AI close_long blocked by config (enable_ai_close=false); ignoring action")
@@ -1692,6 +2046,8 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *kernel.Decision, actio
 			// 已更新 TP/SL 或 ATR 状态，仅记录
 		}
 		return nil
+	case "cancel_order":
+		return at.executeCancelOrder(decision, actionRecord)
 	default:
 		return fmt.Errorf("unknown action: %s", decision.Action)
 	}
@@ -1701,12 +2057,18 @@ func (at *AutoTrader) executeShadowDecision(decision *kernel.Decision, actionRec
 	switch decision.Action {
 	case "open_long":
 		return at.executeShadowOpen(decision, actionRecord, "LONG", aiReasoning)
+	case "open_long_limit":
+		return at.executeShadowOpen(decision, actionRecord, "LONG", aiReasoning)
 	case "open_short":
+		return at.executeShadowOpen(decision, actionRecord, "SHORT", aiReasoning)
+	case "open_short_limit":
 		return at.executeShadowOpen(decision, actionRecord, "SHORT", aiReasoning)
 	case "close_long":
 		return at.executeShadowClose(decision, actionRecord, "LONG")
 	case "close_short":
 		return at.executeShadowClose(decision, actionRecord, "SHORT")
+	case "cancel_order":
+		return nil
 	case "hold", "wait":
 		return nil
 	default:
@@ -1815,6 +2177,193 @@ func (at *AutoTrader) executeShadowClose(decision *kernel.Decision, actionRecord
 	return nil
 }
 
+func (at *AutoTrader) resolveLimitEntryPrice(symbol, side string, requestedPrice float64) (float64, error) {
+	if requestedPrice > 0 {
+		return requestedPrice, nil
+	}
+	gridTrader, ok := at.trader.(GridTrader)
+	if !ok {
+		gridTrader = NewGridTraderAdapter(at.trader)
+	}
+	bids, asks, err := gridTrader.GetOrderBook(symbol, 1)
+	if err == nil {
+		if strings.EqualFold(side, "BUY") && len(bids) > 0 && len(bids[0]) > 0 && bids[0][0] > 0 {
+			return bids[0][0], nil
+		}
+		if strings.EqualFold(side, "SELL") && len(asks) > 0 && len(asks[0]) > 0 && asks[0][0] > 0 {
+			return asks[0][0], nil
+		}
+	}
+	marketData, marketErr := market.GetWithExchange(symbol, at.exchange, nil)
+	if marketErr != nil {
+		if err != nil {
+			return 0, err
+		}
+		return 0, marketErr
+	}
+	if marketData.CurrentPrice <= 0 {
+		return 0, fmt.Errorf("invalid market price for %s", symbol)
+	}
+	return marketData.CurrentPrice, nil
+}
+
+func (at *AutoTrader) executeLimitEntryWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction, aiReasoning, side, positionSide string) error {
+	logger.Infof("  📌 Place %s limit entry: %s", strings.ToLower(positionSide), decision.Symbol)
+
+	positions, err := at.trader.GetPositions()
+	if err != nil {
+		return fmt.Errorf("failed to get positions: %w", err)
+	}
+	if err := at.enforceMaxPositions(len(positions)); err != nil {
+		return err
+	}
+	for _, pos := range positions {
+		if pos["symbol"] == decision.Symbol && pos["side"] == strings.ToLower(positionSide) {
+			return fmt.Errorf("❌ %s already has %s position, close it first", decision.Symbol, strings.ToLower(positionSide))
+		}
+	}
+
+	balance, err := at.trader.GetBalance()
+	if err != nil {
+		return fmt.Errorf("failed to get account balance: %w", err)
+	}
+	availableBalance := 0.0
+	if avail, ok := balance["availableBalance"].(float64); ok {
+		availableBalance = avail
+	}
+	equity := 0.0
+	if eq, ok := balance["totalEquity"].(float64); ok && eq > 0 {
+		equity = eq
+	} else if eq, ok := balance["totalWalletBalance"].(float64); ok && eq > 0 {
+		equity = eq
+	} else {
+		equity = availableBalance
+	}
+
+	adjustedPositionSize, wasCapped := at.enforcePositionValueRatio(decision.PositionSizeUSD, equity, decision.Symbol)
+	if wasCapped {
+		decision.PositionSizeUSD = adjustedPositionSize
+	}
+
+	marginFactor := 1.01/float64(decision.Leverage) + 0.001
+	maxAffordablePositionSize := availableBalance / marginFactor
+	actualPositionSize := decision.PositionSizeUSD
+	if actualPositionSize > maxAffordablePositionSize {
+		actualPositionSize = maxAffordablePositionSize * 0.98
+		decision.PositionSizeUSD = actualPositionSize
+	}
+	if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
+		return err
+	}
+
+	limitPrice, err := at.resolveLimitEntryPrice(decision.Symbol, side, decision.Price)
+	if err != nil {
+		return err
+	}
+	decision.Price = limitPrice
+	if err := applyLeverageDiscipline(decision.Symbol, strings.ToLower(positionSide), limitPrice, decision); err != nil {
+		return err
+	}
+	quantity := actualPositionSize / limitPrice
+	if quantity <= 0 {
+		return fmt.Errorf("limit position size too small")
+	}
+
+	gridTrader, ok := at.trader.(GridTrader)
+	if !ok {
+		gridTrader = NewGridTraderAdapter(at.trader)
+	}
+	if err := at.trader.SetMarginMode(decision.Symbol, at.config.IsCrossMargin); err != nil {
+		logger.Infof("  ⚠️ Failed to set margin mode: %v", err)
+	}
+	result, err := gridTrader.PlaceLimitOrder(&LimitOrderRequest{
+		Symbol:       decision.Symbol,
+		Side:         side,
+		PositionSide: positionSide,
+		Price:        limitPrice,
+		Quantity:     quantity,
+		Leverage:     decision.Leverage,
+		ReduceOnly:   false,
+		ClientID:     fmt.Sprintf("entry-%s-%d", strings.ToLower(positionSide), time.Now().UnixNano()%1000000),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to place limit entry order: %w", err)
+	}
+
+	at.registerPendingEntryOrder(&PendingEntryOrder{
+		OrderID:                result.OrderID,
+		Symbol:                 decision.Symbol,
+		Side:                   positionSide,
+		Price:                  limitPrice,
+		StopLoss:               decision.StopLoss,
+		TakeProfit:             decision.TakeProfit,
+		TakeProfitStages:       append([]kernel.TakeProfitStage(nil), decision.TakeProfitStages...),
+		Leverage:               decision.Leverage,
+		TrailingActivationPct:  decision.TrailingActivationPct,
+		TrailingRetracePct:     decision.TrailingRetracePct,
+	})
+	if at.store != nil && aiReasoning != "" {
+		if err := at.store.Position().AddPendingReasoning(at.id, decision.Symbol, positionSide, aiReasoning); err != nil {
+			logger.Infof("  ⚠ Failed to add pending reasoning: %v", err)
+		}
+	}
+
+	actionRecord.Quantity = quantity
+	actionRecord.Price = limitPrice
+	logger.Infof("  ✓ Limit entry placed successfully, order ID: %s, quantity: %.4f @ %.4f", result.OrderID, quantity, limitPrice)
+	return nil
+}
+
+func (at *AutoTrader) executeOpenLongLimitWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction, aiReasoning string) error {
+	return at.executeLimitEntryWithRecord(decision, actionRecord, aiReasoning, "BUY", "LONG")
+}
+
+func (at *AutoTrader) executeOpenShortLimitWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction, aiReasoning string) error {
+	return at.executeLimitEntryWithRecord(decision, actionRecord, aiReasoning, "SELL", "SHORT")
+}
+
+func (at *AutoTrader) executeCancelOrder(decision *kernel.Decision, actionRecord *store.DecisionAction) error {
+	orderID := strings.TrimSpace(decision.OrderID)
+	if orderID == "" {
+		return fmt.Errorf("cancel_order requires order_id")
+	}
+	symbol := market.Normalize(decision.Symbol)
+	if symbol == "" {
+		at.pendingEntryOrdersMu.RLock()
+		if pending, ok := at.pendingEntryOrders[orderID]; ok {
+			symbol = pending.Symbol
+		}
+		at.pendingEntryOrdersMu.RUnlock()
+	}
+	if symbol == "" {
+		return fmt.Errorf("cancel_order requires symbol")
+	}
+	side := ""
+	at.pendingEntryOrdersMu.RLock()
+	if pending, ok := at.pendingEntryOrders[orderID]; ok {
+		side = pending.Side
+	}
+	at.pendingEntryOrdersMu.RUnlock()
+	gridTrader, ok := at.trader.(GridTrader)
+	if !ok {
+		gridTrader = NewGridTraderAdapter(at.trader)
+	}
+	if err := gridTrader.CancelOrder(symbol, orderID); err != nil {
+		return fmt.Errorf("failed to cancel order: %w", err)
+	}
+	at.removePendingEntryOrder(orderID)
+	if at.store != nil {
+		if side != "" {
+			if err := at.store.Position().RemoveLatestPendingReasoning(at.id, symbol, side); err != nil {
+				logger.Infof("  ⚠ Failed to remove pending reasoning after cancel: %v", err)
+			}
+		}
+	}
+	actionRecord.Price = decision.Price
+	logger.Infof("  ✓ Pending entry order cancelled: %s %s", symbol, orderID)
+	return nil
+}
+
 // getATRTrailingStateSnapshot 返回当前 ATR  trailing 状态的副本，供 watchdog 只读使用（避免并发写冲突）
 func (at *AutoTrader) getATRTrailingStateSnapshot() map[string]*ATRTrailingState {
 	at.atrTrailingMu.RLock()
@@ -1829,58 +2378,163 @@ func (at *AutoTrader) getATRTrailingStateSnapshot() map[string]*ATRTrailingState
 	return out
 }
 
-func (at *AutoTrader) getStagedTakeProfitStateSnapshot() map[string]*StagedTakeProfitState {
-	at.stagedTakeProfitMu.RLock()
-	defer at.stagedTakeProfitMu.RUnlock()
-	out := make(map[string]*StagedTakeProfitState, len(at.stagedTakeProfitState))
-	for k, v := range at.stagedTakeProfitState {
-		if v != nil {
-			out[k] = v
-		}
+func (at *AutoTrader) setNativeTPOrderIDs(symbol, side string, orderIDs []string) {
+	key := symbol + "_" + strings.ToLower(side)
+	at.nativeTPOrderIDsMu.Lock()
+	defer at.nativeTPOrderIDsMu.Unlock()
+	if len(orderIDs) == 0 {
+		delete(at.nativeTPOrderIDs, key)
+		return
 	}
+	cp := make([]string, 0, len(orderIDs))
+	for _, id := range orderIDs {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		cp = append(cp, id)
+	}
+	if len(cp) == 0 {
+		delete(at.nativeTPOrderIDs, key)
+		return
+	}
+	at.nativeTPOrderIDs[key] = cp
+}
+
+func (at *AutoTrader) clearNativeTPOrderIDs(symbol, side string) {
+	at.setNativeTPOrderIDs(symbol, side, nil)
+}
+
+func (at *AutoTrader) getNativeTPOrderIDs(symbol, side string) []string {
+	key := symbol + "_" + strings.ToLower(side)
+	at.nativeTPOrderIDsMu.RLock()
+	defer at.nativeTPOrderIDsMu.RUnlock()
+	ids := at.nativeTPOrderIDs[key]
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, len(ids))
+	copy(out, ids)
 	return out
 }
 
-func (at *AutoTrader) registerStagedTakeProfitState(symbol, side string, entryPrice, quantity, stopLoss float64, stages []kernel.TakeProfitStage) {
+func (at *AutoTrader) placeNativeStagedTakeProfit(symbol, posSideUpper string, quantity float64, leverage int, decision *kernel.Decision) error {
+	stages := at.normalizeStaticTakeProfitStages(decision.TakeProfitStages, posSideUpper)
 	if len(stages) != 2 {
-		return
+		return fmt.Errorf("native staged take profit requires exactly 2 stages, got %d", len(stages))
 	}
-	key := symbol + "_" + strings.ToLower(side)
-	at.stagedTakeProfitMu.Lock()
-	at.stagedTakeProfitState[key] = &StagedTakeProfitState{
-		Symbol:       symbol,
-		Side:         strings.ToLower(side),
-		EntryPrice:   entryPrice,
-		OriginalQty:  quantity,
-		StopLoss:     stopLoss,
-		Target1Price: stages[0].Price,
-		Target2Price: stages[1].Price,
+
+	gridTrader, ok := at.trader.(GridTrader)
+	if !ok {
+		gridTrader = NewGridTraderAdapter(at.trader)
 	}
-	at.stagedTakeProfitMu.Unlock()
-	logger.Infof("  ✓ [system defense] staged take profit registered: %s %s tp1=%.6f tp2=%.6f qty=%.4f", symbol, side, stages[0].Price, stages[1].Price, quantity)
+
+	posSideUpper = strings.ToUpper(strings.TrimSpace(posSideUpper))
+	side := "SELL"
+	if posSideUpper == "SHORT" {
+		side = "BUY"
+	}
+
+	if err := at.trader.CancelTakeProfitOrders(symbol); err != nil {
+		logger.Infof("  ⚠️ [原生止盈] cancel take profit orders: %v", err)
+	}
+	at.clearNativeTPOrderIDs(symbol, posSideUpper)
+
+	orderIDs := make([]string, 0, len(stages))
+	assigned := 0.0
+	for idx, st := range stages {
+		stageQty := quantity * (st.ClosePct / 100.0)
+		if idx == len(stages)-1 {
+			stageQty = quantity - assigned
+		}
+		if stageQty <= 0 {
+			continue
+		}
+		clientID := fmt.Sprintf("tp-%s-%d", strings.ToLower(symbol), time.Now().UnixNano())
+		result, err := gridTrader.PlaceLimitOrder(&LimitOrderRequest{
+			Symbol:       symbol,
+			Side:         side,
+			PositionSide: posSideUpper,
+			Price:        st.Price,
+			Quantity:     stageQty,
+			Leverage:     leverage,
+			ReduceOnly:   true,
+			ClientID:     clientID,
+		})
+		if err != nil {
+			_ = at.trader.CancelTakeProfitOrders(symbol)
+			at.clearNativeTPOrderIDs(symbol, posSideUpper)
+			return fmt.Errorf("place native TP%d failed: %w", idx+1, err)
+		}
+		orderID := strings.TrimSpace(result.OrderID)
+		if orderID == "" {
+			orderID = clientID
+		}
+		orderIDs = append(orderIDs, orderID)
+		assigned += stageQty
+	}
+
+	at.setNativeTPOrderIDs(symbol, posSideUpper, orderIDs)
+	at.setTakeProfitTarget(symbol, posSideUpper, resolveTakeProfitTargetPrice(posSideUpper, decision))
+	exchangeLabel := "交易所"
+	if strings.EqualFold(at.exchange, "binance") {
+		exchangeLabel = "币安"
+	}
+	logger.Infof("  ✓ [原生止盈] 已在%s挂出分批止盈单：TP1=@%.6f, TP2=@%.6f", exchangeLabel, stages[0].Price, stages[1].Price)
+	return nil
 }
 
-func (at *AutoTrader) clearStagedTakeProfitState(symbol, side string) {
-	key := symbol + "_" + strings.ToLower(side)
-	at.stagedTakeProfitMu.Lock()
-	delete(at.stagedTakeProfitState, key)
-	at.stagedTakeProfitMu.Unlock()
+func (at *AutoTrader) executeStagedTakeProfit(symbol, posSideUpper string, quantity float64, decision *kernel.Decision) error {
+	if decision == nil {
+		return nil
+	}
+	if at.useSystemStagedTakeProfit(decision) {
+		if err := at.placeNativeStagedTakeProfit(symbol, posSideUpper, quantity, decision.Leverage, decision); err != nil {
+			logger.Infof("  ⚠️ [executeStagedTakeProfit] native staged take profit: %v", err)
+			return err
+		}
+		return nil
+	}
+	at.clearNativeTPOrderIDs(symbol, strings.ToLower(posSideUpper))
+	return at.applyStaticTakeProfit(symbol, posSideUpper, quantity, decision)
 }
 
-func (at *AutoTrader) onStagedTakeProfitPartialClose(symbol, side string, closedQty float64, stageIndex int) {
-	at.stagedTakeProfitMu.Lock()
-	defer at.stagedTakeProfitMu.Unlock()
-	key := symbol + "_" + strings.ToLower(side)
-	if state, ok := at.stagedTakeProfitState[key]; ok && state != nil {
-		if stageIndex == 0 {
-			state.TP1Triggered = true
+func (at *AutoTrader) applyProtectionForFilledEntry(order *PendingEntryOrder, quantity float64) error {
+	if order == nil || quantity <= 0 {
+		return nil
+	}
+	sideUpper := strings.ToUpper(strings.TrimSpace(order.Side))
+	decision := &kernel.Decision{
+		Symbol:                order.Symbol,
+		Leverage:              order.Leverage,
+		StopLoss:              order.StopLoss,
+		TakeProfit:            order.TakeProfit,
+		TakeProfitStages:      append([]kernel.TakeProfitStage(nil), order.TakeProfitStages...),
+		TrailingActivationPct: order.TrailingActivationPct,
+		TrailingRetracePct:    order.TrailingRetracePct,
+	}
+	var applyErrs []string
+
+	if decision.StopLoss > 0 {
+		if err := at.trader.CancelStopLossOrders(order.Symbol); err != nil {
+			logger.Infof("  ⚠️ [pending entry] cancel stop loss orders: %v", err)
+		}
+		if err := at.trader.SetStopLoss(order.Symbol, sideUpper, quantity, decision.StopLoss); err != nil {
+			logger.Infof("  ⚠️ [pending entry] set stop loss: %v", err)
+			applyErrs = append(applyErrs, fmt.Sprintf("stop loss: %v", err))
+		} else {
+			at.setStopLossTarget(order.Symbol, strings.ToLower(sideUpper), decision.StopLoss)
 		}
 	}
-}
-
-func (at *AutoTrader) onStagedTakeProfitFullClose(symbol, side string) {
-	at.clearStagedTakeProfitState(symbol, side)
-	at.clearPositionTargets(symbol, side)
+	if decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0 {
+		if err := at.executeStagedTakeProfit(order.Symbol, sideUpper, quantity, decision); err != nil {
+			logger.Infof("  ⚠️ [pending entry] set take profit: %v", err)
+			applyErrs = append(applyErrs, fmt.Sprintf("take profit: %v", err))
+		}
+	}
+	if len(applyErrs) > 0 {
+		return fmt.Errorf(strings.Join(applyErrs, "; "))
+	}
+	return nil
 }
 
 func (at *AutoTrader) getAIDynamicTrailingStateSnapshot() map[string]*AIDynamicTrailingConfig {
@@ -1999,6 +2653,7 @@ func (at *AutoTrader) clearPositionTargets(symbol, side string) {
 	at.setTakeProfitTarget(symbol, side, 0)
 	at.setStopLossTarget(symbol, side, 0)
 	at.clearSafetyFloorTarget(symbol, side)
+	at.clearNativeTPOrderIDs(symbol, side)
 }
 
 func (at *AutoTrader) injectManagedTargets(position map[string]interface{}) map[string]interface{} {
@@ -2030,6 +2685,11 @@ func (at *AutoTrader) injectManagedTargets(position map[string]interface{}) map[
 	}
 	at.safetyFloorTargetsMu.RUnlock()
 
+	if ids := at.getNativeTPOrderIDs(symbol, side); len(ids) > 0 {
+		position["has_native_tp"] = true
+		position["tp_order_ids"] = ids
+	}
+
 	return position
 }
 
@@ -2041,6 +2701,14 @@ func (at *AutoTrader) registerAIDynamicTrailingState(symbol, side string, decisi
 		return
 	}
 	key := symbol + "_" + strings.ToLower(side)
+	if !at.hasResolvableTakeProfitTarget(symbol, side, decision) {
+		at.aiDynamicTrailingMu.Lock()
+		delete(at.aiDynamicTrailingState, key)
+		at.aiDynamicTrailingMu.Unlock()
+		logger.Infof("  ⚠️ [追踪止盈] skipped for %s %s: trailing params require a take_profit target (decision TP missing and no cached TP target found)",
+			symbol, strings.ToLower(side))
+		return
+	}
 	at.aiDynamicTrailingMu.Lock()
 	defer at.aiDynamicTrailingMu.Unlock()
 	state := at.aiDynamicTrailingState[key]
@@ -2057,6 +2725,16 @@ func (at *AutoTrader) registerAIDynamicTrailingState(symbol, side string, decisi
 	if decision.TrailingRetracePct > 0 {
 		state.TrailingRetracePct = decision.TrailingRetracePct
 	}
+}
+
+func (at *AutoTrader) hasResolvableTakeProfitTarget(symbol, side string, decision *kernel.Decision) bool {
+	if resolveTakeProfitTargetPrice(side, decision) > 0 {
+		return true
+	}
+	key := symbol + "_" + strings.ToLower(side)
+	at.takeProfitTargetsMu.RLock()
+	defer at.takeProfitTargetsMu.RUnlock()
+	return at.takeProfitTargets[key] > 0
 }
 
 func (at *AutoTrader) clearAIDynamicTrailingState(symbol, side string) {
@@ -2251,21 +2929,12 @@ func (at *AutoTrader) updateTpSlForExistingPosition(decision *kernel.Decision) b
 	sideUpper := strings.ToUpper(posSide)
 	updateTP := decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0
 	updateSL := decision.StopLoss > 0
-	useSystemStagedTP := at.useSystemStagedTakeProfit(decision)
 	logger.Infof("  📍 [updateTpSl] %s 已有 %s 持仓 qty=%.4f，updateTP=%v updateSL=%v (TP=%.4f, stages=%d, SL=%.4f)",
 		decision.Symbol, posSide, quantity, updateTP, updateSL, decision.TakeProfit, len(decision.TakeProfitStages), decision.StopLoss)
 	// Only cancel and set TP when AI provided a new take_profit / take_profit_stages; otherwise keep existing TP (trailing stop = SL only).
 	if updateTP {
-		if useSystemStagedTP {
-			stages := at.normalizeStaticTakeProfitStages(decision.TakeProfitStages, sideUpper)
-			at.registerStagedTakeProfitState(decision.Symbol, posSide, entryPrice, quantity, decision.StopLoss, stages)
-			at.setTakeProfitTarget(decision.Symbol, posSide, resolveTakeProfitTargetPrice(sideUpper, decision))
-			if err := at.trader.CancelTakeProfitOrders(decision.Symbol); err != nil {
-				logger.Infof("  ⚠️ [updateTpSl] cancel take profit orders for system-staged TP: %v", err)
-			}
-		} else {
-			at.clearStagedTakeProfitState(decision.Symbol, posSide)
-			at.applyStaticTakeProfit(decision.Symbol, sideUpper, quantity, decision)
+		if err := at.executeStagedTakeProfit(decision.Symbol, sideUpper, quantity, decision); err != nil {
+			logger.Infof("  ⚠️ [updateTpSl] set take profit: %v", err)
 		}
 	} else {
 		logger.Infof("  ✓ [updateTpSl] take_profit not set (≤0 or omitted), keeping existing TP order")
@@ -2280,11 +2949,6 @@ func (at *AutoTrader) updateTpSlForExistingPosition(decision *kernel.Decision) b
 		} else {
 			logger.Infof("  ✓ [updateTpSl] stop loss set: %.4f", decision.StopLoss)
 			at.setStopLossTarget(decision.Symbol, posSide, decision.StopLoss)
-			at.stagedTakeProfitMu.Lock()
-			if state := at.stagedTakeProfitState[decision.Symbol+"_"+posSide]; state != nil {
-				state.StopLoss = decision.StopLoss
-			}
-			at.stagedTakeProfitMu.Unlock()
 		}
 	}
 	return true
@@ -2294,7 +2958,7 @@ func (at *AutoTrader) updateTpSlForExistingPosition(decision *kernel.Decision) b
 // - 若 decision.TakeProfitStages 非空，则根据各档 close_pct 按当前持仓数量拆分多笔 TP 单；
 // - 否则退回到单一 take_profit。
 // 注意：这里的 close_pct 是针对“当前剩余仓位”的百分比，而不是开仓时的原始仓位。
-func (at *AutoTrader) applyStaticTakeProfit(symbol, posSideUpper string, quantity float64, decision *kernel.Decision) {
+func (at *AutoTrader) applyStaticTakeProfit(symbol, posSideUpper string, quantity float64, decision *kernel.Decision) error {
 	stages := at.normalizeStaticTakeProfitStages(decision.TakeProfitStages, posSideUpper)
 	at.setTakeProfitTarget(symbol, posSideUpper, resolveTakeProfitTargetPrice(posSideUpper, decision))
 
@@ -2307,18 +2971,20 @@ func (at *AutoTrader) applyStaticTakeProfit(symbol, posSideUpper string, quantit
 	if len(stages) == 0 {
 		if decision.TakeProfit <= 0 {
 			logger.Infof("  ⚠️ [applyStaticTakeProfit] no valid take_profit_stages and take_profit ≤ 0, skip setting TP")
-			return
+			return nil
 		}
 		if err := at.trader.SetTakeProfit(symbol, posSideUpper, quantity, decision.TakeProfit); err != nil {
 			logger.Infof("  ⚠️ [applyStaticTakeProfit] set single take profit: %v", err)
+			return err
 		} else {
 			logger.Infof("  ✓ [applyStaticTakeProfit] single take profit set: price=%.4f qty=%.4f", decision.TakeProfit, quantity)
 		}
-		return
+		return nil
 	}
 
 	remaining := quantity
 	var assigned float64
+	var tpErrs []string
 	for idx, st := range stages {
 		if remaining <= 0 {
 			break
@@ -2338,6 +3004,7 @@ func (at *AutoTrader) applyStaticTakeProfit(symbol, posSideUpper string, quantit
 		if err := at.trader.SetTakeProfit(symbol, posSideUpper, stageQty, st.Price); err != nil {
 			logger.Infof("  ⚠️ [applyStaticTakeProfit] set TP stage %d failed: price=%.4f qty=%.4f (%.2f%% of %.4f): %v",
 				idx+1, st.Price, stageQty, st.ClosePct, quantity, err)
+			tpErrs = append(tpErrs, fmt.Sprintf("stage %d: %v", idx+1, err))
 		} else {
 			logger.Infof("  ✓ [applyStaticTakeProfit] TP stage %d set: price=%.4f qty=%.4f (%.2f%% of %.4f)",
 				idx+1, st.Price, stageQty, st.ClosePct, quantity)
@@ -2346,6 +3013,10 @@ func (at *AutoTrader) applyStaticTakeProfit(symbol, posSideUpper string, quantit
 		assigned += stageQty
 		remaining -= stageQty
 	}
+	if len(tpErrs) > 0 {
+		return fmt.Errorf(strings.Join(tpErrs, "; "))
+	}
+	return nil
 }
 
 // normalizeStaticTakeProfitStages 过滤非法 close_pct/price，并根据多空方向做价格排序；最多保留 5 档，避免过多 TP 订单。
@@ -2416,6 +3087,7 @@ func (at *AutoTrader) ExecuteDecision(d *kernel.Decision) error {
 		Leverage:              d.Leverage,
 		StopLoss:              d.StopLoss,
 		TakeProfit:            d.TakeProfit,
+		TakeProfitStages:      decisionTakeProfitStagesForRecord(d.TakeProfitStages),
 		TrailingActivationPct: d.TrailingActivationPct,
 		TrailingRetracePct:    d.TrailingRetracePct,
 		Confidence:            d.Confidence,
@@ -2436,6 +3108,9 @@ func (at *AutoTrader) ExecuteDecision(d *kernel.Decision) error {
 // executeOpenLongWithRecord executes open long position and records detailed information
 // aiReasoning 为本轮 CoT，实盘会写入 pending_reasonings 供 OrderSync 创建仓位时填充 ai_reasoning_at_open
 func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction, aiReasoning string) error {
+	if at.config.EnableLimitEntry {
+		return at.executeOpenLongLimitWithRecord(decision, actionRecord, aiReasoning)
+	}
 	logger.Infof("  📈 Open long: %s", decision.Symbol)
 
 	// ⚠️ Get current positions for multiple checks
@@ -2584,15 +3259,10 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 			at.setStopLossTarget(decision.Symbol, "long", decision.StopLoss)
 		}
 	}
-	if at.useSystemStagedTakeProfit(decision) {
-		stages := at.normalizeStaticTakeProfitStages(decision.TakeProfitStages, "LONG")
-		at.registerStagedTakeProfitState(decision.Symbol, "long", marketData.CurrentPrice, quantity, decision.StopLoss, stages)
-		at.setTakeProfitTarget(decision.Symbol, "long", resolveTakeProfitTargetPrice("LONG", decision))
-		if err := at.trader.CancelTakeProfitOrders(decision.Symbol); err != nil {
-			logger.Infof("  ⚠ Failed to clear existing take profit orders before system-staged TP: %v", err)
+	if decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0 {
+		if err := at.executeStagedTakeProfit(decision.Symbol, "LONG", quantity, decision); err != nil {
+			logger.Infof("  ⚠ Failed to set take profit: %v", err)
 		}
-	} else if decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0 {
-		at.applyStaticTakeProfit(decision.Symbol, "LONG", quantity, decision)
 	}
 
 	return nil
@@ -2601,6 +3271,9 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 // executeOpenShortWithRecord executes open short position and records detailed information
 // aiReasoning 为本轮 CoT，实盘会写入 pending_reasonings 供 OrderSync 创建仓位时填充 ai_reasoning_at_open
 func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction, aiReasoning string) error {
+	if at.config.EnableLimitEntry {
+		return at.executeOpenShortLimitWithRecord(decision, actionRecord, aiReasoning)
+	}
 	logger.Infof("  📉 Open short: %s", decision.Symbol)
 
 	// ⚠️ Get current positions for multiple checks
@@ -2749,15 +3422,10 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 			at.setStopLossTarget(decision.Symbol, "short", decision.StopLoss)
 		}
 	}
-	if at.useSystemStagedTakeProfit(decision) {
-		stages := at.normalizeStaticTakeProfitStages(decision.TakeProfitStages, "SHORT")
-		at.registerStagedTakeProfitState(decision.Symbol, "short", marketData.CurrentPrice, quantity, decision.StopLoss, stages)
-		at.setTakeProfitTarget(decision.Symbol, "short", resolveTakeProfitTargetPrice("SHORT", decision))
-		if err := at.trader.CancelTakeProfitOrders(decision.Symbol); err != nil {
-			logger.Infof("  ⚠ Failed to clear existing take profit orders before system-staged TP: %v", err)
+	if decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0 {
+		if err := at.executeStagedTakeProfit(decision.Symbol, "SHORT", quantity, decision); err != nil {
+			logger.Infof("  ⚠ Failed to set take profit: %v", err)
 		}
-	} else if decision.TakeProfit > 0 || len(decision.TakeProfitStages) > 0 {
-		at.applyStaticTakeProfit(decision.Symbol, "SHORT", quantity, decision)
 	}
 
 	return nil
@@ -2827,7 +3495,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 	actualQty, _ := at.getPositionQuantity(decision.Symbol, "long")
 	if actualQty <= 0 {
 		logger.Infof("  ✓ 仓位已无或已平，跳过 close_long (避免 -2022)")
-		at.clearStagedTakeProfitState(decision.Symbol, "long")
+		at.clearNativeTPOrderIDs(decision.Symbol, "long")
 		at.onATRFullClose(decision.Symbol, "long")
 		return nil
 	}
@@ -2848,7 +3516,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 			bt.ForceZeroPositionInCache(decision.Symbol, "LONG")
 		}
 		logger.Infof("  ✓ Position already closed, skipped (ghost cache cleared)")
-		at.clearStagedTakeProfitState(decision.Symbol, "long")
+		at.clearNativeTPOrderIDs(decision.Symbol, "long")
 		at.clearPositionTargets(decision.Symbol, "long")
 		return nil
 	}
@@ -2860,7 +3528,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 
 	// Record order to database and poll for confirmation
 	at.recordAndConfirmOrder(order, decision.Symbol, "close_long", closeQty, marketData.CurrentPrice, 0, entryPrice)
-	at.clearStagedTakeProfitState(decision.Symbol, "long")
+	at.clearNativeTPOrderIDs(decision.Symbol, "long")
 
 	if closeQty >= quantity {
 		at.onATRFullClose(decision.Symbol, "long")
@@ -2933,7 +3601,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 	actualQty, _ := at.getPositionQuantity(decision.Symbol, "short")
 	if actualQty <= 0 {
 		logger.Infof("  ✓ 仓位已无或已平，跳过 close_short (避免 -2022)")
-		at.clearStagedTakeProfitState(decision.Symbol, "short")
+		at.clearNativeTPOrderIDs(decision.Symbol, "short")
 		at.onATRFullClose(decision.Symbol, "short")
 		return nil
 	}
@@ -2954,7 +3622,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 			bt.ForceZeroPositionInCache(decision.Symbol, "SHORT")
 		}
 		logger.Infof("  ✓ Position already closed, skipped (ghost cache cleared)")
-		at.clearStagedTakeProfitState(decision.Symbol, "short")
+		at.clearNativeTPOrderIDs(decision.Symbol, "short")
 		at.clearPositionTargets(decision.Symbol, "short")
 		return nil
 	}
@@ -2966,7 +3634,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 
 	// Record order to database and poll for confirmation
 	at.recordAndConfirmOrder(order, decision.Symbol, "close_short", closeQty, marketData.CurrentPrice, 0, entryPrice)
-	at.clearStagedTakeProfitState(decision.Symbol, "short")
+	at.clearNativeTPOrderIDs(decision.Symbol, "short")
 
 	if closeQty >= quantity {
 		at.onATRFullClose(decision.Symbol, "short")
@@ -3019,6 +3687,16 @@ func (at *AutoTrader) SetCustomPrompt(prompt string) {
 // SetOverrideBasePrompt sets whether to override base prompt
 func (at *AutoTrader) SetOverrideBasePrompt(override bool) {
 	at.overrideBasePrompt = override
+}
+
+// SetVirtualEquity updates the in-memory virtual equity baseline.
+func (at *AutoTrader) SetVirtualEquity(value float64) {
+	at.config.VirtualEquity = value
+}
+
+// SetInitialBalance updates the in-memory initial balance baseline.
+func (at *AutoTrader) SetInitialBalance(value float64) {
+	at.initialBalance = value
 }
 
 // GetSystemPromptTemplate gets current system prompt template name (from strategy config)
@@ -3180,11 +3858,107 @@ func (at *AutoTrader) getVirtualPositions() ([]map[string]interface{}, error) {
 			"liquidationPrice":   0.0,
 			"marginUsed":         marginUsed,
 			"source":             pos.Source,
+			"take_profit":        pos.TakeProfit,
+			"stop_loss":          pos.StopLoss,
 			"unrealizedPnlPct":   unrealizedPnLPct,
 		})
 		at.injectManagedTargets(result[len(result)-1])
 	}
 	return result, nil
+}
+
+func (at *AutoTrader) getWatchdogPositions() ([]map[string]interface{}, error) {
+	if at.usesVirtualExecution() {
+		return at.getVirtualPositions()
+	}
+
+	if binanceTrader, ok := at.trader.(*binance.FuturesTrader); ok {
+		if cached, ok := binanceTrader.GetPositionsFromCache(); ok {
+			withTargets := make([]map[string]interface{}, 0, len(cached))
+			for _, pos := range cached {
+				withTargets = append(withTargets, at.injectManagedTargets(pos))
+			}
+			return withTargets, nil
+		}
+	}
+
+	positions, err := at.trader.GetPositions()
+	if err != nil {
+		return nil, err
+	}
+	for i := range positions {
+		at.injectManagedTargets(positions[i])
+	}
+	return positions, nil
+}
+
+func (at *AutoTrader) closeManagedWatchdogPosition(symbol, side string, quantity float64) (map[string]interface{}, error) {
+	if !at.usesVirtualExecution() {
+		if side == "long" {
+			return at.trader.CloseLong(symbol, quantity)
+		}
+		return at.trader.CloseShort(symbol, quantity)
+	}
+
+	action := "close_short"
+	if side == "long" {
+		action = "close_long"
+	}
+	decision := &kernel.Decision{
+		Symbol:   symbol,
+		Action:   action,
+		Quantity: quantity,
+	}
+	actionRecord := &store.DecisionAction{
+		Symbol:    symbol,
+		Action:    action,
+		Quantity:  quantity,
+		Timestamp: time.Now().UTC(),
+	}
+	if at.config.IsShadow {
+		if err := at.executeShadowDecision(decision, actionRecord, ""); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := at.executeDryRunOrder(decision, actionRecord, action, ""); err != nil {
+			return nil, err
+		}
+	}
+	return map[string]interface{}{
+		"orderId":   at.dryRunOrderID(),
+		"symbol":    symbol,
+		"side":      side,
+		"quantity":  actionRecord.Quantity,
+		"price":     actionRecord.Price,
+		"source":    at.virtualPositionSource(),
+		"synthetic": true,
+	}, nil
+}
+
+func (at *AutoTrader) recordVirtualWatchdogClose(symbol, action string, quantity, exitPrice, entryPrice float64) {
+	if at.store == nil {
+		return
+	}
+	record := &store.DecisionRecord{
+		Timestamp:     time.Now().UTC(),
+		ExecutionLog:  []string{fmt.Sprintf("[watchdog] %s %s qty=%.6f exit=%.6f entry=%.6f", symbol, action, quantity, exitPrice, entryPrice)},
+		Success:       true,
+		CandidateCoins: []string{symbol},
+		Decisions: []store.DecisionAction{
+			{
+				Action:    action,
+				Symbol:    symbol,
+				Quantity:  quantity,
+				Price:     exitPrice,
+				Timestamp: time.Now().UTC(),
+				Success:   true,
+				Reasoning: "watchdog_virtual_close",
+			},
+		},
+	}
+	if err := at.saveDecision(record); err != nil {
+		logger.Infof("⚠️ Failed to save virtual watchdog decision: %v", err)
+	}
 }
 
 // GetAccountInfo gets account information (for API)
@@ -3397,7 +4171,9 @@ func sortDecisionsByPriority(decisions []kernel.Decision) []kernel.Decision {
 		switch action {
 		case "close_long", "close_short":
 			return 1 // Highest priority: close positions first
-		case "open_long", "open_short":
+		case "cancel_order":
+			return 2
+		case "open_long", "open_short", "open_long_limit", "open_short_limit":
 			return 2 // Second priority: open positions later
 		case "hold", "wait":
 			return 3 // Lowest priority: wait
@@ -3825,7 +4601,7 @@ func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
 	default:
 		return fmt.Errorf("unknown position direction: %s", side)
 	}
-	at.clearStagedTakeProfitState(symbol, side)
+	at.clearNativeTPOrderIDs(symbol, side)
 	// 清除 ATR 移动止盈止损状态，避免 watchdog 继续追踪已平仓位
 	at.onATRFullClose(symbol, side)
 	return nil

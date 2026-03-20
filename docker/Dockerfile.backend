@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # docker/backend/Dockerfile
 
 # ═══════════════════════════════════════════════════════════════
@@ -16,12 +17,15 @@ RUN apk update && apk add --no-cache git make
 
 WORKDIR /app
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 COPY . .
 
 # Pure Go 构建 - 无 CGO
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o nofx .
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o nofx .
 
 # ──────────────────────────────────────────────────────────────
 # Stage 2: Runtime (最小化镜像)

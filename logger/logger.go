@@ -84,8 +84,11 @@ func Init(cfg *Config) error {
 	// Set compact formatter
 	Log.SetFormatter(&compactFormatter{})
 
-	// Setup log file output (write to both stdout and file)
-	logDir := "data"
+	// Default logs to a dedicated subdirectory so they can be mounted separately.
+	logDir := os.Getenv("NOFX_LOG_DIR")
+	if logDir == "" {
+		logDir = filepath.Join("data", "logs")
+	}
 	if err := os.MkdirAll(logDir, 0755); err == nil {
 		logFileName := filepath.Join(logDir, fmt.Sprintf("nofx_%s.log", time.Now().Format("2006-01-02")))
 		f, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)

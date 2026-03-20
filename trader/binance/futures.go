@@ -1109,10 +1109,15 @@ func (t *FuturesTrader) PlaceLimitOrder(req *types.LimitOrderRequest) (*types.Li
 
 	if req.Side == "BUY" {
 		side = futures.SideTypeBuy
-		positionSide = futures.PositionSideTypeLong
 	} else {
 		side = futures.SideTypeSell
+	}
+
+	switch strings.ToUpper(strings.TrimSpace(req.PositionSide)) {
+	case "SHORT":
 		positionSide = futures.PositionSideTypeShort
+	default:
+		positionSide = futures.PositionSideTypeLong
 	}
 
 	// Build order service with broker ID
@@ -1125,6 +1130,10 @@ func (t *FuturesTrader) PlaceLimitOrder(req *types.LimitOrderRequest) (*types.Li
 		Quantity(quantityStr).
 		Price(priceStr).
 		NewClientOrderID(getBrOrderID())
+
+	if req.ReduceOnly {
+		orderService = orderService.ReduceOnly(true)
+	}
 
 	// Execute order
 	order, err := orderService.Do(context.Background())

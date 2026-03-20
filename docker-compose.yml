@@ -12,12 +12,14 @@ services:
       - "6060:6060"  # pprof profiling
     volumes:
       - ./data:/app/data
+      - /mnt/archive/nofx_logs:/app/data/logs
       - /etc/localtime:/etc/localtime:ro
     env_file:
       - .env
     environment:
       - TZ=${TZ:-Asia/Shanghai}
       - AI_MAX_TOKENS=8000
+      - NOFX_LOG_DIR=/app/data/logs
       - CZSC_SERVICE_URL=http://czsc_service:8765
     networks:
       - nofx-network

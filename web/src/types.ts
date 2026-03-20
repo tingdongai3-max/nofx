@@ -42,10 +42,12 @@ export interface Position {
   margin_used: number
   stop_loss?: number
   take_profit?: number
+  has_native_tp?: boolean
+  tp_order_ids?: string[]
   safety_floor_sl?: number
-  trailing_activation_pct?: number // tp_progress for global config, price_move for AI dynamic trailing
-  trailing_activation_mode?: 'tp_progress' | 'price_move'
-  trailing_retrace_pct?: number // Underlying price retrace %
+  trailing_activation_pct?: number // Take-profit target progress ratio (0-100)
+  trailing_activation_mode?: 'tp_progress'
+  trailing_retrace_pct?: number // Allowed giveback ratio of earned profit (0-100)
   source?: string // e.g. "dry_run" for paper trading
 }
 
@@ -57,8 +59,8 @@ export interface DecisionAction {
   price: number
   stop_loss?: number // Stop loss price
   take_profit?: number // Take profit price
-  trailing_activation_pct?: number // Underlying price move %, not leveraged ROI
-  trailing_retrace_pct?: number // Underlying price retrace %
+  trailing_activation_pct?: number // Take-profit target progress ratio (0-100)
+  trailing_retrace_pct?: number // Allowed giveback ratio of earned profit (0-100)
   confidence?: number // AI confidence (0-100)
   reasoning?: string // Brief reasoning
   order_id: number
@@ -118,6 +120,7 @@ export interface TraderInfo {
   system_prompt_template?: string
   is_dry_run?: boolean
   virtual_equity?: number
+  enable_limit_entry?: boolean
 }
 
 export interface EquitySnapshot {
@@ -142,8 +145,29 @@ export interface ColliderVariant {
   system_prompt_template?: string
   initial_balance: number
   virtual_equity: number
+  decision_count: number
+  equity_last: number
+  return_pct: number
+  drawdown_pct: number
   decisions: DecisionRecord[]
   equity_snapshots: EquitySnapshot[]
+  coach_logs: ExperimentLogRecord[]
+}
+
+export interface ExperimentLogRecord {
+  id: number
+  experiment_id: string
+  user_id: string
+  coach_model_id: string
+  coach_reasoning: string
+  winner_trader_ids: string[]
+  loser_trader_ids: string[]
+  replaced_trader_ids: string[]
+  old_prompt: string
+  new_prompt: string
+  prompt_diff: string
+  summary: string
+  created_at: string
 }
 
 export interface ColliderExperiment {
@@ -231,7 +255,9 @@ export interface CreateTraderRequest {
   is_cross_margin?: boolean
   show_in_competition?: boolean // 是否在竞技场显示
   is_dry_run?: boolean // 开启模拟盘 (Dry-Run Mode)
+  is_shadow?: boolean
   virtual_equity?: number // 模拟盘虚拟本金（如 10000 USDT）
+  enable_limit_entry?: boolean
   // 以下字段为向后兼容保留，新版使用策略配置
   btc_eth_leverage?: number
   altcoin_leverage?: number
@@ -311,7 +337,9 @@ export interface TraderConfigData {
   initial_balance: number
   is_running: boolean
   is_dry_run?: boolean
+  is_shadow?: boolean
   virtual_equity?: number
+  enable_limit_entry?: boolean
   // 以下为旧版字段（向后兼容）
   btc_eth_leverage?: number
   altcoin_leverage?: number

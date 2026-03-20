@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"nofx/logger"
 	"sync"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -326,6 +327,26 @@ func (s *Store) ExperimentLog() *ExperimentLogStore {
 		s.experimentLog = NewExperimentLogStore(s.gdb)
 	}
 	return s.experimentLog
+}
+
+// CleanupTraderVariantDataBefore removes stale decision/equity rows produced by an old trader variant.
+func (s *Store) CleanupTraderVariantDataBefore(traderID string, cutoff time.Time) error {
+	if traderID == "" || cutoff.IsZero() {
+		return nil
+	}
+
+	decisionRows, err := s.Decision().DeleteBeforeCreatedAt(traderID, cutoff)
+	if err != nil {
+		return err
+	}
+	equityRows, err := s.Equity().DeleteBeforeCreatedAt(traderID, cutoff)
+	if err != nil {
+		return err
+	}
+
+	logger.Infof("🧹 Cleaned stale variant data for trader %s before %s (decisions=%d equity=%d)",
+		traderID, cutoff.UTC().Format(time.RFC3339), decisionRows, equityRows)
+	return nil
 }
 
 // TraderAdmin gets trader admin storage

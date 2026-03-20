@@ -33,6 +33,7 @@ type Trader struct {
 	ShowInCompetition   bool      `gorm:"column:show_in_competition;default:true" json:"show_in_competition"`
 	IsDryRun            bool      `gorm:"column:is_dry_run;default:false" json:"is_dry_run"`                   // 模拟盘：不真实下单，仅本地撮合与落库
 	VirtualEquity       float64   `gorm:"column:virtual_equity;default:0" json:"virtual_equity"`             // 模拟盘本金（USDT），IsDryRun 时 Prompt 用此值
+	EnableLimitEntry    bool      `gorm:"column:enable_limit_entry;default:false" json:"enable_limit_entry"`
 	ResetTimestamp      time.Time `gorm:"column:reset_timestamp" json:"reset_timestamp"`
 	CreatedAt           time.Time `gorm:"column:created_at;autoCreateTime" json:"created_at"`
 	UpdatedAt           time.Time `gorm:"column:updated_at;autoUpdateTime" json:"updated_at"`
@@ -73,6 +74,7 @@ func (s *TraderStore) initTables() error {
 			}{
 				{column: "reset_timestamp", sql: `ALTER TABLE traders ADD COLUMN reset_timestamp TIMESTAMPTZ NULL`},
 				{column: "is_shadow", sql: `ALTER TABLE traders ADD COLUMN is_shadow BOOLEAN NOT NULL DEFAULT FALSE`},
+				{column: "enable_limit_entry", sql: `ALTER TABLE traders ADD COLUMN enable_limit_entry BOOLEAN NOT NULL DEFAULT FALSE`},
 			} {
 				var columnExists int64
 				s.db.Raw(`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'traders' AND column_name = ?`, migration.column).Scan(&columnExists)
@@ -94,6 +96,7 @@ func (s *TraderStore) initTables() error {
 		}{
 			{column: "reset_timestamp", sql: `ALTER TABLE traders ADD COLUMN reset_timestamp DATETIME`},
 			{column: "is_shadow", sql: `ALTER TABLE traders ADD COLUMN is_shadow BOOLEAN NOT NULL DEFAULT FALSE`},
+			{column: "enable_limit_entry", sql: `ALTER TABLE traders ADD COLUMN enable_limit_entry BOOLEAN NOT NULL DEFAULT FALSE`},
 		} {
 			var columnExists int64
 			s.db.Raw(`SELECT COUNT(*) FROM pragma_table_info('traders') WHERE name = ?`, migration.column).Scan(&columnExists)
@@ -151,6 +154,7 @@ func (s *TraderStore) Update(trader *Trader) error {
 		"show_in_competition": trader.ShowInCompetition,
 		"is_dry_run":          trader.IsDryRun,
 		"virtual_equity":      trader.VirtualEquity,
+		"enable_limit_entry":  trader.EnableLimitEntry,
 	}
 
 	// Only update these if > 0
@@ -182,6 +186,16 @@ func (s *TraderStore) UpdateVirtualEquity(userID, id string, virtualEquity float
 	return s.db.Model(&Trader{}).
 		Where("id = ? AND user_id = ?", id, userID).
 		Update("virtual_equity", virtualEquity).Error
+}
+
+// ResetVirtualGeneration resets a virtual trader to a clean generation baseline.
+func (s *TraderStore) ResetVirtualGeneration(userID, id string, initialBalance, virtualEquity float64) error {
+	return s.db.Model(&Trader{}).
+		Where("id = ? AND user_id = ?", id, userID).
+		Updates(map[string]interface{}{
+			"initial_balance": initialBalance,
+			"virtual_equity":  virtualEquity,
+		}).Error
 }
 
 // UpdateResetTimestamp updates a trader's logical reset time without deleting any historical rows.

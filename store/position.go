@@ -90,6 +90,8 @@ type TraderPosition struct {
 	EntryQuantity      float64 `gorm:"column:entry_quantity;default:0" json:"entry_quantity"`
 	Quantity           float64 `gorm:"column:quantity;not null" json:"quantity"`
 	EntryPrice         float64 `gorm:"column:entry_price;not null" json:"entry_price"`
+	TakeProfit         float64 `gorm:"column:take_profit;default:0" json:"take_profit"`
+	StopLoss           float64 `gorm:"column:stop_loss;default:0" json:"stop_loss"`
 	EntryOrderID       string  `gorm:"column:entry_order_id;default:''" json:"entry_order_id"`
 	EntryTime          int64   `gorm:"column:entry_time;not null;index:idx_positions_entry" json:"entry_time"` // Unix milliseconds UTC
 	ExitPrice          float64 `gorm:"column:exit_price;default:0" json:"exit_price"`
@@ -183,6 +185,15 @@ func (s *PositionStore) InitTables() error {
 				}
 			}
 
+			// Ensure TP/SL columns exist for virtual position replay and watchdog recovery.
+			for _, col := range []string{"take_profit", "stop_loss"} {
+				var count int64
+				s.db.Raw(`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'trader_positions' AND column_name = ?`, col).Scan(&count)
+				if count == 0 {
+					s.db.Exec(fmt.Sprintf(`ALTER TABLE trader_positions ADD COLUMN %s DOUBLE PRECISION DEFAULT 0`, col))
+				}
+			}
+
 			// Ensure indicator snapshot columns exist (Pre-computed for 指标分析 秒开)
 			for _, col := range []string{"entry_indicators", "exit_indicators"} {
 				var count int64
@@ -211,7 +222,7 @@ func (s *PositionStore) InitTables() error {
 	// For SQLite (or non-PostgreSQL), ensure MFE/MAE columns exist after AutoMigrate
 	if !s.isPostgres() {
 		// SQLite: check if column exists using PRAGMA
-		for _, col := range []string{"max_favorable_excursion", "max_adverse_excursion"} {
+		for _, col := range []string{"max_favorable_excursion", "max_adverse_excursion", "take_profit", "stop_loss"} {
 			var count int64
 			s.db.Raw(fmt.Sprintf("SELECT COUNT(*) FROM pragma_table_info('trader_positions') WHERE name = ?", col)).Scan(&count)
 			if count == 0 {
@@ -398,6 +409,15 @@ func (s *PositionStore) ClosePositionFully(id int64, exitPrice float64, exitOrde
 // DeleteAllOpenPositions deletes all OPEN positions for a trader
 func (s *PositionStore) DeleteAllOpenPositions(traderID string) error {
 	return s.db.Where("trader_id = ? AND status = ?", traderID, "OPEN").Delete(&TraderPosition{}).Error
+}
+
+// DeleteOpenPositionsBySource deletes all OPEN positions for a trader/source pair.
+func (s *PositionStore) DeleteOpenPositionsBySource(traderID, source string) error {
+	q := s.db.Where("trader_id = ? AND status = ?", traderID, "OPEN")
+	if source != "" {
+		q = q.Where("source = ?", source)
+	}
+	return q.Delete(&TraderPosition{}).Error
 }
 
 // DeleteAllRecordsByTrader deletes all persisted runtime data for a trader so it can restart from a blank state.
@@ -969,9 +989,11 @@ func (s *PositionStore) GetRecentTradesBySourceSince(traderID string, limit int,
 // RecentTradeWithReasoning extends RecentTrade with AI reasoning at open and close metadata (原证复核 + 防串线)
 type RecentTradeWithReasoning struct {
 	RecentTrade
-	PositionID       int64  `json:"position_id"`        // 唯一仓位 ID，防串线
-	AiReasoningAtOpen string `json:"ai_reasoning_at_open"` // 开仓时原始思维链（仅来自 DB，禁止 AI 改写）
-	CloseReason      string `json:"close_reason"`       // 系统平仓触发点：StopLoss / TakeProfit / sync 等
+	TraderID          string `json:"trader_id,omitempty"`       // 显式携带归属交易员，防止上下文串线
+	Source            string `json:"source,omitempty"`          // dry_run / real / sync
+	PositionID        int64  `json:"position_id"`               // 唯一仓位 ID，防串线
+	AiReasoningAtOpen string `json:"ai_reasoning_at_open"`      // 开仓时原始思维链（仅来自 DB，禁止 AI 改写）
+	CloseReason       string `json:"close_reason"`              // 系统平仓触发点：StopLoss / TakeProfit / sync 等
 }
 
 type CoachFailureCase struct {
@@ -1086,6 +1108,8 @@ func (s *PositionStore) GetRecentTradesWithReasoning(traderID string, limit int)
 				RealizedPnL: pos.RealizedPnL,
 				EntryTime:   pos.EntryTime / 1000,
 			},
+			TraderID:          pos.TraderID,
+			Source:            pos.Source,
 			PositionID:        pos.ID,
 			AiReasoningAtOpen: pos.AiReasoningAtOpen,
 			CloseReason:       pos.CloseReason,
@@ -1105,6 +1129,11 @@ func (s *PositionStore) GetRecentTradesWithReasoning(traderID string, limit int)
 		trades = append(trades, t)
 	}
 	return trades, nil
+}
+
+// GetRecentTradesWithReasoningSince returns recent closed trades including AI reasoning at open, filtered by reset timestamp.
+func (s *PositionStore) GetRecentTradesWithReasoningSince(traderID string, limit int, resetAt time.Time) ([]RecentTradeWithReasoning, error) {
+	return s.GetRecentTradesWithReasoningBySourceSince(traderID, limit, "", resetAt)
 }
 
 // GetRecentTradesWithReasoningBySource 按 source 过滤的近期平仓+开仓逻辑（模拟盘用 source=\"dry_run\"）
@@ -1129,6 +1158,8 @@ func (s *PositionStore) GetRecentTradesWithReasoningBySource(traderID string, li
 				RealizedPnL: pos.RealizedPnL,
 				EntryTime:   pos.EntryTime / 1000,
 			},
+			TraderID:          pos.TraderID,
+			Source:            pos.Source,
 			PositionID:        pos.ID,
 			AiReasoningAtOpen: pos.AiReasoningAtOpen,
 			CloseReason:       pos.CloseReason,
@@ -1167,6 +1198,8 @@ func (s *PositionStore) GetRecentTradesWithReasoningBySourceSince(traderID strin
 				RealizedPnL: pos.RealizedPnL,
 				EntryTime:   pos.EntryTime / 1000,
 			},
+			TraderID:          pos.TraderID,
+			Source:            pos.Source,
 			PositionID:        pos.ID,
 			AiReasoningAtOpen: pos.AiReasoningAtOpen,
 			CloseReason:       pos.CloseReason,
@@ -1226,6 +1259,20 @@ func (s *PositionStore) GetWorstFailureCasesBySourceSince(traderID, source strin
 		})
 	}
 	return result, nil
+}
+
+// CountNonVirtualPositionsSince returns the number of non-virtual positions opened on/after resetAt.
+// This is used to decide whether a real account handover notice should still be shown to the AI.
+func (s *PositionStore) CountNonVirtualPositionsSince(traderID string, resetAt time.Time) (int, error) {
+	q := s.withResetCutoff(s.db.Model(&TraderPosition{}), resetAt).
+		Where("trader_id = ?", traderID).
+		Where("source NOT IN ?", []string{"dry_run", "shadow"})
+
+	var count int64
+	if err := q.Count(&count).Error; err != nil {
+		return 0, fmt.Errorf("failed to count non-virtual positions: %w", err)
+	}
+	return int(count), nil
 }
 
 // GetClosedCountSince 返回自某时刻（Unix 毫秒）以来被平仓的仓位数量（用于「未决策期间空档复盘」ALERT）

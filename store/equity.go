@@ -39,10 +39,25 @@ func (s *EquityStore) initTables() error {
 		var tableExists int64
 		s.db.Raw(`SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'trader_equity_snapshots'`).Scan(&tableExists)
 		if tableExists > 0 {
-			return nil
+			return s.ensureIndexes()
 		}
 	}
-	return s.db.AutoMigrate(&EquitySnapshot{})
+	if err := s.db.AutoMigrate(&EquitySnapshot{}); err != nil {
+		return err
+	}
+	return s.ensureIndexes()
+}
+
+func (s *EquityStore) ensureIndexes() error {
+	for _, sql := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_equity_trader_time ON trader_equity_snapshots(trader_id, timestamp DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_equity_trader_created ON trader_equity_snapshots(trader_id, created_at DESC)`,
+	} {
+		if err := s.db.Exec(sql).Error; err != nil {
+			return fmt.Errorf("failed to ensure equity index: %w", err)
+		}
+	}
+	return nil
 }
 
 // Save saves equity snapshot
@@ -143,6 +158,16 @@ func (s *EquityStore) CleanOldRecords(traderID string, days int) (int64, error) 
 		Delete(&EquitySnapshot{})
 	if result.Error != nil {
 		return 0, fmt.Errorf("failed to clean old records: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
+// DeleteBeforeCreatedAt deletes stale equity rows created before the cutoff.
+func (s *EquityStore) DeleteBeforeCreatedAt(traderID string, cutoff time.Time) (int64, error) {
+	result := s.db.Where("trader_id = ? AND created_at < ?", traderID, cutoff.UTC()).
+		Delete(&EquitySnapshot{})
+	if result.Error != nil {
+		return 0, fmt.Errorf("failed to delete stale equity snapshots: %w", result.Error)
 	}
 	return result.RowsAffected, nil
 }

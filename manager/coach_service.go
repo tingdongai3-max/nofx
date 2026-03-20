@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"encoding/xml"
 	"fmt"
 	"nofx/logger"
 	"nofx/mcp"
@@ -15,24 +16,49 @@ import (
 const defaultCoachSystemPrompt = `# Role: Senior Quantitative Prompt Engineer & Trading Coach
 
 ## Objective
-你现在的任务是优化一组 AI 交易员的提示词。你将看到一个“主提示词”以及它派生出的多个变体在过去 12 小时的实盘表现。
+你现在的任务是优化一组 AI 交易员的提示词。你将看到一个主策略灵魂、当前运行中的 Custom Prompt、它派生出的多个变体在最近窗口的实盘/影子表现，以及近期进化历史。
 
 ## Context Data
-1. [Current Base Prompt]: 目前正在使用的核心指令。
-2. [Winning Logic]: 表现优异的变体在开单时的思考片段（Reasoning）。
-3. [Failure Cases]: 表现最差的变体被止损或利润大幅回吐的案例（带 MAE/MFE 数据）。
+1. [Strategy Soul]: 策略必须保留的核心思想。
+2. [Current Running Prompt]: 当前这个变体正在使用的完整 Custom Prompt。
+3. [Variant Performance]: 当前变体的绩效指标（Calmar、收益率、回撤、交易数）。
+4. [Winning Logic]: 表现优异的变体在开单时的思考片段（Reasoning）。
+5. [Failure Cases]: 表现最差的变体被止损或利润大幅回吐的案例（带 MAE/MFE 数据）。
+6. [Evolution Logs]: 最近几次对这个实验做过的改动记录。
 
-## Mutation Strategy (进化策略)
-请执行以下逻辑并生成一个新的提示词变体：
-1. **逻辑增强**：如果优胜者提到了某种特定形态（如“缩量回踩颈线”）而表现更好，请将此逻辑显式化。
-2. **约束收紧**：分析失败案例。如果是由于在 Avg MAE 范围内止损被扫，请在提示词中加入“必须等待价格进入历史 MAE 缓冲区后再下单”的强制指令。
-3. **消除幻觉**：如果 AI 在回撤期间表现出“过度自信”，请增加针对当前波动率（ATR）的风险降级机制。
+## Agentic Diff Policy
+你必须像一个给交易策略提 PR 的程序员一样工作，而不是像随机改写器：
+1. 先评估当前提示词是否“基本正确”。
+2. 如果当前逻辑主框架仍有效，只针对亏损样本暴露出的错误做 **Minimum Code Change**，例如：
+   - 止损过窄
+   - 追高/追空点位不对
+   - Target 1/2 定义不清
+   - 订单簿/波动率过滤不足
+3. 只有当当前变体 **Calmar < 0 且回撤失控** 时，才允许执行 **Full Refactor**。
+4. 无论如何修改，都必须保留策略灵魂：**支撑位扫荡 / liquidity sweep / support sweep** 相关核心逻辑，严禁在进化过程中丢失。
+5. 修改必须保持逻辑连续性，优先修补 bug、调参数、收紧约束，而不是换一套完全无关的方法论。
 
 ## Output Format
-请直接输出优化后的完整 custom_prompt。要求：
-- 保持技术化风格（涉及 EMA, 2B, MAE, MFE, POC 等术语）。
+严格按照以下 XML 输出，不要输出其他内容：
+<coach_update>
+  <mode>minimum_change|full_refactor</mode>
+  <reasoning>说明你为什么这么改、改了哪些点、预期影响是什么。</reasoning>
+  <new_prompt>输出优化后的完整 custom_prompt。</new_prompt>
+</coach_update>
+
+要求：
+- 保持技术化风格（涉及 EMA, 2B, MAE, MFE, POC, sweep 等术语）。
 - 逻辑必须闭环，不要增加废话。
-- 重点放在“如何过滤高风险入场点”和“如何精准定义 Target 1/2”。`
+- 重点放在“如何过滤高风险入场点”和“如何精准定义 Target 1/2”。
+- Minimum Code Change 时尽量保留原文结构，只改必要片段。`
+
+const (
+	coachEvolutionLogWindow      = 8
+	coachEvolutionLogTokenBudget = 160000
+	shadowGenerationEquity       = 10000.0
+)
+
+const strategySoulPrompt = "Preserve the strategy soul: support-sweep / liquidity-sweep entries around key support or support-resistance zones, with disciplined confirmation before entry."
 
 type CoachService struct {
 	store         *store.Store
@@ -49,6 +75,20 @@ type coachVariantPerformance struct {
 	Source   string
 	ResetAt  time.Time
 	Running  bool
+}
+
+type coachMutationResult struct {
+	Mode       string
+	Reasoning  string
+	NewPrompt  string
+	PromptDiff string
+}
+
+type coachUpdateXML struct {
+	XMLName   xml.Name `xml:"coach_update"`
+	Mode      string   `xml:"mode"`
+	Reasoning string   `xml:"reasoning"`
+	NewPrompt string   `xml:"new_prompt"`
 }
 
 type evolutionConfig struct {
@@ -147,7 +187,7 @@ func (cs *CoachService) runExperimentEvolution(experiment *store.ExperimentRecor
 	if err != nil {
 		return err
 	}
-	currentPrompt, err := cs.resolveCurrentPrompt(master)
+	basePrompt, err := cs.resolveCurrentPrompt(master)
 	if err != nil {
 		return err
 	}
@@ -167,57 +207,83 @@ func (cs *CoachService) runExperimentEvolution(experiment *store.ExperimentRecor
 		return fmt.Errorf("no shadow variants eligible for replacement")
 	}
 
+	evolutionLogs, err := cs.store.ExperimentLog().ListRecentByExperiment(experiment.ID, coachEvolutionLogWindow)
+	if err != nil {
+		return err
+	}
+	historyWindow := buildCoachHistoryWindow(evolutionLogs, coachEvolutionLogTokenBudget, coachEvolutionLogWindow)
+
 	resetAt := time.Now().UTC().Truncate(time.Second)
 	replacedIDs := make([]string, 0, len(replaced))
-	mutationSummaries := make([]string, 0, len(replaced))
 	for i, perf := range replaced {
 		mutationDirection := mutationDirections[i%len(mutationDirections)]
-		newPrompt, err := cs.generateMutatedPrompt(coachModel, currentPrompt, winningLogic, failureCases, mutationDirection)
+		currentVariantPrompt, err := cs.resolveCurrentPrompt(perf.Trader)
 		if err != nil {
 			return err
 		}
-		newPrompt = strings.TrimSpace(stripCodeFence(newPrompt))
-		if newPrompt == "" {
+		if strings.TrimSpace(currentVariantPrompt) == "" {
+			currentVariantPrompt = strings.TrimSpace(basePrompt)
+		}
+
+		mutationResult, err := cs.generateMutatedPrompt(coachModel, currentVariantPrompt, winningLogic, failureCases, mutationDirection, perf, historyWindow)
+		if err != nil {
+			return err
+		}
+		if mutationResult.NewPrompt == "" {
 			return fmt.Errorf("coach model returned empty prompt for trader %s", perf.Trader.ID)
 		}
 
-		if err := cs.store.Trader().UpdateCustomPrompt(perf.Trader.UserID, perf.Trader.ID, newPrompt, true); err != nil {
+		if err := cs.store.Trader().UpdateCustomPrompt(perf.Trader.UserID, perf.Trader.ID, mutationResult.NewPrompt, true); err != nil {
+			return err
+		}
+		if err := cs.store.Trader().ResetVirtualGeneration(perf.Trader.UserID, perf.Trader.ID, shadowGenerationEquity, shadowGenerationEquity); err != nil {
 			return err
 		}
 		if err := cs.store.Trader().UpdateResetTimestamp(perf.Trader.UserID, perf.Trader.ID, resetAt); err != nil {
 			return err
 		}
+		if err := cs.store.Position().DeleteOpenPositionsBySource(perf.Trader.ID, "shadow"); err != nil {
+			return err
+		}
 		if memTrader, err := cs.traderManager.GetTrader(perf.Trader.ID); err == nil && memTrader != nil {
-			memTrader.SetCustomPrompt(newPrompt)
+			memTrader.SetCustomPrompt(mutationResult.NewPrompt)
 			memTrader.SetOverrideBasePrompt(true)
+			memTrader.SetVirtualEquity(shadowGenerationEquity)
+			memTrader.SetInitialBalance(shadowGenerationEquity)
 			memTrader.ApplyDataReset(resetAt)
 		}
+		go func(traderID string) {
+			if err := cs.store.CleanupTraderVariantDataBefore(traderID, resetAt); err != nil {
+				logger.Warnf("failed to cleanup stale coach variant data for trader %s: %v", traderID, err)
+			}
+		}(perf.Trader.ID)
 		replacedIDs = append(replacedIDs, perf.Trader.ID)
-		mutationSummaries = append(mutationSummaries, fmt.Sprintf("%s=>%s", perf.Trader.ID, mutationDirection))
-		logger.Infof("🧬 Coach mutated trader %s with direction: %s", perf.Trader.ID, mutationDirection)
-	}
 
-	mutationSummaryText := strings.Join(mutationSummaries, "\n")
-	logRecord := &store.ExperimentLogRecord{
-		ExperimentID:      experiment.ID,
-		UserID:            master.UserID,
-		CoachModelID:      coachModel.ID,
-		WinnerTraderIDs:   collectTraderIDs(winners),
-		LoserTraderIDs:    collectTraderIDs(losers),
-		ReplacedTraderIDs: replacedIDs,
-		OldPrompt:         currentPrompt,
-		NewPrompt:         mutationSummaryText,
-		PromptDiff:        mutationSummaryText,
-		Summary: fmt.Sprintf(
-			"winners=%s losers=%s replaced=%s directions=%s",
-			strings.Join(collectTraderIDs(winners), ","),
-			strings.Join(collectTraderIDs(losers), ","),
-			strings.Join(replacedIDs, ","),
-			strings.Join(mutationSummaries, "; "),
-		),
-	}
-	if err := cs.store.ExperimentLog().Create(logRecord); err != nil {
-		return err
+		logRecord := &store.ExperimentLogRecord{
+			ExperimentID:      experiment.ID,
+			UserID:            master.UserID,
+			CoachModelID:      coachModel.ID,
+			CoachReasoning:    mutationResult.Reasoning,
+			WinnerTraderIDs:   collectTraderIDs(winners),
+			LoserTraderIDs:    collectTraderIDs(losers),
+			ReplacedTraderIDs: []string{perf.Trader.ID},
+			OldPrompt:         currentVariantPrompt,
+			NewPrompt:         mutationResult.NewPrompt,
+			PromptDiff:        mutationResult.PromptDiff,
+			Summary: fmt.Sprintf(
+				"trader=%s mode=%s direction=%s calmar=%.4f total_pnl=%.2f drawdown_pct=%.2f",
+				perf.Trader.ID,
+				mutationResult.Mode,
+				mutationDirection,
+				perf.Calmar,
+				safeCoachStatValue(perf.Stats.TotalPnL),
+				safeCoachStatValue(perf.Stats.MaxDrawdownPct),
+			),
+		}
+		if err := cs.store.ExperimentLog().Create(logRecord); err != nil {
+			return err
+		}
+		logger.Infof("🧬 Coach mutated trader %s with direction: %s", perf.Trader.ID, mutationDirection)
 	}
 
 	logger.Infof("🧬 Coach evolved experiment %s with model %s, replaced shadows=%s", experiment.ID, coachModel.ID, strings.Join(replacedIDs, ","))
@@ -230,18 +296,7 @@ func (cs *CoachService) resolveCurrentPrompt(master *store.Trader) (string, erro
 		return currentPrompt, nil
 	}
 
-	records, err := cs.store.Decision().GetLatestRecords(master.ID, 1)
-	if err != nil {
-		return "", fmt.Errorf("load latest decision record for trader %s: %w", master.ID, err)
-	}
-	if len(records) == 0 {
-		return "", nil
-	}
-
-	if prompt := strings.TrimSpace(records[0].InputPrompt); prompt != "" {
-		return prompt, nil
-	}
-	if prompt := strings.TrimSpace(records[0].SystemPrompt); prompt != "" {
+	if prompt := strings.TrimSpace(master.SystemPromptTemplate); prompt != "" {
 		return prompt, nil
 	}
 
@@ -353,10 +408,10 @@ func (cs *CoachService) selectWorstShadowVariants(performances []coachVariantPer
 	return shadows[:replacementCount]
 }
 
-func (cs *CoachService) generateMutatedPrompt(model *store.AIModel, currentPrompt string, winningLogic []string, failureCases []store.CoachFailureCase, mutationDirection string) (string, error) {
+func (cs *CoachService) generateMutatedPrompt(model *store.AIModel, currentPrompt string, winningLogic []string, failureCases []store.CoachFailureCase, mutationDirection string, perf coachVariantPerformance, evolutionLogs string) (*coachMutationResult, error) {
 	client := newCoachAIClient(model)
 	if client == nil {
-		return "", fmt.Errorf("failed to create coach client for %s", model.ID)
+		return nil, fmt.Errorf("failed to create coach client for %s", model.ID)
 	}
 
 	var failureLines []string
@@ -366,13 +421,25 @@ func (cs *CoachService) generateMutatedPrompt(model *store.AIModel, currentPromp
 	}
 
 	userPrompt := fmt.Sprintf(
-		"[Current Base Prompt]\n%s\n\n[Mutation Direction]\nYou MUST forcefully apply this specific evolutionary path to the new prompt: %s\n\n[Winning Logic]\n%s\n\n[Failure Cases]\n%s",
+		"[Strategy Soul]\n%s\n\n[Current Running Prompt]\n%s\n\n[Variant Performance]\ntrader_id=%s\ncalmar=%.4f\ntotal_pnl=%.2f\ndrawdown_pct=%.2f\ntotal_trades=%d\n\n[Recommended Update Mode]\n%s\n\n[Mutation Direction]\nYou MUST apply this evolutionary path, but follow the Agentic Diff Policy when deciding whether to make a minimum change or a full refactor: %s\n\n[Evolution Logs]\n%s\n\n[Winning Logic]\n%s\n\n[Failure Cases]\n%s",
+		strategySoulPrompt,
 		strings.TrimSpace(currentPrompt),
+		perf.Trader.ID,
+		perf.Calmar,
+		safeCoachStatValue(perf.Stats.TotalPnL),
+		safeCoachStatValue(perf.Stats.MaxDrawdownPct),
+		safeCoachTradeCount(perf.Stats),
+		coachRecommendedMode(perf),
 		strings.TrimSpace(mutationDirection),
+		strings.TrimSpace(evolutionLogs),
 		strings.Join(winningLogic, "\n"),
 		strings.Join(failureLines, "\n"),
 	)
-	return client.CallWithMessages(defaultCoachSystemPrompt, userPrompt)
+	raw, err := client.CallWithMessages(defaultCoachSystemPrompt, userPrompt)
+	if err != nil {
+		return nil, err
+	}
+	return parseCoachMutationResult(raw, currentPrompt)
 }
 
 func (cs *CoachService) selectCoachModel(userID, configuredModelID string) (*store.AIModel, error) {
@@ -517,6 +584,117 @@ func buildPromptDiff(oldPrompt, newPrompt string) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+func parseCoachMutationResult(raw, currentPrompt string) (*coachMutationResult, error) {
+	payload := strings.TrimSpace(stripCodeFence(raw))
+	if payload == "" {
+		return nil, fmt.Errorf("empty coach response")
+	}
+
+	start := strings.Index(payload, "<coach_update>")
+	end := strings.LastIndex(payload, "</coach_update>")
+	if start >= 0 && end >= 0 {
+		payload = payload[start : end+len("</coach_update>")]
+	}
+
+	var parsed coachUpdateXML
+	if err := xml.Unmarshal([]byte(payload), &parsed); err != nil {
+		parsed.NewPrompt = extractCoachTag(payload, "new_prompt")
+		parsed.Reasoning = extractCoachTag(payload, "reasoning")
+		parsed.Mode = extractCoachTag(payload, "mode")
+	}
+
+	newPrompt := strings.TrimSpace(stripCodeFence(parsed.NewPrompt))
+	if newPrompt == "" {
+		return nil, fmt.Errorf("coach response missing new_prompt")
+	}
+	mode := strings.ToLower(strings.TrimSpace(parsed.Mode))
+	if mode == "" {
+		mode = "minimum_change"
+	}
+
+	return &coachMutationResult{
+		Mode:       mode,
+		Reasoning:  strings.TrimSpace(parsed.Reasoning),
+		NewPrompt:  newPrompt,
+		PromptDiff: buildPromptDiff(currentPrompt, newPrompt),
+	}, nil
+}
+
+func extractCoachTag(payload, tag string) string {
+	openTag := "<" + tag + ">"
+	closeTag := "</" + tag + ">"
+	start := strings.Index(payload, openTag)
+	end := strings.Index(payload, closeTag)
+	if start < 0 || end < 0 || end <= start {
+		return ""
+	}
+	return payload[start+len(openTag) : end]
+}
+
+func buildCoachHistoryWindow(logs []*store.ExperimentLogRecord, maxApproxTokens int, maxItems int) string {
+	if len(logs) == 0 {
+		return "(none)"
+	}
+
+	if maxItems > 0 && len(logs) > maxItems {
+		logs = logs[:maxItems]
+	}
+
+	sections := make([]string, 0, len(logs))
+	totalApproxTokens := 0
+	for _, log := range logs {
+		section := fmt.Sprintf(
+			"[log %d]\ncreated_at=%s\nreplaced=%s\nsummary=%s\nreasoning=%s\ndiff=%s",
+			log.ID,
+			log.CreatedAt.UTC().Format(time.RFC3339),
+			strings.Join(log.ReplacedTraderIDs, ","),
+			strings.TrimSpace(log.Summary),
+			strings.TrimSpace(log.CoachReasoning),
+			strings.TrimSpace(log.PromptDiff),
+		)
+		approxTokens := estimatePromptTokens(section)
+		if len(sections) > 0 && totalApproxTokens+approxTokens > maxApproxTokens {
+			break
+		}
+		sections = append(sections, section)
+		totalApproxTokens += approxTokens
+	}
+
+	if len(sections) == 0 {
+		return "(trimmed due to token budget)"
+	}
+	return strings.Join(sections, "\n\n")
+}
+
+func estimatePromptTokens(text string) int {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0
+	}
+	return (len([]rune(text)) / 4) + 1
+}
+
+func safeCoachStatValue(v float64) float64 {
+	if v != v {
+		return 0
+	}
+	return v
+}
+
+func safeCoachTradeCount(stats *store.TraderStats) int {
+	if stats == nil {
+		return 0
+	}
+	return stats.TotalTrades
+}
+
+func coachRecommendedMode(perf coachVariantPerformance) string {
+	if perf.Calmar < 0 && safeCoachStatValue(perf.Stats.MaxDrawdownPct) >= 15 {
+		return "full_refactor_allowed: calmar is negative and drawdown is uncontrolled"
+	}
+	return "minimum_change_only: strategy skeleton is assumed salvageable, preserve the core sweep logic"
 }
 
 func stripCodeFence(input string) string {

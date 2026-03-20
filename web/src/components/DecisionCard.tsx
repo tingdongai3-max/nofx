@@ -237,8 +237,8 @@ function ActionCard({
             }}
           >
             {language === 'zh'
-              ? `⚡ 追踪止盈: ${formatPct(trailingActivationPct)}% / 回撤: ${formatPct(trailingRetracePct)}%`
-              : `⚡ Trailing: ${formatPct(trailingActivationPct)}% / ${formatPct(trailingRetracePct)}%`}
+              ? `⚡ 追踪止盈: TP进度 ${formatPct(trailingActivationPct)}% / 回吐利润 ${formatPct(trailingRetracePct)}%`
+              : `⚡ Trailing: TP progress ${formatPct(trailingActivationPct)}% / Profit giveback ${formatPct(trailingRetracePct)}%`}
           </span>
         </div>
       )}

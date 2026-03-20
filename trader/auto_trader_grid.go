@@ -1315,6 +1315,7 @@ func (at *AutoTrader) saveGridDecisionRecord(decision *kernel.FullDecision) {
 				Price:      d.Price,
 				StopLoss:   d.StopLoss,
 				TakeProfit: d.TakeProfit,
+				TakeProfitStages: decisionTakeProfitStagesForRecord(d.TakeProfitStages),
 				Confidence: d.Confidence,
 				Reasoning:  d.Reasoning,
 				Timestamp:  time.Now().UTC(),

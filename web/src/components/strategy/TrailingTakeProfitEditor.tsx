@@ -67,13 +67,13 @@ export function TrailingTakeProfitEditor({
         >
           <label className="block text-sm mb-1" style={{ color: '#EAECEF' }}>
             {isZh
-              ? '全局追踪回撤平仓率 (%)'
-              : 'Global Trailing Retrace Price Move (%)'}
+              ? '全局追踪利润回吐率 (%)'
+              : 'Global Trailing Profit Giveback Ratio (%)'}
           </label>
           <p className="text-xs mb-2" style={{ color: '#848E9C' }}>
             {isZh
-              ? '激活后，价格从激活后的极值回撤此比例时触发市价全平。这里同样是标的价格百分比，不是杠杆收益率。设为 0 则由 AI 动态决定。'
-              : 'After activation, fully close at market when the underlying price retraces from the post-activation extreme by this percentage. This is a price move, not leveraged ROI. Set 0 to let AI decide dynamically.'}
+              ? '激活后，允许从利润极值回吐此比例时平仓。例：已获利润达到 10%，这里填 20，则利润回吐到 8% 时触发。这里是对已获利润的占比，不是价格绝对波动百分比。设为 0 则由 AI 动态决定。'
+              : 'After activation, close when profit gives back by this ratio from the post-activation extreme. Example: if open profit reaches 10% and this is 20, the position closes after profit falls to 8%. This is a share of earned profit, not an absolute price move. Set 0 to let AI decide dynamically.'}
           </p>
           <div className="flex items-center gap-2">
             <input

@@ -3,6 +3,7 @@ import useSWR from 'swr'
 import {
   Activity,
   BrainCircuit,
+  ChevronDown,
   Crown,
   Radar,
   Rocket,
@@ -19,10 +20,10 @@ import { useLanguage } from '../contexts/LanguageContext'
 import type {
   AIModel,
   ColliderExperiment,
+  ExperimentLogRecord,
   ColliderVariant,
   CoachConfig,
   DecisionRecord,
-  EquitySnapshot,
   TraderInfo,
 } from '../types'
 
@@ -38,6 +39,11 @@ interface ReplayEvent {
   confidence: number
   reasoning: string
   prompt: string
+}
+
+interface VariantCurvePoint {
+  timestamp: string
+  total_equity: number
 }
 
 function formatPct(value: number) {
@@ -59,61 +65,12 @@ function parseTimestamp(value: string | number | null | undefined) {
   return Number.NaN
 }
 
-function getNearestEquityAtTime(
-  snapshots: EquitySnapshot[],
-  targetTime: number,
-  fallbackEquity: number
-) {
-  if (!Number.isFinite(targetTime) || snapshots.length === 0) {
-    return fallbackEquity
-  }
-
-  let nearestEquity = fallbackEquity
-  let nearestDistance = Number.POSITIVE_INFINITY
-
-  for (const snapshot of snapshots) {
-    const snapshotTime = parseTimestamp(snapshot.timestamp)
-    if (!Number.isFinite(snapshotTime)) continue
-
-    const distance = Math.abs(snapshotTime - targetTime)
-    if (distance < nearestDistance) {
-      nearestDistance = distance
-      nearestEquity = snapshot.total_equity
-    }
-  }
-
-  return nearestEquity
-}
-
-function computeDrawdown(snapshots: EquitySnapshot[]) {
-  let peak = 0
-  let maxDrawdown = 0
-  for (const point of snapshots) {
-    peak = Math.max(peak, point.total_equity)
-    if (peak <= 0) continue
-    maxDrawdown = Math.max(
-      maxDrawdown,
-      ((peak - point.total_equity) / peak) * 100
-    )
-  }
-  return maxDrawdown
-}
-
 function getReturnPct(variant: ColliderVariant) {
-  const snapshots = variant.equity_snapshots ?? []
-  const configuredBaseline =
-    variant.initial_balance > 0
-      ? variant.initial_balance
-      : variant.virtual_equity
-  const firstSnapshot = snapshots[0]
-  const latestSnapshot = snapshots[snapshots.length - 1]
-  const baseline =
-    firstSnapshot?.total_equity && firstSnapshot.total_equity > 0
-      ? firstSnapshot.total_equity
-      : configuredBaseline
-  const latest = latestSnapshot?.total_equity ?? baseline
-  if (baseline <= 0) return 0
-  return ((latest - baseline) / baseline) * 100
+  return variant.return_pct ?? 0
+}
+
+function getDrawdownPct(variant: ColliderVariant) {
+  return variant.drawdown_pct ?? 0
 }
 
 function getSyncPulse(variants: ColliderVariant[]) {
@@ -132,7 +89,7 @@ function getSyncPulse(variants: ColliderVariant[]) {
 }
 
 function getCurvePath(
-  points: EquitySnapshot[],
+  points: VariantCurvePoint[],
   width: number,
   height: number,
   min: number,
@@ -178,6 +135,12 @@ function buildReplayEvents(variant: ColliderVariant): ReplayEvent[] {
 function windowToApiValue(value: WindowOption) {
   if (value === '168h') return '168h'
   return value
+}
+
+function windowToHours(value: WindowOption) {
+  if (value === '24h') return 24
+  if (value === '168h') return 168
+  return 72
 }
 
 function CreateExperimentModal({
@@ -473,6 +436,311 @@ function CoachConfigModal({
   )
 }
 
+function VariantCurveCard({
+  isZh,
+  variant,
+  window,
+  isExpanded,
+  isReplaySelected,
+  onToggle,
+}: {
+  isZh: boolean
+  variant: ColliderVariant
+  window: WindowOption
+  isExpanded: boolean
+  isReplaySelected: boolean
+  onToggle: () => void
+}) {
+  const hours = windowToHours(window)
+  const { data: history, isLoading } = useSWR<VariantCurvePoint[]>(
+    isExpanded ? `variant-lab-equity-${variant.trader_id}-${hours}` : null,
+    async () => {
+      const points = await api.getEquityHistory(variant.trader_id, hours)
+      return points.map((point) => ({
+        timestamp: point.timestamp,
+        total_equity: point.total_equity,
+      }))
+    },
+    {
+      refreshInterval: 30000,
+      revalidateOnFocus: false,
+    }
+  )
+
+  const curve = history ?? []
+  const minEquity = curve.reduce(
+    (min, point) => Math.min(min, point.total_equity),
+    Number.POSITIVE_INFINITY
+  )
+  const maxEquity = curve.reduce(
+    (max, point) => Math.max(max, point.total_equity),
+    Number.NEGATIVE_INFINITY
+  )
+  const times = curve
+    .map((point) => parseTimestamp(point.timestamp))
+    .filter(Number.isFinite)
+  const minTime = times.length > 0 ? Math.min(...times) : Date.now()
+  const maxTime = times.length > 0 ? Math.max(...times) : minTime + 1
+  const path =
+    curve.length > 1
+      ? getCurvePath(
+          curve,
+          640,
+          180,
+          Number.isFinite(minEquity) ? minEquity : variant.equity_last,
+          Number.isFinite(maxEquity) ? maxEquity : variant.equity_last + 1,
+          minTime,
+          maxTime
+        )
+      : ''
+  const latestCoachLog = variant.coach_logs?.[0]
+
+  return (
+    <div
+      className={`rounded-2xl border p-4 transition ${isReplaySelected ? 'border-amber-300/40 bg-amber-300/8' : 'border-white/10 bg-white/5'}`}
+    >
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-start justify-between gap-3 text-left"
+      >
+        <div>
+          <div className="flex items-center gap-2 text-white">
+            <span className="font-medium">{variant.trader_name}</span>
+            {!variant.is_shadow && <Crown className="h-4 w-4 text-amber-300" />}
+          </div>
+          <div className="mt-1 text-xs text-zinc-500">
+            {variant.is_shadow
+              ? isZh
+                ? '影子观测者，只落虚拟仓位'
+                : 'Shadow observer, virtual positions only'
+              : isZh
+                ? '主执行器，允许真实下单'
+                : 'Master executor, real exchange orders enabled'}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <span
+            className={`rounded-full px-3 py-1 text-xs ${variant.is_running ? 'bg-emerald-400/15 text-emerald-200' : 'bg-zinc-500/15 text-zinc-300'}`}
+          >
+            {variant.is_running
+              ? isZh
+                ? '运行中'
+                : 'Running'
+              : isZh
+                ? '已停止'
+                : 'Stopped'}
+          </span>
+          <ChevronDown
+            className={`h-4 w-4 text-zinc-400 transition ${isExpanded ? 'rotate-180' : ''}`}
+          />
+        </div>
+      </button>
+
+      <p className="mt-3 line-clamp-3 text-sm leading-7 text-zinc-300">
+        {variant.custom_prompt ||
+          (isZh ? '未设置 custom_prompt。' : 'No custom_prompt configured.')}
+      </p>
+
+      <div className="mt-4 grid grid-cols-4 gap-2 text-xs">
+        <div className="rounded-xl bg-black/30 px-3 py-2 text-zinc-300">
+          <div className="text-zinc-500">{isZh ? '收益率' : 'Return'}</div>
+          <div
+            className={`mt-1 ${variant.return_pct >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}
+          >
+            {formatPct(variant.return_pct ?? 0)}
+          </div>
+        </div>
+        <div className="rounded-xl bg-black/30 px-3 py-2 text-zinc-300">
+          <div className="text-zinc-500">{isZh ? '回撤' : 'Drawdown'}</div>
+          <div className="mt-1 text-white">
+            {formatPct(variant.drawdown_pct ?? 0)}
+          </div>
+        </div>
+        <div className="rounded-xl bg-black/30 px-3 py-2 text-zinc-300">
+          <div className="text-zinc-500">{isZh ? '决策数' : 'Decisions'}</div>
+          <div className="mt-1 text-white">
+            {variant.decision_count ?? variant.decisions.length}
+          </div>
+        </div>
+        <div className="rounded-xl bg-black/30 px-3 py-2 text-zinc-300">
+          <div className="text-zinc-500">
+            {isZh ? '最新净值' : 'Last Equity'}
+          </div>
+          <div className="mt-1 text-white">
+            {variant.equity_last?.toFixed(2) ?? '0.00'}
+          </div>
+        </div>
+      </div>
+
+      {isExpanded && (
+        <div className="mt-4 space-y-4">
+          <div className="rounded-2xl border border-white/10 bg-black/25 p-4">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div>
+                <div className="text-xs uppercase tracking-[0.22em] text-zinc-500">
+                  {isZh ? '资金曲线' : 'Equity Curve'}
+                </div>
+                <div className="mt-1 text-sm text-zinc-300">
+                  {isZh
+                    ? `懒加载最近 ${hours} 小时曲线`
+                    : `Lazy-loaded last ${hours}h window`}
+                </div>
+              </div>
+              <div className="text-xs text-zinc-500">{window}</div>
+            </div>
+            {isLoading ? (
+              <div className="h-[180px] animate-pulse rounded-xl bg-white/5" />
+            ) : curve.length > 1 ? (
+              <svg viewBox="0 0 640 180" className="h-[180px] w-full">
+                {[0, 1, 2, 3].map((line) => (
+                  <line
+                    key={line}
+                    x1="0"
+                    x2="640"
+                    y1={line * 60}
+                    y2={line * 60}
+                    stroke="rgba(255,255,255,0.08)"
+                    strokeDasharray="4 8"
+                  />
+                ))}
+                <path
+                  d={path}
+                  fill="none"
+                  stroke={variant.is_shadow ? '#38bdf8' : '#fbbf24'}
+                  strokeWidth={variant.is_shadow ? 2 : 3}
+                  strokeLinecap="round"
+                />
+              </svg>
+            ) : (
+              <div className="flex h-[180px] items-center justify-center rounded-xl border border-dashed border-white/10 text-sm text-zinc-500">
+                {isZh
+                  ? '当前窗口暂无足够曲线点。'
+                  : 'Not enough curve points in this window.'}
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-2xl border border-cyan-400/15 bg-cyan-400/8 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-xs uppercase tracking-[0.22em] text-zinc-500">
+                  {isZh ? '教练日志' : 'Coach Log'}
+                </div>
+                <div className="mt-1 text-sm text-zinc-300">
+                  {latestCoachLog
+                    ? isZh
+                      ? `最近一次洗脑/重装：${formatTs(latestCoachLog.created_at)}`
+                      : `Latest coach rewrite: ${formatTs(latestCoachLog.created_at)}`
+                    : isZh
+                      ? '这个变体还没有教练改造记录'
+                      : 'No coach rewrite recorded for this variant yet'}
+                </div>
+              </div>
+              {latestCoachLog && (
+                <div className="rounded-full bg-black/30 px-3 py-1 text-xs text-cyan-100">
+                  {latestCoachLog.coach_model_id}
+                </div>
+              )}
+            </div>
+
+            {latestCoachLog ? (
+              <div className="mt-4 space-y-4">
+                <div className="rounded-xl border border-white/10 bg-black/20 p-3">
+                  <div className="text-xs uppercase tracking-[0.22em] text-zinc-500">
+                    {isZh ? '教练推理' : 'Coach Reasoning'}
+                  </div>
+                  <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-7 text-zinc-200">
+                    {latestCoachLog.coach_reasoning ||
+                      (isZh
+                        ? '该次进化未保存 reasoning。'
+                        : 'No reasoning stored for this evolution.')}
+                  </p>
+                </div>
+
+                <div className="grid gap-4 lg:grid-cols-2">
+                  <CoachPromptPanel
+                    isZh={isZh}
+                    title={isZh ? 'Prompt Diff' : 'Prompt Diff'}
+                    content={latestCoachLog.prompt_diff}
+                    emptyLabel={
+                      isZh ? '没有可展示的差异。' : 'No diff available.'
+                    }
+                  />
+                  <CoachPromptPanel
+                    isZh={isZh}
+                    title={isZh ? '新 Prompt' : 'New Prompt'}
+                    content={latestCoachLog.new_prompt}
+                    emptyLabel={
+                      isZh ? '没有保存新的 prompt。' : 'No new prompt saved.'
+                    }
+                  />
+                </div>
+
+                {variant.coach_logs.length > 1 && (
+                  <div className="rounded-xl border border-white/10 bg-black/20 p-3">
+                    <div className="text-xs uppercase tracking-[0.22em] text-zinc-500">
+                      {isZh ? '近期进化记录' : 'Recent Evolutions'}
+                    </div>
+                    <div className="mt-3 space-y-3">
+                      {variant.coach_logs
+                        .slice(0, 4)
+                        .map((log: ExperimentLogRecord) => (
+                          <div
+                            key={log.id}
+                            className="rounded-xl border border-white/5 bg-white/5 p-3"
+                          >
+                            <div className="flex items-center justify-between gap-3 text-xs text-zinc-500">
+                              <span>{formatTs(log.created_at)}</span>
+                              <span>{log.coach_model_id}</span>
+                            </div>
+                            <p className="mt-2 text-sm leading-6 text-zinc-300">
+                              {log.summary}
+                            </p>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function CoachPromptPanel({
+  isZh,
+  title,
+  content,
+  emptyLabel,
+}: {
+  isZh: boolean
+  title: string
+  content?: string
+  emptyLabel: string
+}) {
+  return (
+    <div className="rounded-xl border border-white/10 bg-black/20 p-3">
+      <div className="text-xs uppercase tracking-[0.22em] text-zinc-500">
+        {title}
+      </div>
+      <p className="mt-3 max-h-[20rem] overflow-y-auto whitespace-pre-wrap break-words text-sm leading-7 text-zinc-200">
+        {content?.trim() || emptyLabel}
+      </p>
+      {!content?.trim() && (
+        <div className="mt-2 text-xs text-zinc-500">
+          {isZh
+            ? '等待下一次进化后生成。'
+            : 'Generated after the next evolution.'}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function PromptVariantsLabPage() {
   const { language } = useLanguage()
   const isZh = language === 'zh'
@@ -491,6 +759,7 @@ export function PromptVariantsLabPage() {
   const [isSavingCoachConfig, setIsSavingCoachConfig] = useState(false)
   const [isTriggeringCoachEvolution, setIsTriggeringCoachEvolution] =
     useState(false)
+  const [expandedTraderId, setExpandedTraderId] = useState<string | null>(null)
 
   const experimentsKey = `experiments-${window}`
   const { data, mutate: mutateExperiments } = useSWR(
@@ -545,40 +814,7 @@ export function PromptVariantsLabPage() {
     [experiments, selectedExperimentId]
   )
 
-  const processedVariants = useMemo(() => {
-    if (!selectedExperiment?.variants) return []
-    
-    // 实验的统一发令枪时间
-    const expStartTs = selectedExperiment.created_at ? new Date(selectedExperiment.created_at).getTime() : 0
-    
-    return selectedExperiment.variants.map(variant => {
-      // 变体专属的“重生时间”（由教练 AI 变异时更新）
-      const variantResetTs = variant.reset_timestamp ? new Date(variant.reset_timestamp).getTime() : 0
-      
-      // 真正的起跑线：谁更晚，就用谁！这样就能彻底切断被变异前带来的历史亏损包袱
-      const startTs = Math.max(expStartTs, variantResetTs)
-      
-      // 只保留重生之后的资金曲线快照
-      const snapshots = (variant.equity_snapshots || []).filter(s => {
-         const ts = typeof s.timestamp === 'number' ? s.timestamp : new Date(s.timestamp).getTime()
-         return ts >= startTs
-      })
-      
-      // 只保留重生之后的决策记录
-      const decisions = (variant.decisions || []).filter(d => {
-         const ts = typeof d.timestamp === 'number' ? d.timestamp : new Date(d.timestamp).getTime()
-         return ts >= startTs
-      })
-      
-      return {
-        ...variant,
-        equity_snapshots: snapshots,
-        decisions: decisions
-      }
-    })
-  }, [selectedExperiment])
-
-  const variants = processedVariants
+  const variants = selectedExperiment?.variants ?? []
   const masterVariant =
     variants.find((variant) => !variant.is_shadow) ?? variants[0]
   const sortedVariants = [...variants].sort(
@@ -588,37 +824,14 @@ export function PromptVariantsLabPage() {
   const selectedReplay =
     replayEvents.find((item) => item.id === selectedReplayId) ?? replayEvents[0]
 
-  const chartPoints = variants.flatMap((variant) => variant.equity_snapshots)
-  const minEquity = chartPoints.reduce(
-    (min, point) => Math.min(min, point.total_equity),
-    Number.POSITIVE_INFINITY
-  )
-  const maxEquity = chartPoints.reduce(
-    (max, point) => Math.max(max, point.total_equity),
-    Number.NEGATIVE_INFINITY
-  )
-  const chartTimes = variants.flatMap((variant) => [
-    ...variant.equity_snapshots.map((point) => parseTimestamp(point.timestamp)),
-    ...buildReplayEvents(variant).map((event) => parseTimestamp(event.timestamp)),
-  ])
-  const validChartTimes = chartTimes.filter((time) => Number.isFinite(time))
-  const rawMinTime =
-    validChartTimes.length > 0 ? Math.min(...validChartTimes) : Date.now()
-  const rawMaxTime =
-    validChartTimes.length > 0 ? Math.max(...validChartTimes) : rawMinTime + 1
-  const hasValidTimeRange =
-    Number.isFinite(rawMinTime) &&
-    Number.isFinite(rawMaxTime) &&
-    rawMaxTime > rawMinTime
-  const minTime = hasValidTimeRange ? rawMinTime : rawMinTime - 30 * 60 * 1000
-  const maxTime = hasValidTimeRange ? rawMaxTime : rawMinTime + 30 * 60 * 1000
   const syncPulse = getSyncPulse(variants)
   const activeObservers = variants.filter((variant) => variant.is_shadow).length
   const eliminatedCount = variants.filter(
-    (variant) => computeDrawdown(variant.equity_snapshots) > drawdownThreshold
+    (variant) => getDrawdownPct(variant) > drawdownThreshold
   ).length
   const totalDecisions = variants.reduce(
-    (sum, variant) => sum + (variant.decisions?.length ?? 0),
+    (sum, variant) =>
+      sum + (variant.decision_count ?? variant.decisions?.length ?? 0),
     0
   )
 
@@ -633,18 +846,23 @@ export function PromptVariantsLabPage() {
     .sort((a, b) => b[1] - a[1])
     .slice(0, 6)
 
-  const palette = [
-    '#fbbf24',
-    '#38bdf8',
-    '#34d399',
-    '#f472b6',
-    '#a78bfa',
-    '#fb7185',
-    '#22d3ee',
-  ]
   const availableCoachModels = (coachModels ?? []).filter(
     (model) => model.enabled
   )
+
+  useEffect(() => {
+    if (!sortedVariants.length) {
+      setExpandedTraderId(null)
+      return
+    }
+    if (
+      expandedTraderId &&
+      sortedVariants.some((variant) => variant.trader_id === expandedTraderId)
+    ) {
+      return
+    }
+    setExpandedTraderId(sortedVariants[0].trader_id)
+  }, [expandedTraderId, sortedVariants])
 
   const handleVariantCountChange = (value: number) => {
     if (!Number.isFinite(value)) {
@@ -920,102 +1138,39 @@ export function PromptVariantsLabPage() {
           <div className="flex flex-col gap-3 border-b border-white/10 pb-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <div className="text-xs uppercase tracking-[0.24em] text-zinc-500">
-                {isZh ? '真实资金曲线' : 'Live Equity Curves'}
+                {isZh ? '变体名册' : 'Variant Roster'}
               </div>
               <h2 className="mt-2 text-2xl font-semibold text-white">
                 {isZh
-                  ? '每条曲线来自 trader_equity_snapshots，事件点来自 decision_records。'
-                  : 'Each curve comes from trader_equity_snapshots and each event comes from decision_records.'}
+                  ? '首屏只渲染摘要，曲线按卡片展开后再异步加载。'
+                  : 'Summaries render first; each curve loads only after its card is expanded.'}
               </h2>
+            </div>
+            <div className="rounded-full border border-emerald-300/20 bg-emerald-300/10 px-4 py-2 text-xs text-emerald-200">
+              {isZh
+                ? '默认 72h 窗口，避免全量历史阻塞'
+                : 'Default 72h window, no full-history blocking'}
             </div>
           </div>
 
-          <div className="mt-5 overflow-hidden rounded-[24px] border border-white/10 bg-[linear-gradient(180deg,rgba(4,10,16,0.95),rgba(3,8,13,0.85))] p-4">
-            <svg viewBox="0 0 960 360" className="h-[360px] w-full">
-              {[0, 1, 2, 3, 4].map((line) => (
-                <line
-                  key={line}
-                  x1="0"
-                  x2="960"
-                  y1={line * 90}
-                  y2={line * 90}
-                  stroke="rgba(255,255,255,0.08)"
-                  strokeDasharray="4 8"
-                />
-              ))}
-              {sortedVariants.map((variant, index) => {
-                const color = palette[index % palette.length]
-                const path = getCurvePath(
-                  variant.equity_snapshots,
-                  920,
-                  320,
-                  minEquity,
-                  maxEquity,
-                  minTime,
-                  maxTime
-                )
-                const events = buildReplayEvents(variant)
-                return (
-                  <g key={variant.trader_id} transform="translate(20,20)">
-                    <path
-                      d={path}
-                      fill="none"
-                      stroke={color}
-                      strokeWidth={variant.is_shadow ? 2 : 3.5}
-                      strokeLinecap="round"
-                    />
-                    {events.map((event) => {
-                      const eventTime = parseTimestamp(event.timestamp)
-                      const x = Number.isFinite(eventTime)
-                        ? ((eventTime - minTime) /
-                            Math.max(maxTime - minTime, 1)) *
-                          920
-                        : 0
-                      const nearestEquity = getNearestEquityAtTime(
-                        variant.equity_snapshots,
-                        eventTime,
-                        variant.initial_balance
-                      )
-                      const y =
-                        320 -
-                        ((nearestEquity - minEquity) /
-                          Math.max(maxEquity - minEquity, 1)) *
-                          320
-                      return (
-                        <circle
-                          key={event.id}
-                          cx={x}
-                          cy={y}
-                          r={selectedReplay?.id === event.id ? 6 : 4}
-                          fill={
-                            selectedReplay?.id === event.id ? '#fbbf24' : color
-                          }
-                          className="cursor-pointer transition-transform hover:scale-125"
-                          onClick={() => setSelectedReplayId(event.id)}
-                        />
-                      )
-                    })}
-                  </g>
-                )
-              })}
-            </svg>
-            <div className="mt-4 flex flex-wrap gap-3">
-              {sortedVariants.map((variant, index) => (
-                <div
-                  key={variant.trader_id}
-                  className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-zinc-300"
-                >
-                  <span
-                    className="h-2.5 w-2.5 rounded-full"
-                    style={{ background: palette[index % palette.length] }}
-                  />
-                  {variant.trader_name}
-                  {!variant.is_shadow && (
-                    <Crown className="h-3.5 w-3.5 text-amber-300" />
-                  )}
-                </div>
-              ))}
-            </div>
+          <div className="mt-5 space-y-3">
+            {sortedVariants.map((variant) => (
+              <VariantCurveCard
+                key={variant.trader_id}
+                isZh={isZh}
+                variant={variant}
+                window={window}
+                isExpanded={expandedTraderId === variant.trader_id}
+                isReplaySelected={
+                  selectedReplay?.traderId === variant.trader_id
+                }
+                onToggle={() =>
+                  setExpandedTraderId((current) =>
+                    current === variant.trader_id ? null : variant.trader_id
+                  )
+                }
+              />
+            ))}
           </div>
         </section>
 
@@ -1088,97 +1243,7 @@ export function PromptVariantsLabPage() {
         </section>
       </div>
 
-      <div className="mt-6 grid gap-6 xl:grid-cols-[1fr_0.9fr]">
-        <section className="rounded-[28px] border border-white/10 bg-[#0a1016]/90 p-5">
-          <div className="text-xs uppercase tracking-[0.24em] text-zinc-500">
-            {isZh ? '变体名册' : 'Variant Roster'}
-          </div>
-          <h2 className="mt-2 text-2xl font-semibold text-white">
-            {isZh
-              ? '真实运行状态、收益率与回撤。'
-              : 'Live status, return, and drawdown for every variant.'}
-          </h2>
-          <div className="mt-5 space-y-3">
-            {sortedVariants.map((variant) => {
-              const drawdown = computeDrawdown(variant.equity_snapshots)
-              const returnPct = getReturnPct(variant)
-              return (
-                <div
-                  key={variant.trader_id}
-                  className="rounded-2xl border border-white/10 bg-white/5 p-4"
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <div className="flex items-center gap-2 text-white">
-                        <span className="font-medium">
-                          {variant.trader_name}
-                        </span>
-                        {!variant.is_shadow && (
-                          <Crown className="h-4 w-4 text-amber-300" />
-                        )}
-                      </div>
-                      <div className="mt-1 text-xs text-zinc-500">
-                        {variant.is_shadow
-                          ? isZh
-                            ? '影子观测者，只落虚拟仓位'
-                            : 'Shadow observer, virtual positions only'
-                          : isZh
-                            ? '主执行器，允许真实下单'
-                            : 'Master executor, real exchange orders enabled'}
-                      </div>
-                    </div>
-                    <span
-                      className={`rounded-full px-3 py-1 text-xs ${variant.is_running ? 'bg-emerald-400/15 text-emerald-200' : 'bg-zinc-500/15 text-zinc-300'}`}
-                    >
-                      {variant.is_running
-                        ? isZh
-                          ? '运行中'
-                          : 'Running'
-                        : isZh
-                          ? '已停止'
-                          : 'Stopped'}
-                    </span>
-                  </div>
-                  <p className="mt-3 line-clamp-3 text-sm leading-7 text-zinc-300">
-                    {variant.custom_prompt ||
-                      (isZh
-                        ? '未设置 custom_prompt。'
-                        : 'No custom_prompt configured.')}
-                  </p>
-                  <div className="mt-4 grid grid-cols-3 gap-2 text-xs">
-                    <div className="rounded-xl bg-black/30 px-3 py-2 text-zinc-300">
-                      <div className="text-zinc-500">
-                        {isZh ? '收益率' : 'Return'}
-                      </div>
-                      <div
-                        className={`mt-1 ${returnPct >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}
-                      >
-                        {formatPct(returnPct)}
-                      </div>
-                    </div>
-                    <div className="rounded-xl bg-black/30 px-3 py-2 text-zinc-300">
-                      <div className="text-zinc-500">
-                        {isZh ? '回撤' : 'Drawdown'}
-                      </div>
-                      <div className="mt-1 text-white">
-                        {formatPct(drawdown)}
-                      </div>
-                    </div>
-                    <div className="rounded-xl bg-black/30 px-3 py-2 text-zinc-300">
-                      <div className="text-zinc-500">
-                        {isZh ? '决策数' : 'Decisions'}
-                      </div>
-                      <div className="mt-1 text-white">
-                        {variant.decisions.length}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </section>
-
+      <div className="mt-6">
         <section className="rounded-[28px] border border-white/10 bg-[#091016]/90 p-5">
           <div className="text-xs uppercase tracking-[0.24em] text-zinc-500">
             {isZh ? '实验摘要' : 'Experiment Summary'}
