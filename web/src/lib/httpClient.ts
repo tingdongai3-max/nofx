@@ -87,10 +87,22 @@ export class HttpClient {
   private async handleError(error: AxiosError): Promise<any> {
     // Network error (no response from server)
     if (!error.response) {
-      toast.error('Network error - Please check your connection', {
-        description: 'Unable to reach the server',
+      const isTimeout = error.code === 'ECONNABORTED'
+      const isNetworkError = error.code === 'ERR_NETWORK' || error.message?.includes('Network')
+
+      if (isTimeout) {
+        toast.error('Request timeout', {
+          description: 'The request took too long, please try again',
+        })
+        throw new Error('Request timeout')
+      }
+
+      toast.error('Network error', {
+        description: isNetworkError
+          ? 'Unable to reach the server, please check your connection'
+          : error.message || 'Unable to reach the server',
       })
-      throw new Error('Network error')
+      throw new Error(`Network error: ${error.message}`)
     }
 
     const { status } = error.response as AxiosResponse<{
@@ -138,20 +150,31 @@ export class HttpClient {
       throw new Error('Permission denied')
     }
 
-    // Handle 404 Not Found - system error
+    // Handle 404 Not Found - show actual URL that was not found
     if (status === 404) {
+      const url = error.config?.url || 'Unknown'
       toast.error('API Not Found', {
-        description: 'The requested endpoint does not exist (404)',
+        description: `Endpoint "${url}" does not exist (404)`,
       })
-      throw new Error('API not found')
+      throw new Error(`API not found: ${url}`)
     }
 
-    // Handle 500+ Server Error - system error
+    // Handle 500+ Server Error - show actual error message from server
     if (status >= 500) {
-      toast.error('Server Error', {
-        description: 'Please try again later or contact support',
-      })
-      throw new Error('Server error')
+      const errorData = error.response.data as { error?: string; message?: string; detail?: string }
+      const errorMessage = errorData?.error || errorData?.message || errorData?.detail
+
+      if (errorMessage) {
+        toast.error('Server Error', {
+          description: errorMessage,
+        })
+        throw new Error(`Server error: ${errorMessage}`)
+      } else {
+        toast.error('Server Error', {
+          description: `Server error (${status}), please try again later`,
+        })
+        throw new Error(`Server error (${status})`)
+      }
     }
 
     // 4xx errors (except 401/403/404) are business logic errors

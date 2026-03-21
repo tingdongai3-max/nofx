@@ -22,6 +22,7 @@ import { AuthProvider, useAuth } from './contexts/AuthContext'
 import { ConfirmDialogProvider } from './components/common/ConfirmDialog'
 import { t } from './i18n/translations'
 import { useSystemConfig } from './hooks/useSystemConfig'
+import { BACKEND_SERVICE_OFFLINE } from './lib/config'
 
 import { OFFICIAL_LINKS } from './constants/branding'
 import type {
@@ -47,10 +48,10 @@ type Page =
 
 
 
-function App() {
+export function App() {
   const { language, setLanguage } = useLanguage()
   const { user, token, logout, isLoading } = useAuth()
-  const { config: systemConfig, loading: configLoading } = useSystemConfig()
+  const { config: systemConfig, loading: configLoading, error: configError } = useSystemConfig()
   const [route, setRoute] = useState(window.location.pathname)
 
   // Debug log
@@ -325,6 +326,40 @@ function App() {
             className="w-16 h-16 mx-auto mb-4 animate-pulse"
           />
           <p style={{ color: '#EAECEF' }}>{t('loading', language)}</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (configError) {
+    const isBackendOffline = configError === BACKEND_SERVICE_OFFLINE
+    const title = isBackendOffline ? '系统维护中' : '系统配置加载失败'
+    const description = isBackendOffline
+      ? 'API 连接失败，请稍后重试。'
+      : configError
+
+    return (
+      <div
+        className="min-h-screen flex items-center justify-center px-6"
+        style={{ background: '#0B0E11', color: '#EAECEF' }}
+      >
+        <div
+          className="w-full max-w-lg rounded-2xl border p-8 text-center"
+          style={{
+            borderColor: 'rgba(240, 185, 11, 0.28)',
+            background: 'linear-gradient(180deg, rgba(17, 22, 29, 0.96) 0%, rgba(11, 14, 17, 0.98) 100%)',
+            boxShadow: '0 24px 80px rgba(0, 0, 0, 0.45)',
+          }}
+        >
+          <img
+            src="/icons/nofx.svg"
+            alt="NoFx Logo"
+            className="w-14 h-14 mx-auto mb-5 opacity-90"
+          />
+          <h1 className="text-2xl font-semibold mb-3">{title}</h1>
+          <p className="text-sm leading-6" style={{ color: '#B7BDC6' }}>
+            {description}
+          </p>
         </div>
       </div>
     )

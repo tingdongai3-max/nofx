@@ -110,6 +110,7 @@ export interface IndicatorConfig {
   enable_rsi: boolean;
   enable_atr: boolean;
   enable_boll: boolean;
+  enable_donchian_box: boolean;
   enable_volume: boolean;
   enable_oi: boolean;
   enable_funding_rate: boolean;
@@ -117,6 +118,7 @@ export interface IndicatorConfig {
   rsi_periods?: number[];
   atr_periods?: number[];
   boll_periods?: number[];
+  donchian_periods?: number[];
   external_data_sources?: ExternalDataSource[];
 
   // ========== NofxOS 数据源统一配置 ==========
@@ -133,7 +135,7 @@ export interface IndicatorConfig {
   oi_ranking_duration?: string;  // "1h", "4h", "24h"
   oi_ranking_limit?: number;
 
-  // NetFlow 排行数据（机构/散户资金流向排行）
+  // NetFlow 排行数据（大单/小单资金流向排行）
   enable_netflow_ranking?: boolean;
   netflow_ranking_duration?: string;  // "1h", "4h", "24h"
   netflow_ranking_limit?: number;

@@ -12,6 +12,28 @@ import (
 	"time"
 )
 
+func TrimMarketDataForPrompt(data *market.Data, userCount int) {
+	if data == nil || userCount <= 0 {
+		return
+	}
+
+	for tf, tfData := range data.TimeframeData {
+		if tfData == nil {
+			continue
+		}
+		if len(tfData.Klines) > userCount {
+			tfData.Klines = tfData.Klines[len(tfData.Klines)-userCount:]
+		}
+		if len(tfData.MidPrices) > userCount {
+			tfData.MidPrices = tfData.MidPrices[len(tfData.MidPrices)-userCount:]
+		}
+		if len(tfData.Volume) > userCount {
+			tfData.Volume = tfData.Volume[len(tfData.Volume)-userCount:]
+		}
+		data.TimeframeData[tf] = tfData
+	}
+}
+
 // ============================================================================
 // Pre-compiled regular expressions (performance optimization)
 // ============================================================================
@@ -149,11 +171,12 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 
 	// 1. First fetch data for position coins (must fetch)
 	for _, pos := range ctx.Positions {
-		data, err := market.GetWithTimeframes(pos.Symbol, timeframes, primaryTimeframe, klineCount)
+		data, err := market.GetWithTimeframes(pos.Symbol, timeframes, primaryTimeframe, klineCount, &config.Indicators)
 		if err != nil {
 			logger.Infof("⚠️  Failed to fetch market data for position %s: %v", pos.Symbol, err)
 			continue
 		}
+		TrimMarketDataForPrompt(data, klineCount)
 		ctx.MarketDataMap[pos.Symbol] = data
 	}
 
@@ -170,11 +193,12 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 			continue
 		}
 
-		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, klineCount)
+		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, klineCount, &config.Indicators)
 		if err != nil {
 			logger.Infof("⚠️  Failed to fetch market data for %s: %v", coin.Symbol, err)
 			continue
 		}
+		TrimMarketDataForPrompt(data, klineCount)
 
 		// Liquidity filter (skip for xyz dex assets - they don't have OI data from Binance)
 		isExistingPosition := positionSymbols[coin.Symbol]

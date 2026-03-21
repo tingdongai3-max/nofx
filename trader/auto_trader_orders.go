@@ -51,7 +51,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 	}
 
 	// Get current price
-	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
+	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange, nil)
 	if err != nil {
 		return err
 	}
@@ -168,7 +168,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 	}
 
 	// Get current price
-	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
+	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange, nil)
 	if err != nil {
 		return err
 	}
@@ -267,7 +267,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 	logger.Infof("  🔄 Close long: %s", decision.Symbol)
 
 	// Get current price
-	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
+	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange, nil)
 	if err != nil {
 		return err
 	}
@@ -331,7 +331,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 	logger.Infof("  🔄 Close short: %s", decision.Symbol)
 
 	// Get current price
-	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
+	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange, nil)
 	if err != nil {
 		return err
 	}

@@ -150,8 +150,8 @@ func (s *Server) handleCreateStrategy(c *gin.Context) {
 	var req struct {
 		Name        string                `json:"name" binding:"required"`
 		Description string                `json:"description"`
-		Lang        string                `json:"lang"`          // "zh" or "en", used when config is omitted
-		Config      *store.StrategyConfig `json:"config"`        // optional — uses default if omitted
+		Lang        string                `json:"lang"`   // "zh" or "en", used when config is omitted
+		Config      *store.StrategyConfig `json:"config"` // optional — uses default if omitted
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -419,9 +419,9 @@ func (s *Server) handlePreviewPrompt(c *gin.Context) {
 	}
 
 	var req struct {
-		Config          store.StrategyConfig `json:"config" binding:"required"`
-		AccountEquity   float64              `json:"account_equity"`
-		PromptVariant   string               `json:"prompt_variant"`
+		Config        store.StrategyConfig `json:"config" binding:"required"`
+		AccountEquity float64              `json:"account_equity"`
+		PromptVariant string               `json:"prompt_variant"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -526,12 +526,13 @@ func (s *Server) handleStrategyTestRun(c *gin.Context) {
 	// Get real market data (using multiple timeframes)
 	marketDataMap := make(map[string]*market.Data)
 	for _, coin := range candidates {
-		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, klineCount)
+		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, klineCount, &req.Config.Indicators)
 		if err != nil {
 			// If getting data for a coin fails, log but continue
 			fmt.Printf("⚠️  Failed to get market data for %s: %v\n", coin.Symbol, err)
 			continue
 		}
+		kernel.TrimMarketDataForPrompt(data, klineCount)
 		marketDataMap[coin.Symbol] = data
 	}
 
@@ -664,4 +665,3 @@ func (s *Server) runRealAITest(userID, modelID, systemPrompt, userPrompt string)
 
 	return response, nil
 }
-

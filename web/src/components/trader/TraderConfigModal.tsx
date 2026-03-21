@@ -437,6 +437,11 @@ export function TraderConfigModal({
                   <p className="text-xs text-gray-500 mt-1">
                     {t('scanIntervalRecommend', language)}
                   </p>
+                  <p className="text-xs text-gray-500 mt-1">
+                    {language === 'zh'
+                      ? '交易员将自动对齐自然时间。例如：设置1小时，将在每个整点（如19:00:05）触发决策。'
+                      : 'Decisions align to natural time boundaries. For example, a 1-hour interval triggers on each hour boundary, such as 19:00:05.'}
+                  </p>
                 </div>
               </div>
 

@@ -36,6 +36,13 @@ export function IndicatorEditor({
   disabled,
   language,
 }: IndicatorEditorProps) {
+  const sanitizePeriodValues = (raw: string) => {
+    return raw
+      .split(',')
+      .map((s) => parseInt(s.trim(), 10))
+      .filter((n) => !isNaN(n) && n > 0)
+  }
+
   // Get currently selected timeframes
   const selectedTimeframes = config.klines.selected_timeframes || [config.klines.primary_timeframe]
 
@@ -521,6 +528,7 @@ export function IndicatorEditor({
                 />
               </div>
             </div>
+            <p className="text-[10px] mb-2" style={{ color: '#848E9C' }}>{ts(indicator.smartFetchHint, language)}</p>
             <p className="text-[10px] mb-2" style={{ color: '#5E6673' }}>{ts(indicator.timeframesDesc, language)}</p>
 
             {/* Timeframe Grid */}
@@ -592,6 +600,7 @@ export function IndicatorEditor({
               { key: 'enable_rsi', label: 'rsi', desc: 'rsiDesc', color: '#F6465D', periodKey: 'rsi_periods', defaultPeriods: '7,14' },
               { key: 'enable_atr', label: 'atr', desc: 'atrDesc', color: '#60a5fa', periodKey: 'atr_periods', defaultPeriods: '14' },
               { key: 'enable_boll', label: 'boll', desc: 'bollDesc', color: '#ec4899', periodKey: 'boll_periods', defaultPeriods: '20' },
+              { key: 'enable_donchian_box', label: 'donchianBox', desc: 'donchianBoxDesc', color: '#22c55e', periodKey: 'donchian_periods', defaultPeriods: '72,240,500' },
             ].map(({ key, label, desc, color, periodKey, defaultPeriods }) => (
               <div
                 key={key}
@@ -621,10 +630,7 @@ export function IndicatorEditor({
                     value={(config[periodKey as keyof IndicatorConfig] as number[])?.join(',') || defaultPeriods}
                     onChange={(e) => {
                       if (disabled) return
-                      const periods = e.target.value
-                        .split(',')
-                        .map((s) => parseInt(s.trim()))
-                        .filter((n) => !isNaN(n) && n > 0)
+                      const periods = sanitizePeriodValues(e.target.value)
                       onChange({ ...config, [periodKey]: periods })
                     }}
                     disabled={disabled}

@@ -2,14 +2,13 @@ package trader
 
 import (
 	"fmt"
+	"github.com/ethereum/go-ethereum/crypto"
 	"nofx/kernel"
 	"nofx/logger"
 	"nofx/mcp"
 	_ "nofx/mcp/payment"
 	_ "nofx/mcp/provider"
 	"nofx/store"
-	"nofx/wallet"
-	"github.com/ethereum/go-ethereum/crypto"
 	"nofx/trader/aster"
 	"nofx/trader/binance"
 	"nofx/trader/bitget"
@@ -20,6 +19,7 @@ import (
 	"nofx/trader/kucoin"
 	"nofx/trader/lighter"
 	"nofx/trader/okx"
+	"nofx/wallet"
 	"sync"
 	"time"
 )
@@ -455,9 +455,6 @@ func (at *AutoTrader) Run() error {
 		}
 	}
 
-	ticker := time.NewTicker(at.config.ScanInterval)
-	defer ticker.Stop()
-
 	// Check if this is a grid trading strategy
 	isGridStrategy := at.IsGridStrategy()
 	if isGridStrategy {
@@ -479,6 +476,12 @@ func (at *AutoTrader) Run() error {
 		}
 	}
 
+	nextDelay, nextTick := calculateNextAlignment(at.config.ScanInterval, store.DefaultCandleCloseOffset)
+	logger.Infof("🕒 [%s] Next aligned decision scheduled at %s (interval: %v, offset: %v)",
+		at.name, nextTick.Format("2006-01-02 15:04:05"), at.config.ScanInterval, store.DefaultCandleCloseOffset)
+	timer := time.NewTimer(nextDelay)
+	defer timer.Stop()
+
 	for {
 		at.isRunningMutex.RLock()
 		running := at.isRunning
@@ -489,7 +492,7 @@ func (at *AutoTrader) Run() error {
 		}
 
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			if isGridStrategy {
 				if err := at.RunGridCycle(); err != nil {
 					logger.Infof("❌ Grid execution failed: %v", err)
@@ -499,7 +502,18 @@ func (at *AutoTrader) Run() error {
 					logger.Infof("❌ Execution failed: %v", err)
 				}
 			}
+
+			nextDelay, nextTick = calculateNextAlignment(at.config.ScanInterval, store.DefaultCandleCloseOffset)
+			logger.Infof("🕒 [%s] Next aligned decision scheduled at %s (interval: %v, offset: %v)",
+				at.name, nextTick.Format("2006-01-02 15:04:05"), at.config.ScanInterval, store.DefaultCandleCloseOffset)
+			timer.Reset(nextDelay)
 		case <-at.stopMonitorCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			logger.Infof("[%s] ⏹ Stop signal received, exiting automatic trading main loop", at.name)
 			return nil
 		}
@@ -583,6 +597,11 @@ func (at *AutoTrader) GetSystemPromptTemplate() string {
 // GetStore gets data store (for external access to decision records, etc.)
 func (at *AutoTrader) GetStore() *store.Store {
 	return at.store
+}
+
+// IsStrategyConfigured returns true if the trader has a valid strategy configured
+func (at *AutoTrader) IsStrategyConfigured() bool {
+	return at.strategyEngine != nil
 }
 
 // calculatePnLPercentage calculates P&L percentage (based on margin, automatically considers leverage)

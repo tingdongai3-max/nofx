@@ -51,8 +51,15 @@ This document describes the complete data flow of the NOFX strategy module, incl
 5. AI Request (CallWithMessages)
    ├─ Select AI model
    ├─ POST: system_prompt + user_prompt
-   ├─ Timeout: 120s, Retries: 3
+   ├─ Timeout: 600s (10 min for reasoning models with deep thinking)
+   ├─ Retries: 3
    └─ Return raw response
+
+**Reasoning Model Response Contract:**
+- AI MUST output `<reasoning>` tags wrapping complete chain of thought analysis
+- AI MUST output `<decision>` tags wrapping JSON decision array
+- Content outside tags will NOT be extracted as CoT (may cause parsing failure)
+- If tags are missing or malformed, system enters SafeFallback mode (hold/wait)
         ↓
 6. AI Parsing (parseFullDecisionResponse)
    ├─ Extract Chain of Thought <reasoning>
@@ -642,6 +649,102 @@ at.store.Decision().LogDecision(record)
 
 ---
 
+## Decision Scheduling Protocol
+
+The decision loop now uses a cron-like aligned timer rather than a fixed `time.Ticker`.
+
+### Alignment Formula
+
+```text
+Alignment = floor(now / interval) * interval + offset
+```
+
+If that aligned point is already in the past, add one more interval:
+
+```text
+if Alignment <= now:
+    Alignment = Alignment + interval
+```
+
+### Runtime Rules
+
+- `interval` is the trader decision interval
+- `offset` is a post-close delay to wait for exchange candle persistence
+- default `offset` is `5s` via `store.DefaultCandleCloseOffset`
+- the trader still performs one immediate startup cycle
+- every later wake-up is recalculated from a fresh `time.Now()`
+- `time.Truncate(interval)` anchors scheduling to the latest natural boundary
+
+### Examples
+
+- `5m + 5s` aligns to `19:00:05`, `19:05:05`, `19:10:05`
+- if the service restarts at `19:03:00`, the next wake-up is `19:05:05`
+- if a decision cycle runs for one minute, the next wake-up still targets the next aligned boundary instead of drifting by one minute
+
+### Why This Replaces Ticker
+
+- `time.Ticker` drifts from process start time
+- aligned timers keep decisions synchronized with candle closes
+- a small offset reduces the risk of reading an in-progress candle before the exchange has fully persisted the closed bar
+
+---
+
+## Dynamic Indicator Protocol
+
+The market indicator engine is now fully driven by `StrategyConfig.Indicators` instead of fixed fields such as `EMA20` or `RSI7`.
+
+### Indicator Payload
+
+`market.Data` now exposes a generic indicator snapshot and per-timeframe indicator series:
+
+```go
+type IndicatorResult struct {
+    EMAs  map[int]float64
+    RSIs  map[int]float64
+    ATRs  map[int]float64
+    Bolls map[int]BollResult
+    MACD  float64
+}
+```
+
+```go
+type IndicatorSeries struct {
+    EMAs  map[int][]float64
+    RSIs  map[int][]float64
+    ATRs  map[int]float64
+    Bolls map[int]BollSeries
+    MACD  []float64
+}
+```
+
+### Runtime Contract
+
+- `kernel/engine_analysis.go` passes the full `config.Indicators` object into `market.GetWithTimeframes`
+- `market/data_klines.go` loops over configured period arrays instead of hardcoded values
+- empty or invalid period arrays are skipped safely
+- prompt generation only renders indicators that were actually requested in the strategy config
+
+### Example
+
+If the frontend sends:
+
+```json
+{
+  "enable_ema": true,
+  "ema_periods": [10, 30]
+}
+```
+
+Then the AI input will contain `EMA10` and `EMA30`, and will not include `EMA20` unless it is explicitly configured.
+
+### Why This Matters
+
+- eliminates backend/frontend mismatch
+- eliminates prompt drift from stale hardcoded indicator labels
+- ensures preview prompt and live trader use the same indicator contract
+
+---
+
 ## Core File Index
 
 | Module | File | Key Methods |
@@ -735,3 +838,59 @@ type StrategyConfig struct {
 
 **Document Version:** 1.0.0
 **Last Updated:** 2025-01-15
+
+## Donchian Box Protocol
+
+The strategy indicator layer supports Donchian boxes as a dynamic trend filter factor.
+
+### Config
+
+- `enable_donchian_box`
+- `donchian_periods`
+
+### Market Contract
+
+Each configured period produces:
+
+- `Upper`: highest high in the trailing window
+- `Lower`: lowest low in the trailing window
+- `Mid`: midpoint of the box
+
+The AI receives both the raw boundary fields and a semantic state derived from the current price, for example:
+
+- `Donchian72_Upper`
+- `Donchian72_Lower`
+- `Donchian72_Mid`
+- `Donchian72_State`
+
+State strings describe whether price is testing resistance/support, breaking out, or still trading inside the box.
+
+## Neutral Data Protocol
+
+Prompt output must describe observable market state without embedding a directional conclusion.
+
+- Allowed: `higher`, `lower`, `above`, `below`, `within`, `proportional`
+- Disallowed: `excellent`, `strong`, `bad`, `bullish`, `bearish`, `dominant`
+
+Examples:
+
+- `Price is currently above the upper bound`
+- `Price is within 2% range of the upper bound`
+- `Large-Order Flow Inflow`
+
+The prompt must not append interpretation footnotes to OI ranking, netflow ranking, or price ranking tables.
+
+## Smart Fetching Protocol
+
+Prompt display length and backend fetch length are separate concerns.
+
+- `primary_count` defines how many candles are exposed to the AI prompt.
+- Backend fetch length is expanded automatically to prewarm indicators before the visible window is trimmed.
+
+Warmup rules:
+
+- EMA / RSI / ATR: `ceil(period * MemoryFactor)`
+- MACD: `ceil(26 * MemoryFactor)`
+- BOLL / Donchian: `period`
+
+The final request window is `userCount + maxWarmup` whenever any warmup is required. After indicator calculation completes, timeframe kline arrays are trimmed back to the user-visible `primary_count`.

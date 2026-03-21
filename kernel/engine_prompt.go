@@ -5,6 +5,7 @@ import (
 	"nofx/market"
 	"nofx/provider/nofxos"
 	"nofx/store"
+	"sort"
 	"strings"
 	"time"
 )
@@ -87,7 +88,7 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 		sb.WriteString("\n\n")
 	} else {
 		sb.WriteString("# ⏱️ Trading Frequency Awareness\n\n")
-		sb.WriteString("- Excellent traders: 2-4 trades/day ≈ 0.1-0.2 trades/hour\n")
+		sb.WriteString("- Reference frequency: 2-4 trades/day ≈ 0.1-0.2 trades/hour\n")
 		sb.WriteString("- >2 trades/hour = Overtrading\n")
 		sb.WriteString("- Single position hold time ≥ 30-60 minutes\n")
 		sb.WriteString("If you find yourself trading every period → standards too low; if closing positions < 30 minutes → too impatient.\n\n")
@@ -113,7 +114,7 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 	} else {
 		sb.WriteString("# 📋 Decision Process\n\n")
 		sb.WriteString("1. Check positions → Should we take profit/stop-loss\n")
-		sb.WriteString("2. Scan candidate coins + multi-timeframe → Are there strong signals\n")
+		sb.WriteString("2. Scan candidate coins + multi-timeframe → Are multiple signals aligned or conflicting\n")
 		sb.WriteString("3. Write chain of thought first, then output structured JSON\n\n")
 	}
 
@@ -140,6 +141,18 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 	sb.WriteString(fmt.Sprintf("- `confidence`: 0-100 (opening recommended ≥ %d)\n", riskControl.MinConfidence))
 	sb.WriteString("- Required when opening: leverage, position_size_usd, stop_loss, take_profit, confidence, risk_usd\n")
 	sb.WriteString("- **IMPORTANT**: All numeric values must be calculated numbers, NOT formulas/expressions (e.g., use `27.76` not `3000 * 0.01`)\n\n")
+
+	// ⚡ Forced Output Format - Critical constraint for reasoning models
+	sb.WriteString("## ⚡ Forced Output Format (CRITICAL - MUST FOLLOW)\n\n")
+	sb.WriteString("**MANDATORY ORDER**: You MUST first wrap your complete logical analysis inside `<reasoning>` tags. Then immediately output the JSON decision block inside `<decision>` tags.\n\n")
+	sb.WriteString("**FORBIDDEN**: Do NOT write any content outside the `<reasoning>` and `<decision>` tags. The tags themselves must be on their own lines.\n\n")
+	sb.WriteString("**CORRECT EXAMPLE**:\n")
+	sb.WriteString("```\n<reasoning>\nYour complete analysis here...\nCheck all indicators, consider risk, then decide.\n</reasoning>\n<decision>\n[{\"symbol\": \"BTCUSDT\", \"action\": \"wait\", ...}]\n</decision>\n```\n\n")
+	sb.WriteString("**WRONG - WILL CAUSE PARSING FAILURE**:\n")
+	sb.WriteString("- Writing analysis before `<reasoning>` tag\n")
+	sb.WriteString("- Skipping `<reasoning>` tag entirely\n")
+	sb.WriteString("- Closing `</reasoning>` before analysis is complete\n")
+	sb.WriteString("- Writing content after `</decision>` tag\n\n")
 
 	// 8. Custom Prompt
 	if e.config.CustomPrompt != "" {
@@ -199,6 +212,14 @@ func (e *StrategyEngine) writeAvailableIndicators(sb *strings.Builder) {
 		sb.WriteString("\n")
 	}
 
+	if indicators.EnableDonchianBox {
+		sb.WriteString("- Donchian Box (Trend Filter Factor) - Upper/Lower boundaries and breakout state")
+		if len(indicators.DonchianPeriods) > 0 {
+			sb.WriteString(fmt.Sprintf(" (periods: %v)", indicators.DonchianPeriods))
+		}
+		sb.WriteString("\n")
+	}
+
 	if indicators.EnableVolume {
 		sb.WriteString("- Volume data\n")
 	}
@@ -234,9 +255,19 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 
 	// BTC market
 	if btcData, hasBTC := ctx.MarketDataMap["BTCUSDT"]; hasBTC {
-		sb.WriteString(fmt.Sprintf("BTC: %.2f (1h: %+.2f%%, 4h: %+.2f%%) | MACD: %.4f | RSI: %.2f\n\n",
-			btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h,
-			btcData.CurrentMACD, btcData.CurrentRSI7))
+		summary := []string{
+			fmt.Sprintf("BTC: %.2f (1h: %+.2f%%, 4h: %+.2f%%)", btcData.CurrentPrice, btcData.PriceChange1h, btcData.PriceChange4h),
+		}
+		if e.config.Indicators.EnableMACD {
+			summary = append(summary, fmt.Sprintf("MACD: %.4f", btcData.Indicators.MACD))
+		}
+		if e.config.Indicators.EnableRSI {
+			for _, period := range sortedKeysFloatMap(btcData.Indicators.RSIs) {
+				summary = append(summary, fmt.Sprintf("RSI%d: %.2f", period, btcData.Indicators.RSIs[period]))
+			}
+		}
+		sb.WriteString(strings.Join(summary, " | "))
+		sb.WriteString("\n\n")
 	}
 
 	// Account information
@@ -289,16 +320,6 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 				ctx.TradingStats.AvgLoss,
 				ctx.TradingStats.MaxDrawdownPct))
 
-			// Performance hints based on profit factor, sharpe, and drawdown
-			if ctx.TradingStats.ProfitFactor >= 1.5 && ctx.TradingStats.SharpeRatio >= 1 {
-				sb.WriteString("表现: 良好 - 保持当前策略\n")
-			} else if ctx.TradingStats.ProfitFactor < 1 {
-				sb.WriteString("表现: 需改进 - 提高盈亏比，优化止盈止损\n")
-			} else if ctx.TradingStats.MaxDrawdownPct > 30 {
-				sb.WriteString("表现: 风险偏高 - 减少仓位，控制回撤\n")
-			} else {
-				sb.WriteString("表现: 正常 - 有优化空间\n")
-			}
 		} else {
 			sb.WriteString("## Historical Trading Statistics\n")
 			sb.WriteString(fmt.Sprintf("Total Trades: %d | Profit Factor: %.2f | Sharpe: %.2f | Win/Loss Ratio: %.2f\n",
@@ -311,17 +332,6 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 				ctx.TradingStats.AvgWin,
 				ctx.TradingStats.AvgLoss,
 				ctx.TradingStats.MaxDrawdownPct))
-
-			// Performance hints based on profit factor, sharpe, and drawdown
-			if ctx.TradingStats.ProfitFactor >= 1.5 && ctx.TradingStats.SharpeRatio >= 1 {
-				sb.WriteString("Performance: GOOD - maintain current strategy\n")
-			} else if ctx.TradingStats.ProfitFactor < 1 {
-				sb.WriteString("Performance: NEEDS IMPROVEMENT - improve win/loss ratio, optimize TP/SL\n")
-			} else if ctx.TradingStats.MaxDrawdownPct > 30 {
-				sb.WriteString("Performance: HIGH RISK - reduce position size, control drawdown\n")
-			} else {
-				sb.WriteString("Performance: NORMAL - room for optimization\n")
-			}
 		}
 		sb.WriteString("\n")
 	}
@@ -507,19 +517,10 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 	// Clearly label the coin symbol
 	sb.WriteString(fmt.Sprintf("=== %s Market Data ===\n\n", data.Symbol))
 	sb.WriteString(fmt.Sprintf("current_price = %.4f", data.CurrentPrice))
-
-	if indicators.EnableEMA {
-		sb.WriteString(fmt.Sprintf(", current_ema20 = %.3f", data.CurrentEMA20))
+	for _, line := range formatIndicatorSummary(indicators, data.CurrentPrice, data.Indicators) {
+		sb.WriteString(", ")
+		sb.WriteString(line)
 	}
-
-	if indicators.EnableMACD {
-		sb.WriteString(fmt.Sprintf(", current_macd = %.3f", data.CurrentMACD))
-	}
-
-	if indicators.EnableRSI {
-		sb.WriteString(fmt.Sprintf(", current_rsi7 = %.3f", data.CurrentRSI7))
-	}
-
 	sb.WriteString("\n\n")
 
 	if indicators.EnableOI || indicators.EnableFundingRate {
@@ -541,68 +542,6 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 			if tfData, ok := data.TimeframeData[tf]; ok {
 				sb.WriteString(fmt.Sprintf("=== %s Timeframe (oldest → latest) ===\n\n", strings.ToUpper(tf)))
 				e.formatTimeframeSeriesData(&sb, tfData, indicators)
-			}
-		}
-	} else {
-		// Compatible with old data format
-		if data.IntradaySeries != nil {
-			klineConfig := indicators.Klines
-			sb.WriteString(fmt.Sprintf("Intraday series (%s intervals, oldest → latest):\n\n", klineConfig.PrimaryTimeframe))
-
-			if len(data.IntradaySeries.MidPrices) > 0 {
-				sb.WriteString(fmt.Sprintf("Mid prices: %s\n\n", formatFloatSlice(data.IntradaySeries.MidPrices)))
-			}
-
-			if indicators.EnableEMA && len(data.IntradaySeries.EMA20Values) > 0 {
-				sb.WriteString(fmt.Sprintf("EMA indicators (20-period): %s\n\n", formatFloatSlice(data.IntradaySeries.EMA20Values)))
-			}
-
-			if indicators.EnableMACD && len(data.IntradaySeries.MACDValues) > 0 {
-				sb.WriteString(fmt.Sprintf("MACD indicators: %s\n\n", formatFloatSlice(data.IntradaySeries.MACDValues)))
-			}
-
-			if indicators.EnableRSI {
-				if len(data.IntradaySeries.RSI7Values) > 0 {
-					sb.WriteString(fmt.Sprintf("RSI indicators (7-Period): %s\n\n", formatFloatSlice(data.IntradaySeries.RSI7Values)))
-				}
-				if len(data.IntradaySeries.RSI14Values) > 0 {
-					sb.WriteString(fmt.Sprintf("RSI indicators (14-Period): %s\n\n", formatFloatSlice(data.IntradaySeries.RSI14Values)))
-				}
-			}
-
-			if indicators.EnableVolume && len(data.IntradaySeries.Volume) > 0 {
-				sb.WriteString(fmt.Sprintf("Volume: %s\n\n", formatFloatSlice(data.IntradaySeries.Volume)))
-			}
-
-			if indicators.EnableATR {
-				sb.WriteString(fmt.Sprintf("3m ATR (14-period): %.3f\n\n", data.IntradaySeries.ATR14))
-			}
-		}
-
-		if data.LongerTermContext != nil && indicators.Klines.EnableMultiTimeframe {
-			sb.WriteString(fmt.Sprintf("Longer-term context (%s timeframe):\n\n", indicators.Klines.LongerTimeframe))
-
-			if indicators.EnableEMA {
-				sb.WriteString(fmt.Sprintf("20-Period EMA: %.3f vs. 50-Period EMA: %.3f\n\n",
-					data.LongerTermContext.EMA20, data.LongerTermContext.EMA50))
-			}
-
-			if indicators.EnableATR {
-				sb.WriteString(fmt.Sprintf("3-Period ATR: %.3f vs. 14-Period ATR: %.3f\n\n",
-					data.LongerTermContext.ATR3, data.LongerTermContext.ATR14))
-			}
-
-			if indicators.EnableVolume {
-				sb.WriteString(fmt.Sprintf("Current Volume: %.3f vs. Average Volume: %.3f\n\n",
-					data.LongerTermContext.CurrentVolume, data.LongerTermContext.AverageVolume))
-			}
-
-			if indicators.EnableMACD && len(data.LongerTermContext.MACDValues) > 0 {
-				sb.WriteString(fmt.Sprintf("MACD indicators: %s\n\n", formatFloatSlice(data.LongerTermContext.MACDValues)))
-			}
-
-			if indicators.EnableRSI && len(data.LongerTermContext.RSI14Values) > 0 {
-				sb.WriteString(fmt.Sprintf("RSI indicators (14-Period): %s\n\n", formatFloatSlice(data.LongerTermContext.RSI14Values)))
 			}
 		}
 	}
@@ -632,38 +571,156 @@ func (e *StrategyEngine) formatTimeframeSeriesData(sb *strings.Builder, data *ma
 	}
 
 	if indicators.EnableEMA {
-		if len(data.EMA20Values) > 0 {
-			sb.WriteString(fmt.Sprintf("EMA20: %s\n", formatFloatSlice(data.EMA20Values)))
-		}
-		if len(data.EMA50Values) > 0 {
-			sb.WriteString(fmt.Sprintf("EMA50: %s\n", formatFloatSlice(data.EMA50Values)))
+		for _, period := range sortedKeysSeriesMap(data.Indicators.EMAs) {
+			values := data.Indicators.EMAs[period]
+			if len(values) > 0 {
+				sb.WriteString(fmt.Sprintf("EMA%d: %s\n", period, formatFloatSlice(values)))
+			}
 		}
 	}
 
-	if indicators.EnableMACD && len(data.MACDValues) > 0 {
-		sb.WriteString(fmt.Sprintf("MACD: %s\n", formatFloatSlice(data.MACDValues)))
+	if indicators.EnableMACD && len(data.Indicators.MACD) > 0 {
+		sb.WriteString(fmt.Sprintf("MACD: %s\n", formatFloatSlice(data.Indicators.MACD)))
 	}
 
 	if indicators.EnableRSI {
-		if len(data.RSI7Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI7: %s\n", formatFloatSlice(data.RSI7Values)))
-		}
-		if len(data.RSI14Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI14: %s\n", formatFloatSlice(data.RSI14Values)))
+		for _, period := range sortedKeysSeriesMap(data.Indicators.RSIs) {
+			values := data.Indicators.RSIs[period]
+			if len(values) > 0 {
+				sb.WriteString(fmt.Sprintf("RSI%d: %s\n", period, formatFloatSlice(values)))
+			}
 		}
 	}
 
-	if indicators.EnableATR && data.ATR14 > 0 {
-		sb.WriteString(fmt.Sprintf("ATR14: %.4f\n", data.ATR14))
+	if indicators.EnableATR {
+		for _, period := range sortedKeysFloatMap(data.Indicators.ATRs) {
+			value := data.Indicators.ATRs[period]
+			if value > 0 {
+				sb.WriteString(fmt.Sprintf("ATR%d: %.4f\n", period, value))
+			}
+		}
 	}
 
-	if indicators.EnableBOLL && len(data.BOLLUpper) > 0 {
-		sb.WriteString(fmt.Sprintf("BOLL Upper: %s\n", formatFloatSlice(data.BOLLUpper)))
-		sb.WriteString(fmt.Sprintf("BOLL Middle: %s\n", formatFloatSlice(data.BOLLMiddle)))
-		sb.WriteString(fmt.Sprintf("BOLL Lower: %s\n", formatFloatSlice(data.BOLLLower)))
+	if indicators.EnableBOLL {
+		for _, period := range sortedKeysBollSeriesMap(data.Indicators.Bolls) {
+			series := data.Indicators.Bolls[period]
+			if len(series.Upper) > 0 {
+				sb.WriteString(fmt.Sprintf("BOLL%d Upper: %s\n", period, formatFloatSlice(series.Upper)))
+				sb.WriteString(fmt.Sprintf("BOLL%d Middle: %s\n", period, formatFloatSlice(series.Middle)))
+				sb.WriteString(fmt.Sprintf("BOLL%d Lower: %s\n", period, formatFloatSlice(series.Lower)))
+			}
+		}
+	}
+
+	if indicators.EnableDonchianBox {
+		for _, period := range sortedKeysDonchianSeriesMap(data.Indicators.Donchians) {
+			series := data.Indicators.Donchians[period]
+			if len(series.Upper) > 0 {
+				sb.WriteString(fmt.Sprintf("Donchian%d_Upper: %s\n", period, formatFloatSlice(series.Upper)))
+				sb.WriteString(fmt.Sprintf("Donchian%d_Lower: %s\n", period, formatFloatSlice(series.Lower)))
+				sb.WriteString(fmt.Sprintf("Donchian%d_Mid: %s\n", period, formatFloatSlice(series.Mid)))
+			}
+		}
 	}
 
 	sb.WriteString("\n")
+}
+
+func formatIndicatorSummary(indicators store.IndicatorConfig, currentPrice float64, result market.IndicatorResult) []string {
+	lines := make([]string, 0)
+	if indicators.EnableEMA {
+		for _, period := range sortedKeysFloatMap(result.EMAs) {
+			lines = append(lines, fmt.Sprintf("current_ema%d = %.3f", period, result.EMAs[period]))
+		}
+	}
+	if indicators.EnableMACD {
+		lines = append(lines, fmt.Sprintf("current_macd = %.3f", result.MACD))
+	}
+	if indicators.EnableRSI {
+		for _, period := range sortedKeysFloatMap(result.RSIs) {
+			lines = append(lines, fmt.Sprintf("current_rsi%d = %.3f", period, result.RSIs[period]))
+		}
+	}
+	if indicators.EnableATR {
+		for _, period := range sortedKeysFloatMap(result.ATRs) {
+			lines = append(lines, fmt.Sprintf("current_atr%d = %.3f", period, result.ATRs[period]))
+		}
+	}
+	if indicators.EnableDonchianBox {
+		for _, period := range sortedKeysDonchianResultMap(result.Donchians) {
+			box := result.Donchians[period]
+			lines = append(lines, fmt.Sprintf("Donchian%d_Upper = %.3f", period, box.Upper))
+			lines = append(lines, fmt.Sprintf("Donchian%d_Lower = %.3f", period, box.Lower))
+			lines = append(lines, fmt.Sprintf("Donchian%d_Mid = %.3f", period, box.Mid))
+			lines = append(lines, fmt.Sprintf("Donchian%d_State = %s", period, describeDonchianState(currentPrice, box)))
+		}
+	}
+	return lines
+}
+
+func sortedKeysFloatMap[T ~float64](m map[int]T) []int {
+	keys := make([]int, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+func sortedKeysSeriesMap(m map[int][]float64) []int {
+	keys := make([]int, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+func sortedKeysBollSeriesMap(m map[int]market.BollSeries) []int {
+	keys := make([]int, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+func sortedKeysDonchianSeriesMap(m map[int]market.DonchianSeries) []int {
+	keys := make([]int, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+func sortedKeysDonchianResultMap(m map[int]market.DonchianResult) []int {
+	keys := make([]int, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+func describeDonchianState(currentPrice float64, box market.DonchianResult) string {
+	width := box.Upper - box.Lower
+	if width <= 0 {
+		return "Price is inside the Donchian Box"
+	}
+
+	switch {
+	case currentPrice > box.Upper:
+		return "Price is currently above the upper bound"
+	case currentPrice < box.Lower:
+		return "Price is currently below the lower bound"
+	case currentPrice >= box.Upper-width*0.02:
+		return "Price is within 2% range of the upper bound"
+	case currentPrice <= box.Lower+width*0.02:
+		return "Price is within 2% range of the lower bound"
+	default:
+		return "Price is currently between the upper and lower bounds"
+	}
 }
 
 func (e *StrategyEngine) formatQuantData(data *QuantData) string {
@@ -698,7 +755,7 @@ func (e *StrategyEngine) formatQuantData(data *QuantData) string {
 
 		if data.Netflow.Institution != nil {
 			if data.Netflow.Institution.Future != nil && len(data.Netflow.Institution.Future) > 0 {
-				sb.WriteString("  Institutional Futures:\n")
+				sb.WriteString("  Large-Order Flow Futures:\n")
 				for _, tf := range timeframes {
 					if v, ok := data.Netflow.Institution.Future[tf]; ok {
 						sb.WriteString(fmt.Sprintf("    %s: %s\n", tf, formatFlowValue(v)))
@@ -706,7 +763,7 @@ func (e *StrategyEngine) formatQuantData(data *QuantData) string {
 				}
 			}
 			if data.Netflow.Institution.Spot != nil && len(data.Netflow.Institution.Spot) > 0 {
-				sb.WriteString("  Institutional Spot:\n")
+				sb.WriteString("  Large-Order Flow Spot:\n")
 				for _, tf := range timeframes {
 					if v, ok := data.Netflow.Institution.Spot[tf]; ok {
 						sb.WriteString(fmt.Sprintf("    %s: %s\n", tf, formatFlowValue(v)))
@@ -717,7 +774,7 @@ func (e *StrategyEngine) formatQuantData(data *QuantData) string {
 
 		if data.Netflow.Personal != nil {
 			if data.Netflow.Personal.Future != nil && len(data.Netflow.Personal.Future) > 0 {
-				sb.WriteString("  Retail Futures:\n")
+				sb.WriteString("  Small-Order Flow Futures:\n")
 				for _, tf := range timeframes {
 					if v, ok := data.Netflow.Personal.Future[tf]; ok {
 						sb.WriteString(fmt.Sprintf("    %s: %s\n", tf, formatFlowValue(v)))
@@ -725,7 +782,7 @@ func (e *StrategyEngine) formatQuantData(data *QuantData) string {
 				}
 			}
 			if data.Netflow.Personal.Spot != nil && len(data.Netflow.Personal.Spot) > 0 {
-				sb.WriteString("  Retail Spot:\n")
+				sb.WriteString("  Small-Order Flow Spot:\n")
 				for _, tf := range timeframes {
 					if v, ok := data.Netflow.Personal.Spot[tf]; ok {
 						sb.WriteString(fmt.Sprintf("    %s: %s\n", tf, formatFlowValue(v)))

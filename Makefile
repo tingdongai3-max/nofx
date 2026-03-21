@@ -1,6 +1,9 @@
 # NOFX Makefile for testing and development
 
-.PHONY: help test test-backend test-frontend test-coverage clean
+SHELL := /bin/bash
+GO_WRAPPER := ./scripts/with_go_env.sh
+
+.PHONY: help test test-backend test-frontend test-coverage clean dev env-info
 
 # Default target
 help:
@@ -15,6 +18,7 @@ help:
 	@echo "Build:"
 	@echo "  make build                - Build backend binary"
 	@echo "  make build-frontend       - Build frontend"
+	@echo "  make env-info             - Show detected Go environment"
 	@echo ""
 	@echo "Clean:"
 	@echo "  make clean                - Clean build artifacts and test cache"
@@ -26,7 +30,7 @@ help:
 # Run all tests
 test:
 	@echo "🧪 Running backend tests..."
-	go test -v ./...
+	@$(GO_WRAPPER) go test -v ./...
 	@echo ""
 	@echo "🧪 Running frontend tests..."
 	cd web && npm run test
@@ -35,7 +39,7 @@ test:
 # Backend tests only
 test-backend:
 	@echo "🧪 Running backend tests..."
-	go test -v ./...
+	@$(GO_WRAPPER) go test -v ./...
 
 # Frontend tests only
 test-frontend:
@@ -45,8 +49,8 @@ test-frontend:
 # Coverage report
 test-coverage:
 	@echo "📊 Generating coverage..."
-	go test -coverprofile=coverage.out ./...
-	go tool cover -html=coverage.out -o coverage.html
+	@$(GO_WRAPPER) go test -coverprofile=coverage.out ./...
+	@$(GO_WRAPPER) go tool cover -html=coverage.out -o coverage.html
 	@echo "✅ Backend coverage: coverage.html"
 
 # =============================================================================
@@ -56,7 +60,7 @@ test-coverage:
 # Build backend binary
 build:
 	@echo "🔨 Building backend..."
-	go build -o nofx
+	@$(GO_WRAPPER) go build -o nofx .
 	@echo "✅ Backend built: ./nofx"
 
 # Build frontend
@@ -69,10 +73,17 @@ build-frontend:
 # Development
 # =============================================================================
 
+# Full-stack development environment (backend + frontend)
+# This is the ONLY permitted way to start/restart the development stack
+dev:
+	@echo "🚀 Starting full-stack development environment..."
+	@./scripts/dev_guard.sh
+	@echo "✅ Development environment ready"
+
 # Run backend in development mode
 run:
 	@echo "🚀 Starting backend..."
-	go run main.go
+	@$(GO_WRAPPER) go run main.go
 
 # Run frontend in development mode
 run-frontend:
@@ -82,7 +93,7 @@ run-frontend:
 # Format Go code
 fmt:
 	@echo "🎨 Formatting Go code..."
-	go fmt ./...
+	@$(GO_WRAPPER) go fmt ./...
 	@echo "✅ Code formatted"
 
 # Lint Go code (requires golangci-lint)
@@ -100,7 +111,7 @@ clean:
 	rm -f nofx
 	rm -f coverage.out coverage.html
 	rm -rf web/dist
-	go clean -testcache
+	@$(GO_WRAPPER) go clean -testcache
 	@echo "✅ Cleaned"
 
 # =============================================================================
@@ -136,15 +147,22 @@ docker-logs:
 # Download Go dependencies
 deps:
 	@echo "📦 Downloading Go dependencies..."
-	go mod download
+	@$(GO_WRAPPER) go mod download
 	@echo "✅ Dependencies downloaded"
 
 # Update Go dependencies
 deps-update:
 	@echo "📦 Updating Go dependencies..."
-	go get -u ./...
-	go mod tidy
+	@$(GO_WRAPPER) go get -u ./...
+	@$(GO_WRAPPER) go mod tidy
 	@echo "✅ Dependencies updated"
+
+env-info:
+	@source ./scripts/go_env.sh && \
+	echo "GO_BIN=$$GO_BIN" && \
+	echo "GOROOT=$$GOROOT" && \
+	echo "GOCACHE=$$GOCACHE" && \
+	"$$GO_BIN" version
 
 # Install frontend dependencies
 deps-frontend:

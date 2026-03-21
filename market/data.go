@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"nofx/logger"
+	"nofx/store"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,13 +27,15 @@ var (
 
 // Get retrieves market data for the specified token (uses Binance data by default)
 func Get(symbol string) (*Data, error) {
-	return GetWithExchange(symbol, "binance")
+	defaults := store.GetDefaultStrategyConfig("en")
+	return GetWithExchange(symbol, "binance", &defaults.Indicators)
 }
 
 // GetWithExchange retrieves market data for the specified token using exchange-specific data
-func GetWithExchange(symbol, exchange string) (*Data, error) {
+func GetWithExchange(symbol, exchange string, indicatorConfig *store.IndicatorConfig) (*Data, error) {
 	var klines3m, klines4h []Kline
 	var err error
+	config := normalizedIndicatorConfig(indicatorConfig)
 	// Normalize symbol
 	symbol = Normalize(symbol)
 
@@ -86,9 +89,7 @@ func GetWithExchange(symbol, exchange string) (*Data, error) {
 
 	// Calculate current indicators (based on 3-minute latest data)
 	currentPrice := klines3m[len(klines3m)-1].Close
-	currentEMA20 := calculateEMA(klines3m, 20)
-	currentMACD := calculateMACD(klines3m)
-	currentRSI7 := calculateRSI(klines3m, 7)
+	currentIndicators := buildIndicatorSnapshot(klines3m, config)
 
 	// Calculate price change percentage
 	// 1-hour price change = price from 20 3-minute K-lines ago
@@ -119,24 +120,20 @@ func GetWithExchange(symbol, exchange string) (*Data, error) {
 	// Get Funding Rate
 	fundingRate, _ := getFundingRate(symbol)
 
-	// Calculate intraday series data
-	intradayData := calculateIntradaySeries(klines3m)
-
-	// Calculate longer-term data
-	longerTermData := calculateLongerTermData(klines4h)
+	timeframeData := map[string]*TimeframeSeriesData{
+		"3m": calculateTimeframeSeries(klines3m, "3m", 30, &config),
+		"4h": calculateTimeframeSeries(klines4h, "4h", 30, &config),
+	}
 
 	return &Data{
-		Symbol:            symbol,
-		CurrentPrice:      currentPrice,
-		PriceChange1h:     priceChange1h,
-		PriceChange4h:     priceChange4h,
-		CurrentEMA20:      currentEMA20,
-		CurrentMACD:       currentMACD,
-		CurrentRSI7:       currentRSI7,
-		OpenInterest:      oiData,
-		FundingRate:       fundingRate,
-		IntradaySeries:    intradayData,
-		LongerTermContext: longerTermData,
+		Symbol:        symbol,
+		CurrentPrice:  currentPrice,
+		PriceChange1h: priceChange1h,
+		PriceChange4h: priceChange4h,
+		Indicators:    currentIndicators,
+		OpenInterest:  oiData,
+		FundingRate:   fundingRate,
+		TimeframeData: timeframeData,
 	}, nil
 }
 
@@ -144,8 +141,10 @@ func GetWithExchange(symbol, exchange string) (*Data, error) {
 // timeframes: list of timeframes, e.g. ["5m", "15m", "1h", "4h"]
 // primaryTimeframe: primary timeframe (used for calculating current indicators), defaults to timeframes[0]
 // count: number of K-lines for each timeframe
-func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe string, count int) (*Data, error) {
+func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe string, count int, indicatorConfig *store.IndicatorConfig) (*Data, error) {
 	symbol = Normalize(symbol)
+	config := normalizedIndicatorConfig(indicatorConfig)
+	fetchCount := CalculateRequiredFetchCount(config, count)
 
 	if len(timeframes) == 0 {
 		return nil, fmt.Errorf("at least one timeframe is required")
@@ -180,16 +179,18 @@ func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe stri
 		var klines []Kline
 		var err error
 
+		logger.Infof("📦 Market fetch window %s %s: display=%d fetch=%d", symbol, tf, count, fetchCount)
+
 		if isXyzAsset {
 			// Use Hyperliquid API for xyz dex assets
-			klines, err = getKlinesFromHyperliquid(symbol, tf, 200)
+			klines, err = getKlinesFromHyperliquid(symbol, tf, fetchCount)
 			if err != nil {
 				logger.Infof("⚠️ Failed to get %s %s K-line from Hyperliquid: %v", symbol, tf, err)
 				continue
 			}
 		} else {
 			// Use CoinAnk for regular crypto assets (default to Binance)
-			klines, err = getKlinesFromCoinAnk(symbol, tf, "binance", 200)
+			klines, err = getKlinesFromCoinAnk(symbol, tf, "binance", fetchCount)
 			if err != nil {
 				logger.Infof("⚠️ Failed to get %s %s K-line from CoinAnk: %v", symbol, tf, err)
 				continue
@@ -207,7 +208,7 @@ func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe stri
 		}
 
 		// Calculate series data for this timeframe (use count from config)
-		seriesData := calculateTimeframeSeries(klines, tf, count)
+		seriesData := calculateTimeframeSeries(klines, tf, count, &config)
 		timeframeData[tf] = seriesData
 	}
 
@@ -224,12 +225,10 @@ func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe stri
 
 	// Calculate current indicators (based on primary timeframe latest data)
 	currentPrice := primaryKlines[len(primaryKlines)-1].Close
-	currentEMA20 := calculateEMA(primaryKlines, 20)
-	currentMACD := calculateMACD(primaryKlines)
-	currentRSI7 := calculateRSI(primaryKlines, 7)
+	currentIndicators := buildIndicatorSnapshot(primaryKlines, config)
 
 	// Calculate price changes
-	priceChange1h := calculatePriceChangeByBars(primaryKlines, primaryTimeframe, 60) // 1 hour
+	priceChange1h := calculatePriceChangeByBars(primaryKlines, primaryTimeframe, 60)  // 1 hour
 	priceChange4h := calculatePriceChangeByBars(primaryKlines, primaryTimeframe, 240) // 4 hours
 
 	// Get OI data
@@ -246,9 +245,7 @@ func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe stri
 		CurrentPrice:  currentPrice,
 		PriceChange1h: priceChange1h,
 		PriceChange4h: priceChange4h,
-		CurrentEMA20:  currentEMA20,
-		CurrentMACD:   currentMACD,
-		CurrentRSI7:   currentRSI7,
+		Indicators:    currentIndicators,
 		OpenInterest:  oiData,
 		FundingRate:   fundingRate,
 		TimeframeData: timeframeData,
@@ -347,8 +344,11 @@ func Format(data *Data) string {
 
 	// Format price with dynamic precision
 	priceStr := formatPriceWithDynamicPrecision(data.CurrentPrice)
-	sb.WriteString(fmt.Sprintf("current_price = %s, current_ema20 = %.3f, current_macd = %.3f, current_rsi (7 period) = %.3f\n\n",
-		priceStr, data.CurrentEMA20, data.CurrentMACD, data.CurrentRSI7))
+	sb.WriteString(fmt.Sprintf("current_price = %s", priceStr))
+	for _, line := range formatIndicatorSnapshot(data.Indicators) {
+		sb.WriteString(", " + line)
+	}
+	sb.WriteString("\n\n")
 
 	sb.WriteString(fmt.Sprintf("In addition, here is the latest %s open interest and funding rate for perps:\n\n",
 		data.Symbol))
@@ -362,57 +362,6 @@ func Format(data *Data) string {
 	}
 
 	sb.WriteString(fmt.Sprintf("Funding Rate: %.2e\n\n", data.FundingRate))
-
-	if data.IntradaySeries != nil {
-		sb.WriteString("Intraday series (3‑minute intervals, oldest → latest):\n\n")
-
-		if len(data.IntradaySeries.MidPrices) > 0 {
-			sb.WriteString(fmt.Sprintf("Mid prices: %s\n\n", formatFloatSlice(data.IntradaySeries.MidPrices)))
-		}
-
-		if len(data.IntradaySeries.EMA20Values) > 0 {
-			sb.WriteString(fmt.Sprintf("EMA indicators (20‑period): %s\n\n", formatFloatSlice(data.IntradaySeries.EMA20Values)))
-		}
-
-		if len(data.IntradaySeries.MACDValues) > 0 {
-			sb.WriteString(fmt.Sprintf("MACD indicators: %s\n\n", formatFloatSlice(data.IntradaySeries.MACDValues)))
-		}
-
-		if len(data.IntradaySeries.RSI7Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI indicators (7‑Period): %s\n\n", formatFloatSlice(data.IntradaySeries.RSI7Values)))
-		}
-
-		if len(data.IntradaySeries.RSI14Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI indicators (14‑Period): %s\n\n", formatFloatSlice(data.IntradaySeries.RSI14Values)))
-		}
-
-		if len(data.IntradaySeries.Volume) > 0 {
-			sb.WriteString(fmt.Sprintf("Volume: %s\n\n", formatFloatSlice(data.IntradaySeries.Volume)))
-		}
-
-		sb.WriteString(fmt.Sprintf("3m ATR (14‑period): %.3f\n\n", data.IntradaySeries.ATR14))
-	}
-
-	if data.LongerTermContext != nil {
-		sb.WriteString("Longer‑term context (4‑hour timeframe):\n\n")
-
-		sb.WriteString(fmt.Sprintf("20‑Period EMA: %.3f vs. 50‑Period EMA: %.3f\n\n",
-			data.LongerTermContext.EMA20, data.LongerTermContext.EMA50))
-
-		sb.WriteString(fmt.Sprintf("3‑Period ATR: %.3f vs. 14‑Period ATR: %.3f\n\n",
-			data.LongerTermContext.ATR3, data.LongerTermContext.ATR14))
-
-		sb.WriteString(fmt.Sprintf("Current Volume: %.3f vs. Average Volume: %.3f\n\n",
-			data.LongerTermContext.CurrentVolume, data.LongerTermContext.AverageVolume))
-
-		if len(data.LongerTermContext.MACDValues) > 0 {
-			sb.WriteString(fmt.Sprintf("MACD indicators: %s\n\n", formatFloatSlice(data.LongerTermContext.MACDValues)))
-		}
-
-		if len(data.LongerTermContext.RSI14Values) > 0 {
-			sb.WriteString(fmt.Sprintf("RSI indicators (14‑Period): %s\n\n", formatFloatSlice(data.LongerTermContext.RSI14Values)))
-		}
-	}
 
 	// Multi-timeframe data (new)
 	if len(data.TimeframeData) > 0 {
@@ -454,28 +403,34 @@ func formatTimeframeData(sb *strings.Builder, data *TimeframeSeriesData) {
 	}
 
 	// Technical indicators
-	if len(data.EMA20Values) > 0 {
-		sb.WriteString(fmt.Sprintf("EMA20: %s\n", formatFloatSlice(data.EMA20Values)))
+	for period, values := range data.Indicators.EMAs {
+		if len(values) > 0 {
+			sb.WriteString(fmt.Sprintf("EMA%d: %s\n", period, formatFloatSlice(values)))
+		}
 	}
 
-	if len(data.EMA50Values) > 0 {
-		sb.WriteString(fmt.Sprintf("EMA50: %s\n", formatFloatSlice(data.EMA50Values)))
+	if len(data.Indicators.MACD) > 0 {
+		sb.WriteString(fmt.Sprintf("MACD: %s\n", formatFloatSlice(data.Indicators.MACD)))
 	}
 
-	if len(data.MACDValues) > 0 {
-		sb.WriteString(fmt.Sprintf("MACD: %s\n", formatFloatSlice(data.MACDValues)))
+	for period, values := range data.Indicators.RSIs {
+		if len(values) > 0 {
+			sb.WriteString(fmt.Sprintf("RSI%d: %s\n", period, formatFloatSlice(values)))
+		}
 	}
 
-	if len(data.RSI7Values) > 0 {
-		sb.WriteString(fmt.Sprintf("RSI7: %s\n", formatFloatSlice(data.RSI7Values)))
+	for period, value := range data.Indicators.ATRs {
+		if value > 0 {
+			sb.WriteString(fmt.Sprintf("ATR%d: %.4f\n", period, value))
+		}
 	}
 
-	if len(data.RSI14Values) > 0 {
-		sb.WriteString(fmt.Sprintf("RSI14: %s\n", formatFloatSlice(data.RSI14Values)))
-	}
-
-	if data.ATR14 > 0 {
-		sb.WriteString(fmt.Sprintf("ATR14: %.4f\n", data.ATR14))
+	for period, series := range data.Indicators.Bolls {
+		if len(series.Upper) > 0 {
+			sb.WriteString(fmt.Sprintf("BOLL%d Upper: %s\n", period, formatFloatSlice(series.Upper)))
+			sb.WriteString(fmt.Sprintf("BOLL%d Middle: %s\n", period, formatFloatSlice(series.Middle)))
+			sb.WriteString(fmt.Sprintf("BOLL%d Lower: %s\n", period, formatFloatSlice(series.Lower)))
+		}
 	}
 
 	sb.WriteString("\n")
@@ -519,6 +474,25 @@ func formatFloatSlice(values []float64) string {
 		strValues[i] = formatPriceWithDynamicPrecision(v)
 	}
 	return "[" + strings.Join(strValues, ", ") + "]"
+}
+
+func formatIndicatorSnapshot(indicators IndicatorResult) []string {
+	parts := make([]string, 0)
+	for period, value := range indicators.EMAs {
+		parts = append(parts, fmt.Sprintf("current_ema%d = %.3f", period, value))
+	}
+	if indicators.MACD != 0 {
+		parts = append(parts, fmt.Sprintf("current_macd = %.3f", indicators.MACD))
+	}
+	for period, value := range indicators.RSIs {
+		parts = append(parts, fmt.Sprintf("current_rsi%d = %.3f", period, value))
+	}
+	for period, value := range indicators.ATRs {
+		if value > 0 {
+			parts = append(parts, fmt.Sprintf("current_atr%d = %.3f", period, value))
+		}
+	}
+	return parts
 }
 
 // xyz dex assets that should NOT get USDT suffix
@@ -607,27 +581,28 @@ func BuildDataFromKlines(symbol string, primary []Kline, longer []Kline) (*Data,
 	if len(primary) == 0 {
 		return nil, fmt.Errorf("primary series is empty")
 	}
+	defaults := store.GetDefaultStrategyConfig("en")
+	config := normalizedIndicatorConfig(&defaults.Indicators)
 
 	symbol = Normalize(symbol)
 	current := primary[len(primary)-1]
 	currentPrice := current.Close
 
 	data := &Data{
-		Symbol:            symbol,
-		CurrentPrice:      currentPrice,
-		CurrentEMA20:      calculateEMA(primary, 20),
-		CurrentMACD:       calculateMACD(primary),
-		CurrentRSI7:       calculateRSI(primary, 7),
-		PriceChange1h:     priceChangeFromSeries(primary, time.Hour),
-		PriceChange4h:     priceChangeFromSeries(primary, 4*time.Hour),
-		OpenInterest:      &OIData{Latest: 0, Average: 0},
-		FundingRate:       0,
-		IntradaySeries:    calculateIntradaySeries(primary),
-		LongerTermContext: nil,
+		Symbol:        symbol,
+		CurrentPrice:  currentPrice,
+		Indicators:    buildIndicatorSnapshot(primary, config),
+		PriceChange1h: priceChangeFromSeries(primary, time.Hour),
+		PriceChange4h: priceChangeFromSeries(primary, 4*time.Hour),
+		OpenInterest:  &OIData{Latest: 0, Average: 0},
+		FundingRate:   0,
+		TimeframeData: map[string]*TimeframeSeriesData{
+			"primary": calculateTimeframeSeries(primary, "primary", 30, &config),
+		},
 	}
 
 	if len(longer) > 0 {
-		data.LongerTermContext = calculateLongerTermData(longer)
+		data.TimeframeData["longer"] = calculateTimeframeSeries(longer, "longer", 30, &config)
 	}
 
 	return data, nil

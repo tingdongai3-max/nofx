@@ -11,6 +11,41 @@ import (
 	"time"
 )
 
+// calculateNextAlignment returns the delay until the next decision boundary aligned to
+// the natural interval plus a fixed offset.
+//
+// It uses time.Time.Truncate to snap the current wall-clock time down to the most recent
+// interval boundary. From that anchor it first tries the current boundary plus offset:
+//
+//	(now.Truncate(interval) + offset)
+//
+// If that aligned point is already in the past, it rolls forward by one interval.
+//
+// Recomputing from time.Now() after every cycle keeps the loop anchored to candle closes
+// instead of drifting with execution time. The returned time.Time is the absolute aligned
+// wake-up point for logging and observability.
+func calculateNextAlignment(interval time.Duration, offset time.Duration) (time.Duration, time.Time) {
+	return calculateNextAlignmentFrom(time.Now(), interval, offset)
+}
+
+func calculateNextAlignmentFrom(now time.Time, interval time.Duration, offset time.Duration) (time.Duration, time.Time) {
+	if interval <= 0 {
+		nextTick := now.Add(offset)
+		if !nextTick.After(now) {
+			nextTick = now.Add(time.Second)
+		}
+		return nextTick.Sub(now), nextTick
+	}
+
+	lastTick := now.Truncate(interval)
+	nextTick := lastTick.Add(offset)
+	if !nextTick.After(now) {
+		nextTick = nextTick.Add(interval)
+	}
+
+	return nextTick.Sub(now), nextTick
+}
+
 // runCycle runs one trading cycle (using AI full decision-making)
 func (at *AutoTrader) runCycle() error {
 	at.callCount++

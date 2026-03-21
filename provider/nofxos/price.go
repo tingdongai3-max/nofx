@@ -12,7 +12,7 @@ import (
 type PriceRankingItem struct {
 	Pair         string  `json:"pair"`
 	Symbol       string  `json:"symbol"`
-	PriceDelta   float64 `json:"price_delta"`    // Decimal format: 0.0723 = 7.23%
+	PriceDelta   float64 `json:"price_delta"` // Decimal format: 0.0723 = 7.23%
 	Price        float64 `json:"price"`
 	FutureFlow   float64 `json:"future_flow"`
 	SpotFlow     float64 `json:"spot_flow"`
@@ -134,7 +134,6 @@ func formatPriceRankingZH(data *PriceRankingData) string {
 		}
 	}
 
-	sb.WriteString("**解读**: 涨幅大+资金流入+OI增加=强势上涨 | 跌幅大+资金流出+OI减少=弱势下跌\n\n")
 	return sb.String()
 }
 
@@ -177,6 +176,5 @@ func formatPriceRankingEN(data *PriceRankingData) string {
 		}
 	}
 
-	sb.WriteString("**Key**: Big gain + Fund inflow + OI increase = Strong bullish | Big loss + Fund outflow + OI decrease = Strong bearish\n\n")
 	return sb.String()
 }

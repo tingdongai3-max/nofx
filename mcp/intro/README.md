@@ -274,6 +274,36 @@ func (c *CustomProvider) setAuthHeader(headers http.Header) {
 }
 ```
 
+### ⚠️ 重要：必须显式实现 ParseMCPResponse
+
+当自定义 Provider 使用与基类不同的响应格式时（如 Anthropic Messages API），
+**必须显式实现 `ParseMCPResponse` 方法**，而不能依赖基类的隐式调用。
+
+```go
+// ❌ 错误：当 ParseMCPResponseFull 被重写时，基类的 ParseMCPResponse
+//       会调用自己的 ParseMCPResponseFull 而不是子类的版本
+func (c *CustomProvider) ParseMCPResponseFull(body []byte) (*mcp.LLMResponse, error) {
+    // 自定义解析逻辑...
+}
+
+// ✅ 正确：显式实现 ParseMCPResponse，确保调用的是自己的 ParseMCPResponseFull
+func (c *CustomProvider) ParseMCPResponse(body []byte) (string, error) {
+    r, err := c.ParseMCPResponseFull(body)
+    if err != nil {
+        return "", err
+    }
+    return r.Content, nil
+}
+
+func (c *CustomProvider) ParseMCPResponseFull(body []byte) (*mcp.LLMResponse, error) {
+    // 自定义解析逻辑...
+}
+```
+
+**原因**：Go 的方法调用基于具体接收者类型。当通过接口调用时，
+基类的 `ParseMCPResponse` 会调用基类的 `ParseMCPResponseFull`，
+而不是子类的重写版本，导致响应解析失败。
+
 ## 📝 日志器适配示例
 
 ### Zap 日志器

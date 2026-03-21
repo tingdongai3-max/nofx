@@ -51,6 +51,14 @@ func (s *Server) handleLatestDecisions(c *gin.Context) {
 		return
 	}
 
+	// Check if trader has strategy configured
+	if !trader.IsStrategyConfigured() {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "no_strategy_configured",
+		})
+		return
+	}
+
 	// Get limit from query parameter, default to 5
 	limit := 5
 	if limitStr := c.Query("limit"); limitStr != "" {

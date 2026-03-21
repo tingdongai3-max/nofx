@@ -173,7 +173,6 @@ func formatOIRankingZH(data *OIRankingData) string {
 
 	if len(data.TopPositions) > 0 {
 		sb.WriteString("### 持仓增加榜\n")
-		sb.WriteString("资金流入，趋势延续或新仓建立信号:\n\n")
 		sb.WriteString("| 排名 | 币种 | 持仓变化(USDT) | OI变化% | 价格变化% |\n")
 		sb.WriteString("|------|------|----------------|---------|----------|\n")
 		for _, pos := range data.TopPositions {
@@ -186,7 +185,6 @@ func formatOIRankingZH(data *OIRankingData) string {
 
 	if len(data.LowPositions) > 0 {
 		sb.WriteString("### 持仓减少榜\n")
-		sb.WriteString("资金流出，趋势反转或仓位平仓信号:\n\n")
 		sb.WriteString("| 排名 | 币种 | 持仓变化(USDT) | OI变化% | 价格变化% |\n")
 		sb.WriteString("|------|------|----------------|---------|----------|\n")
 		for _, pos := range data.LowPositions {
@@ -197,7 +195,6 @@ func formatOIRankingZH(data *OIRankingData) string {
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("**解读**: OI增+价涨=多头主导 | OI增+价跌=空头主导 | OI减+价涨=空头平仓 | OI减+价跌=多头平仓\n\n")
 	return sb.String()
 }
 
@@ -208,7 +205,6 @@ func formatOIRankingEN(data *OIRankingData) string {
 
 	if len(data.TopPositions) > 0 {
 		sb.WriteString("### OI Increase Ranking\n")
-		sb.WriteString("Capital inflow signals - trend continuation or new positions:\n\n")
 		sb.WriteString("| Rank | Symbol | OI Change (USDT) | OI Change % | Price Change % |\n")
 		sb.WriteString("|------|--------|------------------|-------------|----------------|\n")
 		for _, pos := range data.TopPositions {
@@ -221,7 +217,6 @@ func formatOIRankingEN(data *OIRankingData) string {
 
 	if len(data.LowPositions) > 0 {
 		sb.WriteString("### OI Decrease Ranking\n")
-		sb.WriteString("Capital outflow signals - trend reversal or position closing:\n\n")
 		sb.WriteString("| Rank | Symbol | OI Change (USDT) | OI Change % | Price Change % |\n")
 		sb.WriteString("|------|--------|------------------|-------------|----------------|\n")
 		for _, pos := range data.LowPositions {
@@ -232,6 +227,5 @@ func formatOIRankingEN(data *OIRankingData) string {
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString("**Key**: OI up + Price up = Bulls dominant | OI up + Price down = Bears dominant | OI down + Price up = Short covering | OI down + Price down = Long liquidation\n\n")
 	return sb.String()
 }

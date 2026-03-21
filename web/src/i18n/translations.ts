@@ -67,6 +67,7 @@ export const translations = {
     aiThinking: 'AI Chain of Thought',
     collapse: 'Collapse',
     expand: 'Expand',
+    deepReasoning: 'Deep reasoning in progress, please wait (up to 10 min)',
 
     // Equity Chart
     accountEquityCurve: 'Account Equity Curve',
@@ -1413,6 +1414,7 @@ export const translations = {
     aiThinking: '💭 AI思维链分析',
     collapse: '▼ 收起',
     expand: '▶ 展开',
+    deepReasoning: '深度推理中，请耐心等待（最多10分钟）',
 
     // Equity Chart
     accountEquityCurve: '账户净值曲线',
@@ -2699,6 +2701,7 @@ export const translations = {
     aiThinking: 'Rantai Pemikiran AI',
     collapse: 'Tutup',
     expand: 'Buka',
+    deepReasoning: 'Penalaran mendalam sedang berlangsung, silakan tunggu (hingga 10 menit)',
 
     // Equity Chart
     accountEquityCurve: 'Kurva Ekuitas Akun',

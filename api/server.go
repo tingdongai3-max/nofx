@@ -260,6 +260,7 @@ StrategyConfig fields:
   indicators.enable_rsi: true for overbought/oversold, divergence detection
   indicators.enable_boll: true for volatility, range trading, breakout strategies
   indicators.enable_atr: true for volatility measurement and stop-loss sizing
+  indicators.enable_donchian_box: true for Donchian trend boxes and breakout context
   indicators.enable_volume: ALWAYS true
   indicators.enable_oi: ALWAYS true (open interest data)
   indicators.enable_funding_rate: ALWAYS true
@@ -267,6 +268,7 @@ StrategyConfig fields:
   indicators.rsi_periods: [7,14] default
   indicators.atr_periods: [14] default
   indicators.boll_periods: [20] default
+  indicators.donchian_periods: [72,240,500] default, capped by primary_count in UI
   indicators.nofxos_api_key: ALWAYS "cm_568c67eae410d912c54c"
   indicators.enable_quant_data: ALWAYS true
   indicators.enable_quant_oi: ALWAYS true

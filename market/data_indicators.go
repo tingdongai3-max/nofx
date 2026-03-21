@@ -146,10 +146,12 @@ func calculateBOLL(klines []Kline, period int, multiplier float64) (upper, middl
 	return upper, middle, lower
 }
 
-// calculateDonchian calculates Donchian channel (highest high, lowest low) for given period
-func calculateDonchian(klines []Kline, period int) (upper, lower float64) {
+// calculateDonchian calculates a Donchian box trend filter factor.
+// It scans the trailing high-low window and returns the upper bound,
+// lower bound, and midpoint that define the active box.
+func calculateDonchian(klines []Kline, period int) DonchianResult {
 	if len(klines) == 0 || period <= 0 {
-		return 0, 0
+		return DonchianResult{}
 	}
 
 	// Use all available klines if period > len(klines)
@@ -158,8 +160,8 @@ func calculateDonchian(klines []Kline, period int) (upper, lower float64) {
 		start = 0
 	}
 
-	upper = klines[start].High
-	lower = klines[start].Low
+	upper := klines[start].High
+	lower := klines[start].Low
 
 	for i := start + 1; i < len(klines); i++ {
 		if klines[i].High > upper {
@@ -170,7 +172,11 @@ func calculateDonchian(klines []Kline, period int) (upper, lower float64) {
 		}
 	}
 
-	return upper, lower
+	return DonchianResult{
+		Upper: upper,
+		Lower: lower,
+		Mid:   (upper + lower) / 2,
+	}
 }
 
 // Box period constants (in 1h candles)
@@ -190,9 +196,12 @@ func calculateBoxData(klines []Kline, currentPrice float64) *BoxData {
 		return box
 	}
 
-	box.ShortUpper, box.ShortLower = calculateDonchian(klines, ShortBoxPeriod)
-	box.MidUpper, box.MidLower = calculateDonchian(klines, MidBoxPeriod)
-	box.LongUpper, box.LongLower = calculateDonchian(klines, LongBoxPeriod)
+	shortBox := calculateDonchian(klines, ShortBoxPeriod)
+	midBox := calculateDonchian(klines, MidBoxPeriod)
+	longBox := calculateDonchian(klines, LongBoxPeriod)
+	box.ShortUpper, box.ShortLower = shortBox.Upper, shortBox.Lower
+	box.MidUpper, box.MidLower = midBox.Upper, midBox.Lower
+	box.LongUpper, box.LongLower = longBox.Upper, longBox.Lower
 
 	return box
 }
@@ -225,7 +234,7 @@ func ExportCalculateBOLL(klines []Kline, period int, multiplier float64) (upper,
 }
 
 // ExportCalculateDonchian exports calculateDonchian for testing
-func ExportCalculateDonchian(klines []Kline, period int) (float64, float64) {
+func ExportCalculateDonchian(klines []Kline, period int) DonchianResult {
 	return calculateDonchian(klines, period)
 }
 

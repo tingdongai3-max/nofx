@@ -51,8 +51,15 @@
 5. AI请求 (CallWithMessages)
    ├─ 选择AI模型
    ├─ POST: system_prompt + user_prompt
-   ├─ 超时: 120秒, 重试: 3次
+   ├─ 超时: 600秒 (推理模型深度思考最长10分钟)
+   ├─ 重试: 3次
    └─ 返回原始响应
+
+**推理模型响应契约:**
+- AI 必须用 `<reasoning>` 标签包裹完整的思维链分析
+- AI 必须用 `<decision>` 标签包裹JSON决策数组
+- 标签外的内容不会被提取为思维链（可能导致解析失败）
+- 如果标签缺失或格式错误，系统进入SafeFallback模式（持有/等待）
         ↓
 6. AI解析 (parseFullDecisionResponse)
    ├─ 提取思维链 <reasoning>

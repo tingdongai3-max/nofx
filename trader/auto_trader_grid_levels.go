@@ -23,8 +23,8 @@ func (at *AutoTrader) calculateDefaultBounds(price float64, config *store.GridSt
 // calculateATRBounds calculates bounds using ATR
 func (at *AutoTrader) calculateATRBounds(price float64, mktData *market.Data, config *store.GridStrategyConfig) {
 	atr := 0.0
-	if mktData.LongerTermContext != nil {
-		atr = mktData.LongerTermContext.ATR14
+	if tf4h, ok := mktData.TimeframeData["4h"]; ok {
+		atr = tf4h.LatestATR(14)
 	}
 
 	if atr <= 0 {
@@ -282,7 +282,10 @@ func (at *AutoTrader) autoAdjustGrid() {
 	// Use the same logic as InitializeGrid() - either ATR-based or default percentage
 	if gridConfig.UseATRBounds {
 		// Try to get ATR for bound calculation
-		mktData, err := market.GetWithTimeframes(gridConfig.Symbol, []string{"4h"}, "4h", 20)
+		mktData, err := market.GetWithTimeframes(gridConfig.Symbol, []string{"4h"}, "4h", 20, &store.IndicatorConfig{
+			EnableATR:  true,
+			ATRPeriods: []int{14},
+		})
 		if err != nil {
 			logger.Warnf("[Grid] Failed to get market data for ATR during adjust: %v, using default bounds", err)
 			at.calculateDefaultBoundsLocked(currentPrice, gridConfig)
@@ -340,8 +343,8 @@ func (at *AutoTrader) calculateDefaultBoundsLocked(price float64, config *store.
 // calculateATRBoundsLocked calculates bounds using ATR (caller must hold lock)
 func (at *AutoTrader) calculateATRBoundsLocked(price float64, mktData *market.Data, config *store.GridStrategyConfig) {
 	atr := 0.0
-	if mktData.LongerTermContext != nil {
-		atr = mktData.LongerTermContext.ATR14
+	if tf4h, ok := mktData.TimeframeData["4h"]; ok {
+		atr = tf4h.LatestATR(14)
 	}
 
 	if atr <= 0 {

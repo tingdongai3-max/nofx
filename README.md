@@ -202,9 +202,14 @@ docker compose -f docker-compose.prod.yml up -d
 # Ubuntu: sudo apt-get install libta-lib0-dev
 
 git clone https://github.com/NoFxAiOS/nofx.git && cd nofx
-go build -o nofx && ./nofx          # backend
-cd web && npm install && npm run dev  # frontend (new terminal)
+make dev    # Start full-stack development environment
+make build  # Build backend only
+make test   # Run all tests
 ```
+
+> 注：系统已内置 Go 环境探测，无需配置 PATH。
+>
+> ⚠️ **PHYSICAL RED LINE**: 禁止手动单独启动后端或前端，必须且仅能使用 `make dev` 进行全栈热重启。
 
 ### Update
 

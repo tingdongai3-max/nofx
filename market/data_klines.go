@@ -3,10 +3,13 @@ package market
 import (
 	"context"
 	"fmt"
+	"math"
 	"nofx/logger"
 	"nofx/provider/coinank/coinank_api"
 	"nofx/provider/coinank/coinank_enum"
 	"nofx/provider/hyperliquid"
+	"nofx/store"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -149,25 +152,176 @@ func getKlinesFromHyperliquid(symbol, interval string, limit int) ([]Kline, erro
 	return klines, nil
 }
 
+func sanitizePeriods(periods []int) []int {
+	set := make(map[int]struct{})
+	clean := make([]int, 0, len(periods))
+	for _, period := range periods {
+		if period <= 0 {
+			continue
+		}
+		if _, exists := set[period]; exists {
+			continue
+		}
+		set[period] = struct{}{}
+		clean = append(clean, period)
+	}
+	sort.Ints(clean)
+	return clean
+}
+
+func normalizedIndicatorConfig(config *store.IndicatorConfig) store.IndicatorConfig {
+	if config == nil {
+		defaults := store.GetDefaultStrategyConfig("en").Indicators
+		defaults.EMAPeriods = sanitizePeriods(defaults.EMAPeriods)
+		defaults.RSIPeriods = sanitizePeriods(defaults.RSIPeriods)
+		defaults.ATRPeriods = sanitizePeriods(defaults.ATRPeriods)
+		defaults.BOLLPeriods = sanitizePeriods(defaults.BOLLPeriods)
+		defaults.DonchianPeriods = sanitizePeriods(defaults.DonchianPeriods)
+		return defaults
+	}
+
+	normalized := *config
+	normalized.EMAPeriods = sanitizePeriods(normalized.EMAPeriods)
+	normalized.RSIPeriods = sanitizePeriods(normalized.RSIPeriods)
+	normalized.ATRPeriods = sanitizePeriods(normalized.ATRPeriods)
+	normalized.BOLLPeriods = sanitizePeriods(normalized.BOLLPeriods)
+	normalized.DonchianPeriods = sanitizePeriods(normalized.DonchianPeriods)
+	return normalized
+}
+
+// CalculateRequiredFetchCount returns the total window needed for indicator warmup
+// plus the user-visible prompt window.
+func CalculateRequiredFetchCount(config store.IndicatorConfig, userCount int) int {
+	if userCount <= 0 {
+		userCount = 30
+	}
+
+	maxWarmup := 0
+
+	if config.EnableEMA {
+		for _, period := range config.EMAPeriods {
+			maxWarmup = max(maxWarmup, int(math.Ceil(float64(period)*store.MemoryFactor)))
+		}
+	}
+	if config.EnableRSI {
+		for _, period := range config.RSIPeriods {
+			maxWarmup = max(maxWarmup, int(math.Ceil(float64(period)*store.MemoryFactor)))
+		}
+	}
+	if config.EnableATR {
+		for _, period := range config.ATRPeriods {
+			maxWarmup = max(maxWarmup, int(math.Ceil(float64(period)*store.MemoryFactor)))
+		}
+	}
+	if config.EnableMACD {
+		maxWarmup = max(maxWarmup, int(math.Ceil(26*store.MemoryFactor)))
+	}
+	if config.EnableBOLL {
+		for _, period := range config.BOLLPeriods {
+			maxWarmup = max(maxWarmup, period)
+		}
+	}
+	if config.EnableDonchianBox {
+		for _, period := range config.DonchianPeriods {
+			maxWarmup = max(maxWarmup, period)
+		}
+	}
+
+	if maxWarmup == 0 {
+		return userCount
+	}
+
+	return max(userCount, userCount+maxWarmup)
+}
+
+func buildIndicatorSnapshot(klines []Kline, config store.IndicatorConfig) IndicatorResult {
+	result := IndicatorResult{
+		EMAs:      make(map[int]float64),
+		RSIs:      make(map[int]float64),
+		ATRs:      make(map[int]float64),
+		Bolls:     make(map[int]BollResult),
+		Donchians: make(map[int]DonchianResult),
+	}
+
+	if config.EnableEMA {
+		for _, period := range config.EMAPeriods {
+			result.EMAs[period] = calculateEMA(klines, period)
+		}
+	}
+	if config.EnableMACD {
+		result.MACD = calculateMACD(klines)
+	}
+	if config.EnableRSI {
+		for _, period := range config.RSIPeriods {
+			result.RSIs[period] = calculateRSI(klines, period)
+		}
+	}
+	if config.EnableATR {
+		for _, period := range config.ATRPeriods {
+			result.ATRs[period] = calculateATR(klines, period)
+		}
+	}
+	if config.EnableBOLL {
+		for _, period := range config.BOLLPeriods {
+			upper, middle, lower := calculateBOLL(klines, period, 2.0)
+			result.Bolls[period] = BollResult{
+				Upper:  upper,
+				Middle: middle,
+				Lower:  lower,
+			}
+		}
+	}
+	if config.EnableDonchianBox {
+		for _, period := range config.DonchianPeriods {
+			result.Donchians[period] = calculateDonchian(klines, period)
+		}
+	}
+
+	return result
+}
+
 // calculateTimeframeSeries calculates series data for a single timeframe
-func calculateTimeframeSeries(klines []Kline, timeframe string, count int) *TimeframeSeriesData {
+func calculateTimeframeSeries(klines []Kline, timeframe string, count int, indicatorConfig *store.IndicatorConfig) *TimeframeSeriesData {
 	if count <= 0 {
 		count = 10 // default
 	}
+	config := normalizedIndicatorConfig(indicatorConfig)
 
 	data := &TimeframeSeriesData{
-		Timeframe:   timeframe,
-		Klines:      make([]KlineBar, 0, count),
-		MidPrices:   make([]float64, 0, count),
-		EMA20Values: make([]float64, 0, count),
-		EMA50Values: make([]float64, 0, count),
-		MACDValues:  make([]float64, 0, count),
-		RSI7Values:  make([]float64, 0, count),
-		RSI14Values: make([]float64, 0, count),
-		Volume:      make([]float64, 0, count),
-		BOLLUpper:   make([]float64, 0, count),
-		BOLLMiddle:  make([]float64, 0, count),
-		BOLLLower:   make([]float64, 0, count),
+		Timeframe: timeframe,
+		Klines:    make([]KlineBar, 0, count),
+		MidPrices: make([]float64, 0, count),
+		Volume:    make([]float64, 0, count),
+		Indicators: IndicatorSeries{
+			EMAs:      make(map[int][]float64),
+			RSIs:      make(map[int][]float64),
+			ATRs:      make(map[int]float64),
+			Bolls:     make(map[int]BollSeries),
+			Donchians: make(map[int]DonchianSeries),
+		},
+	}
+	for _, period := range config.EMAPeriods {
+		data.Indicators.EMAs[period] = make([]float64, 0, count)
+	}
+	for _, period := range config.RSIPeriods {
+		data.Indicators.RSIs[period] = make([]float64, 0, count)
+	}
+	for _, period := range config.BOLLPeriods {
+		data.Indicators.Bolls[period] = BollSeries{
+			Upper:  make([]float64, 0, count),
+			Middle: make([]float64, 0, count),
+			Lower:  make([]float64, 0, count),
+		}
+	}
+	for _, period := range config.DonchianPeriods {
+		data.Indicators.Donchians[period] = DonchianSeries{
+			Upper: make([]float64, 0, count),
+			Lower: make([]float64, 0, count),
+			Mid:   make([]float64, 0, count),
+		}
+	}
+	if config.EnableMACD {
+		data.Indicators.MACD = make([]float64, 0, count)
 	}
 
 	// Get latest N data points based on count from config
@@ -191,45 +345,61 @@ func calculateTimeframeSeries(klines []Kline, timeframe string, count int) *Time
 		data.MidPrices = append(data.MidPrices, klines[i].Close)
 		data.Volume = append(data.Volume, klines[i].Volume)
 
-		// Calculate EMA20 for each point
-		if i >= 19 {
-			ema20 := calculateEMA(klines[:i+1], 20)
-			data.EMA20Values = append(data.EMA20Values, ema20)
+		if config.EnableEMA {
+			for _, period := range config.EMAPeriods {
+				if i >= period-1 {
+					value := calculateEMA(klines[:i+1], period)
+					data.Indicators.EMAs[period] = append(data.Indicators.EMAs[period], value)
+				}
+			}
 		}
 
-		// Calculate EMA50 for each point
-		if i >= 49 {
-			ema50 := calculateEMA(klines[:i+1], 50)
-			data.EMA50Values = append(data.EMA50Values, ema50)
-		}
-
-		// Calculate MACD for each point
-		if i >= 25 {
+		if config.EnableMACD && i >= 25 {
 			macd := calculateMACD(klines[:i+1])
-			data.MACDValues = append(data.MACDValues, macd)
+			data.Indicators.MACD = append(data.Indicators.MACD, macd)
 		}
 
-		// Calculate RSI for each point
-		if i >= 7 {
-			rsi7 := calculateRSI(klines[:i+1], 7)
-			data.RSI7Values = append(data.RSI7Values, rsi7)
-		}
-		if i >= 14 {
-			rsi14 := calculateRSI(klines[:i+1], 14)
-			data.RSI14Values = append(data.RSI14Values, rsi14)
+		if config.EnableRSI {
+			for _, period := range config.RSIPeriods {
+				if i >= period {
+					value := calculateRSI(klines[:i+1], period)
+					data.Indicators.RSIs[period] = append(data.Indicators.RSIs[period], value)
+				}
+			}
 		}
 
-		// Calculate Bollinger Bands (period 20, std dev multiplier 2)
-		if i >= 19 {
-			upper, middle, lower := calculateBOLL(klines[:i+1], 20, 2.0)
-			data.BOLLUpper = append(data.BOLLUpper, upper)
-			data.BOLLMiddle = append(data.BOLLMiddle, middle)
-			data.BOLLLower = append(data.BOLLLower, lower)
+		if config.EnableBOLL {
+			for _, period := range config.BOLLPeriods {
+				if i >= period-1 {
+					upper, middle, lower := calculateBOLL(klines[:i+1], period, 2.0)
+					series := data.Indicators.Bolls[period]
+					series.Upper = append(series.Upper, upper)
+					series.Middle = append(series.Middle, middle)
+					series.Lower = append(series.Lower, lower)
+					data.Indicators.Bolls[period] = series
+				}
+			}
+		}
+
+		if config.EnableDonchianBox {
+			for _, period := range config.DonchianPeriods {
+				if i >= period-1 {
+					box := calculateDonchian(klines[:i+1], period)
+					series := data.Indicators.Donchians[period]
+					series.Upper = append(series.Upper, box.Upper)
+					series.Lower = append(series.Lower, box.Lower)
+					series.Mid = append(series.Mid, box.Mid)
+					data.Indicators.Donchians[period] = series
+				}
+			}
 		}
 	}
 
-	// Calculate ATR14
-	data.ATR14 = calculateATR(klines, 14)
+	if config.EnableATR {
+		for _, period := range config.ATRPeriods {
+			data.Indicators.ATRs[period] = calculateATR(klines, period)
+		}
+	}
 
 	return data
 }
@@ -299,102 +469,6 @@ func parseTimeframeToMinutes(tf string) int {
 	default:
 		return 0
 	}
-}
-
-// calculateIntradaySeries calculates intraday series data
-func calculateIntradaySeries(klines []Kline) *IntradayData {
-	data := &IntradayData{
-		MidPrices:   make([]float64, 0, 10),
-		EMA20Values: make([]float64, 0, 10),
-		MACDValues:  make([]float64, 0, 10),
-		RSI7Values:  make([]float64, 0, 10),
-		RSI14Values: make([]float64, 0, 10),
-		Volume:      make([]float64, 0, 10),
-	}
-
-	// Get latest 10 data points
-	start := len(klines) - 10
-	if start < 0 {
-		start = 0
-	}
-
-	for i := start; i < len(klines); i++ {
-		data.MidPrices = append(data.MidPrices, klines[i].Close)
-		data.Volume = append(data.Volume, klines[i].Volume)
-
-		// Calculate EMA20 for each point
-		if i >= 19 {
-			ema20 := calculateEMA(klines[:i+1], 20)
-			data.EMA20Values = append(data.EMA20Values, ema20)
-		}
-
-		// Calculate MACD for each point
-		if i >= 25 {
-			macd := calculateMACD(klines[:i+1])
-			data.MACDValues = append(data.MACDValues, macd)
-		}
-
-		// Calculate RSI for each point
-		if i >= 7 {
-			rsi7 := calculateRSI(klines[:i+1], 7)
-			data.RSI7Values = append(data.RSI7Values, rsi7)
-		}
-		if i >= 14 {
-			rsi14 := calculateRSI(klines[:i+1], 14)
-			data.RSI14Values = append(data.RSI14Values, rsi14)
-		}
-	}
-
-	// Calculate 3m ATR14
-	data.ATR14 = calculateATR(klines, 14)
-
-	return data
-}
-
-// calculateLongerTermData calculates longer-term data
-func calculateLongerTermData(klines []Kline) *LongerTermData {
-	data := &LongerTermData{
-		MACDValues:  make([]float64, 0, 10),
-		RSI14Values: make([]float64, 0, 10),
-	}
-
-	// Calculate EMA
-	data.EMA20 = calculateEMA(klines, 20)
-	data.EMA50 = calculateEMA(klines, 50)
-
-	// Calculate ATR
-	data.ATR3 = calculateATR(klines, 3)
-	data.ATR14 = calculateATR(klines, 14)
-
-	// Calculate volume
-	if len(klines) > 0 {
-		data.CurrentVolume = klines[len(klines)-1].Volume
-		// Calculate average volume
-		sum := 0.0
-		for _, k := range klines {
-			sum += k.Volume
-		}
-		data.AverageVolume = sum / float64(len(klines))
-	}
-
-	// Calculate MACD and RSI series
-	start := len(klines) - 10
-	if start < 0 {
-		start = 0
-	}
-
-	for i := start; i < len(klines); i++ {
-		if i >= 25 {
-			macd := calculateMACD(klines[:i+1])
-			data.MACDValues = append(data.MACDValues, macd)
-		}
-		if i >= 14 {
-			rsi14 := calculateRSI(klines[:i+1], 14)
-			data.RSI14Values = append(data.RSI14Values, rsi14)
-		}
-	}
-
-	return data
 }
 
 // GetBoxData fetches 1h klines and calculates box data for a symbol
