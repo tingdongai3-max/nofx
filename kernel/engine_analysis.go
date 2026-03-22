@@ -9,6 +9,7 @@ import (
 	"nofx/store"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -171,7 +172,7 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 
 	// 1. First fetch data for position coins (must fetch)
 	for _, pos := range ctx.Positions {
-		data, err := market.GetWithTimeframes(pos.Symbol, timeframes, primaryTimeframe, klineCount, &config.Indicators)
+		data, err := market.GetWithTimeframesForScope(ctx.TraderID, pos.Symbol, timeframes, primaryTimeframe, klineCount, &config.Indicators)
 		if err != nil {
 			logger.Infof("⚠️  Failed to fetch market data for position %s: %v", pos.Symbol, err)
 			continue
@@ -188,33 +189,49 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 
 	const minOIThresholdMillions = 15.0 // 15M USD minimum open interest value
 
+	const marketFetchConcurrency = 4
+	sem := make(chan struct{}, marketFetchConcurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
 	for _, coin := range ctx.CandidateCoins {
 		if _, exists := ctx.MarketDataMap[coin.Symbol]; exists {
 			continue
 		}
 
-		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, klineCount, &config.Indicators)
-		if err != nil {
-			logger.Infof("⚠️  Failed to fetch market data for %s: %v", coin.Symbol, err)
-			continue
-		}
-		TrimMarketDataForPrompt(data, klineCount)
+		coin := coin
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-		// Liquidity filter (skip for xyz dex assets - they don't have OI data from Binance)
-		isExistingPosition := positionSymbols[coin.Symbol]
-		isXyzAsset := market.IsXyzDexAsset(coin.Symbol)
-		if !isExistingPosition && !isXyzAsset && data.OpenInterest != nil && data.CurrentPrice > 0 {
-			oiValue := data.OpenInterest.Latest * data.CurrentPrice
-			oiValueInMillions := oiValue / 1_000_000
-			if oiValueInMillions < minOIThresholdMillions {
-				logger.Infof("⚠️  %s OI value too low (%.2fM USD < %.1fM), skipping coin",
-					coin.Symbol, oiValueInMillions, minOIThresholdMillions)
-				continue
+			data, err := market.GetWithTimeframesForScope(ctx.TraderID, coin.Symbol, timeframes, primaryTimeframe, klineCount, &config.Indicators)
+			if err != nil {
+				logger.Infof("⚠️  Failed to fetch market data for %s: %v", coin.Symbol, err)
+				return
 			}
-		}
+			TrimMarketDataForPrompt(data, klineCount)
 
-		ctx.MarketDataMap[coin.Symbol] = data
+			// Liquidity filter (skip for xyz dex assets - they don't have OI data from Binance)
+			isExistingPosition := positionSymbols[coin.Symbol]
+			isXyzAsset := market.IsXyzDexAsset(coin.Symbol)
+			if !isExistingPosition && !isXyzAsset && data.OpenInterest != nil && data.CurrentPrice > 0 {
+				oiValue := data.OpenInterest.Latest * data.CurrentPrice
+				oiValueInMillions := oiValue / 1_000_000
+				if oiValueInMillions < minOIThresholdMillions {
+					logger.Infof("⚠️  %s OI value too low (%.2fM USD < %.1fM), skipping coin",
+						coin.Symbol, oiValueInMillions, minOIThresholdMillions)
+					return
+				}
+			}
+
+			mu.Lock()
+			ctx.MarketDataMap[coin.Symbol] = data
+			mu.Unlock()
+		}()
 	}
+	wg.Wait()
 
 	logger.Infof("📊 Successfully fetched multi-timeframe market data for %d coins", len(ctx.MarketDataMap))
 	return nil

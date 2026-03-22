@@ -24,6 +24,7 @@ type Store struct {
 	trader         *TraderStore
 	decision       *DecisionStore
 	position       *PositionStore
+	shadow         *ShadowSnapshotStore
 	strategy       *StrategyStore
 	equity         *EquityStore
 	order          *OrderStore
@@ -146,6 +147,9 @@ func (s *Store) initTables() error {
 	if err := s.Position().InitTables(); err != nil {
 		return fmt.Errorf("failed to initialize position tables: %w", err)
 	}
+	if err := s.Shadow().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize shadow snapshot tables: %w", err)
+	}
 	if err := s.Strategy().initTables(); err != nil {
 		return fmt.Errorf("failed to initialize strategy tables: %w", err)
 	}
@@ -245,6 +249,16 @@ func (s *Store) Position() *PositionStore {
 		s.position = NewPositionStore(s.gdb)
 	}
 	return s.position
+}
+
+// Shadow gets shadow snapshot storage
+func (s *Store) Shadow() *ShadowSnapshotStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.shadow == nil {
+		s.shadow = NewShadowSnapshotStore(s.gdb)
+	}
+	return s.shadow
 }
 
 // Strategy gets strategy storage

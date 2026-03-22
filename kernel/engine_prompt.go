@@ -514,6 +514,9 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 	var sb strings.Builder
 	indicators := e.config.Indicators
 
+	sb.WriteString(e.formatTechnicalContext(data))
+	sb.WriteString("\n")
+
 	// Clearly label the coin symbol
 	sb.WriteString(fmt.Sprintf("=== %s Market Data ===\n\n", data.Symbol))
 	sb.WriteString(fmt.Sprintf("current_price = %.4f", data.CurrentPrice))
@@ -523,12 +526,48 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 	}
 	sb.WriteString("\n\n")
 
-	if indicators.EnableOI || indicators.EnableFundingRate {
+	if indicators.EnableOI || indicators.EnableFundingRate || data.Orderbook != nil || data.VolatilityUtilization > 0 || data.HeatScore != nil {
 		sb.WriteString(fmt.Sprintf("Additional data for %s:\n\n", data.Symbol))
 
 		if indicators.EnableOI && data.OpenInterest != nil {
 			sb.WriteString(fmt.Sprintf("Open Interest: Latest: %.2f Average: %.2f\n\n",
 				data.OpenInterest.Latest, data.OpenInterest.Average))
+		}
+
+		if data.Orderbook != nil && (data.Orderbook.BidTotal > 0 || data.Orderbook.AskTotal > 0) {
+			direction := "Buy depth is roughly balanced with sell depth"
+			switch {
+			case data.Orderbook.Imbalance > 0:
+				direction = "Buy depth exceeds sell depth"
+			case data.Orderbook.Imbalance < 0:
+				direction = "Sell depth exceeds buy depth"
+			}
+			sb.WriteString(fmt.Sprintf("Orderbook Imbalance (Top 100 levels): %+.1f%% (%s)\n\n",
+				data.Orderbook.Imbalance*100, direction))
+		}
+
+		if data.DexScreener != nil && data.DexScreener.VolumeH1 > 0 {
+			sb.WriteString(fmt.Sprintf("DEX-CEX Heat Ratio (1h): %.2f (DEX volume %.2f vs CEX volume %.2f), DEX buy ratio: %.1f%%\n\n",
+				data.DexScreener.OnchainToCEXRatio,
+				data.DexScreener.VolumeH1,
+				data.DexScreener.CEXVolumeH1,
+				data.DexScreener.BuyRatio*100))
+		}
+
+		if data.GeckoSentiment != nil && (data.GeckoSentiment.PublicInterestScore > 0 || data.GeckoSentiment.SentimentVotesUpPercentage > 0) {
+			sb.WriteString(fmt.Sprintf("CoinGecko Public Sentiment: interest %.2f | up-vote %.1f%%\n\n",
+				data.GeckoSentiment.PublicInterestScore,
+				data.GeckoSentiment.SentimentVotesUpPercentage))
+		}
+
+		if data.VolatilityUtilization > 0 {
+			sb.WriteString(fmt.Sprintf("Volatility Utilization (14-period): %.2f (%s)\n\n",
+				data.VolatilityUtilization, describeVolatilityUtilization(data.VolatilityUtilization)))
+		}
+
+		if data.HeatScore != nil {
+			sb.WriteString(fmt.Sprintf("Adaptive Heat Score (24h rolling window): %.1f / 100 (Trading: %.1f, Quant: %.1f)\n\n",
+				data.HeatScore.CompositeScore, data.HeatScore.TradingScore, data.HeatScore.QuantScore))
 		}
 
 		if indicators.EnableFundingRate {
@@ -547,6 +586,86 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 	}
 
 	return sb.String()
+}
+
+func (e *StrategyEngine) formatTechnicalContext(data *market.Data) string {
+	if data == nil {
+		return ""
+	}
+
+	var sb strings.Builder
+	primaryTimeframe := data.PrimaryTimeframe
+	if primaryTimeframe == "" {
+		primaryTimeframe = e.config.Indicators.Klines.PrimaryTimeframe
+	}
+	if primaryTimeframe == "" {
+		primaryTimeframe = "Primary"
+	}
+
+	primaryData := data.TimeframeData[primaryTimeframe]
+	sb.WriteString(fmt.Sprintf("=== Technical Summary (%s - Primary) ===\n", strings.ToUpper(primaryTimeframe)))
+	sb.WriteString(e.formatTechnicalSnapshot(primaryTimeframe, primaryData, data.CurrentPrice, true))
+	sb.WriteString("\n")
+
+	for _, tf := range sortedNonPrimaryTimeframes(data.TimeframeData, primaryTimeframe) {
+		sb.WriteString(fmt.Sprintf("=== Trend Context (%s) ===\n", strings.ToUpper(tf)))
+		sb.WriteString(e.formatTechnicalSnapshot(tf, data.TimeframeData[tf], 0, false))
+		sb.WriteString("\n")
+	}
+
+	return sb.String()
+}
+
+func (e *StrategyEngine) formatTechnicalSnapshot(timeframe string, tfData *market.TimeframeSeriesData, currentPrice float64, isPrimary bool) string {
+	if tfData == nil {
+		return "Data unavailable\n"
+	}
+
+	price := currentPrice
+	if price <= 0 {
+		price = tfData.LatestClose()
+	}
+
+	parts := make([]string, 0, 6)
+	if price > 0 {
+		parts = append(parts, fmt.Sprintf("Price: %.4f", price))
+	}
+
+	if e.config.Indicators.EnableRSI && len(e.config.Indicators.RSIPeriods) > 0 {
+		period := e.config.Indicators.RSIPeriods[0]
+		if rsi := tfData.LatestRSI(period); rsi > 0 {
+			parts = append(parts, fmt.Sprintf("RSI%d: %.1f", period, rsi))
+		}
+	}
+
+	if e.config.Indicators.EnableMACD {
+		parts = append(parts, fmt.Sprintf("MACD: %s", describeMACDContext(tfData.LatestMACD())))
+	}
+
+	if e.config.Indicators.EnableEMA {
+		parts = append(parts, fmt.Sprintf("EMA Stack: %s", describeEMAStackContext(tfData, e.config.Indicators.EMAPeriods)))
+	}
+
+	if e.config.Indicators.EnableDonchianBox && len(e.config.Indicators.DonchianPeriods) > 0 {
+		period := e.config.Indicators.DonchianPeriods[0]
+		box := tfData.LatestDonchian(period)
+		if box.Upper > 0 || box.Lower > 0 {
+			parts = append(parts, fmt.Sprintf("Donchian P%d: %s", period, describeDonchianState(price, box)))
+		}
+	}
+
+	if isPrimary && e.config.Indicators.EnableATR && len(e.config.Indicators.ATRPeriods) > 0 {
+		atrPeriod := e.config.Indicators.ATRPeriods[0]
+		if atr := tfData.LatestATR(atrPeriod); atr > 0 && dataSupportsVolUtil(timeframe, e.config.Indicators.Klines.PrimaryTimeframe) {
+			parts = append(parts, fmt.Sprintf("VolUtil: %.0f%%", estimateVolUtilPercent(tfData, atr)))
+		}
+	}
+
+	if len(parts) == 0 {
+		return "No indicators enabled\n"
+	}
+
+	return strings.Join(parts, " | ") + "\n"
 }
 
 func (e *StrategyEngine) formatTimeframeSeriesData(sb *strings.Builder, data *market.TimeframeSeriesData, indicators store.IndicatorConfig) {
@@ -656,6 +775,140 @@ func formatIndicatorSummary(indicators store.IndicatorConfig, currentPrice float
 		}
 	}
 	return lines
+}
+
+func describeVolatilityUtilization(vu float64) string {
+	switch {
+	case vu > 0.8:
+		return "High efficiency movement / Strong trend"
+	case vu >= 0.4:
+		return "Normal volatility usage / Structured move"
+	default:
+		return "Low efficiency movement / Frictional move"
+	}
+}
+
+func describeMACDContext(macd float64) string {
+	switch {
+	case macd > 0:
+		return "Bullish"
+	case macd < 0:
+		return "Bearish"
+	default:
+		return "Neutral"
+	}
+}
+
+func describeEMAStackContext(tfData *market.TimeframeSeriesData, periods []int) string {
+	values := make(map[int]float64)
+	for _, period := range periods {
+		value := tfData.LatestEMA(period)
+		if value > 0 {
+			values[period] = value
+		}
+	}
+
+	switch buildEMASignalState(values) {
+	case "bullish_stack":
+		return "Bullish"
+	case "bearish_stack":
+		return "Bearish"
+	case "single_ema":
+		return "Single EMA"
+	default:
+		return "Mixed"
+	}
+}
+
+func buildEMASignalState(values map[int]float64) string {
+	periods := sortedKeysFloatMap(values)
+	if len(periods) == 0 {
+		return "unavailable"
+	}
+	if len(periods) < 2 {
+		return "single_ema"
+	}
+
+	bullish := true
+	bearish := true
+	for i := 1; i < len(periods); i++ {
+		prev := values[periods[i-1]]
+		curr := values[periods[i]]
+		if prev <= curr {
+			bullish = false
+		}
+		if prev >= curr {
+			bearish = false
+		}
+	}
+
+	switch {
+	case bullish:
+		return "bullish_stack"
+	case bearish:
+		return "bearish_stack"
+	default:
+		return "mixed"
+	}
+}
+
+func estimateVolUtilPercent(tfData *market.TimeframeSeriesData, atr float64) float64 {
+	if tfData == nil || len(tfData.Klines) <= market.VolUtilLookback || atr <= 0 {
+		return 0
+	}
+
+	latest := tfData.Klines[len(tfData.Klines)-1].Close
+	base := tfData.Klines[len(tfData.Klines)-1-market.VolUtilLookback].Close
+	delta := latest - base
+	if delta < 0 {
+		delta = -delta
+	}
+
+	return (delta / (atr * market.VolUtilMultiplier)) * 100
+}
+
+func dataSupportsVolUtil(timeframe, primaryTimeframe string) bool {
+	if primaryTimeframe == "" {
+		return true
+	}
+	return timeframe == primaryTimeframe
+}
+
+func sortedNonPrimaryTimeframes(timeframeData map[string]*market.TimeframeSeriesData, primary string) []string {
+	keys := make([]string, 0, len(timeframeData))
+	for key := range timeframeData {
+		if key == primary {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return timeframeSortOrder(keys[i]) < timeframeSortOrder(keys[j])
+	})
+	return keys
+}
+
+func timeframeSortOrder(tf string) int {
+	order := map[string]int{
+		"1m":  1,
+		"3m":  2,
+		"5m":  3,
+		"15m": 4,
+		"30m": 5,
+		"1h":  6,
+		"2h":  7,
+		"4h":  8,
+		"6h":  9,
+		"8h":  10,
+		"12h": 11,
+		"1d":  12,
+		"3d":  13,
+		"1w":  14,
+	}
+	if rank, ok := order[tf]; ok {
+		return rank
+	}
+	return 999
 }
 
 func sortedKeysFloatMap[T ~float64](m map[int]T) []int {

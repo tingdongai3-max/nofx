@@ -5,13 +5,14 @@ import (
 	"nofx/auth"
 	"nofx/config"
 	"nofx/crypto"
-	"nofx/telemetry"
 	"nofx/logger"
 	"nofx/manager"
+	"nofx/market"
 	_ "nofx/mcp/payment"
 	_ "nofx/mcp/provider"
 	"nofx/store"
 	"nofx/telegram"
+	"nofx/telemetry"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -79,6 +80,7 @@ func main() {
 		logger.Fatalf("❌ Failed to initialize database: %v", err)
 	}
 	defer st.Close()
+	market.SetAdaptiveWeightStore(st)
 
 	// Initialize installation ID for experience improvement (anonymous statistics)
 	initInstallationID(st)

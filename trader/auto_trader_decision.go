@@ -3,11 +3,11 @@ package trader
 import (
 	"fmt"
 	"math"
-	"nofx/telemetry"
 	"nofx/kernel"
 	"nofx/logger"
 	"nofx/market"
 	"nofx/store"
+	"nofx/telemetry"
 	"time"
 )
 
@@ -91,6 +91,20 @@ func (at *AutoTrader) GetStatus() map[string]interface{} {
 	}
 
 	return result
+}
+
+func (at *AutoTrader) GetCandidateSnapshot() CandidateSnapshot {
+	at.candidateSnapshotMu.RLock()
+	defer at.candidateSnapshotMu.RUnlock()
+
+	snapshot := CandidateSnapshot{
+		TraderID:   at.candidateSnapshot.TraderID,
+		TraderName: at.candidateSnapshot.TraderName,
+		UpdatedAt:  at.candidateSnapshot.UpdatedAt,
+		Candidates: make([]CandidateMarketSnapshot, len(at.candidateSnapshot.Candidates)),
+	}
+	copy(snapshot.Candidates, at.candidateSnapshot.Candidates)
+	return snapshot
 }
 
 // GetAccountInfo gets account information (for API)
@@ -221,7 +235,7 @@ func (at *AutoTrader) GetPositions() ([]map[string]interface{}, error) {
 		// Calculate P&L percentage (based on margin)
 		pnlPct := calculatePnLPercentage(unrealizedPnl, marginUsed)
 
-		result = append(result, map[string]interface{}{
+		payload := map[string]interface{}{
 			"symbol":             symbol,
 			"side":               side,
 			"entry_price":        entryPrice,
@@ -232,7 +246,9 @@ func (at *AutoTrader) GetPositions() ([]map[string]interface{}, error) {
 			"unrealized_pnl_pct": pnlPct,
 			"liquidation_price":  liquidationPrice,
 			"margin_used":        marginUsed,
-		})
+		}
+		at.mergePositionTelemetry(symbol, side, payload)
+		result = append(result, payload)
 	}
 
 	return result, nil

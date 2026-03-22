@@ -6,12 +6,25 @@ import (
 	"io"
 	"math"
 	"nofx/logger"
+	"nofx/provider/nofxos"
 	"nofx/store"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+const defaultOIHistorySamples = 30
+
+type supplementalFetchResult struct {
+	openInterest *OIData
+	fundingRate  float64
+	orderbook    *OrderbookData
+	dexScreener  *DexScreenerData
+	geckoSocial  *GeckoSentimentData
+	quantData    *nofxos.QuantData
+	cexVolumeH1  float64
+}
 
 // FundingRateCache is the funding rate cache structure
 // Binance Funding Rate only updates every 8 hours, using 1-hour cache can significantly reduce API calls
@@ -33,11 +46,17 @@ func Get(symbol string) (*Data, error) {
 
 // GetWithExchange retrieves market data for the specified token using exchange-specific data
 func GetWithExchange(symbol, exchange string, indicatorConfig *store.IndicatorConfig) (*Data, error) {
+	return GetWithExchangeForScope("", symbol, exchange, indicatorConfig)
+}
+
+// GetWithExchangeForScope retrieves market data using adaptive weights from the provided scope.
+func GetWithExchangeForScope(weightScope, symbol, exchange string, indicatorConfig *store.IndicatorConfig) (*Data, error) {
 	var klines3m, klines4h []Kline
 	var err error
 	config := normalizedIndicatorConfig(indicatorConfig)
 	// Normalize symbol
 	symbol = Normalize(symbol)
+	EnsureHeatHistoryPreloaded(symbol, "5m")
 
 	// Check if this is an xyz dex asset (use Hyperliquid API)
 	isXyzAsset := IsXyzDexAsset(symbol)
@@ -110,31 +129,34 @@ func GetWithExchange(symbol, exchange string, indicatorConfig *store.IndicatorCo
 		}
 	}
 
-	// Get OI data
-	oiData, err := getOpenInterestData(symbol)
-	if err != nil {
-		// OI failure doesn't affect overall result, use default values
-		oiData = &OIData{Latest: 0, Average: 0}
-	}
-
-	// Get Funding Rate
-	fundingRate, _ := getFundingRate(symbol)
+	currentATR14 := calculateATR(klines3m, VolUtilLookback)
+	volUtilization := CalculateVolatilityUtilization(symbol, klines3m, currentATR14)
+	supplemental := fetchSupplementalMarketData(symbol, "5m", klines3m, config)
 
 	timeframeData := map[string]*TimeframeSeriesData{
 		"3m": calculateTimeframeSeries(klines3m, "3m", 30, &config),
 		"4h": calculateTimeframeSeries(klines4h, "4h", 30, &config),
 	}
 
-	return &Data{
-		Symbol:        symbol,
-		CurrentPrice:  currentPrice,
-		PriceChange1h: priceChange1h,
-		PriceChange4h: priceChange4h,
-		Indicators:    currentIndicators,
-		OpenInterest:  oiData,
-		FundingRate:   fundingRate,
-		TimeframeData: timeframeData,
-	}, nil
+	data := &Data{
+		Symbol:                symbol,
+		Sector:                DetermineSector(symbol, supplemental.cexVolumeH1, supplemental.geckoSocial),
+		CurrentPrice:          currentPrice,
+		PriceChange1h:         priceChange1h,
+		PriceChange4h:         priceChange4h,
+		Indicators:            currentIndicators,
+		OpenInterest:          supplemental.openInterest,
+		Orderbook:             supplemental.orderbook,
+		DexScreener:           supplemental.dexScreener,
+		GeckoSentiment:        supplemental.geckoSocial,
+		VolatilityUtilization: volUtilization,
+		PrimaryTimeframe:      "3m",
+		FundingRate:           supplemental.fundingRate,
+		TimeframeData:         timeframeData,
+	}
+	data.HeatScore = buildHeatScore(weightScope, symbol, data, supplemental.quantData, time.Now().UTC())
+
+	return data, nil
 }
 
 // GetWithTimeframes retrieves market data for specified multiple timeframes
@@ -142,6 +164,11 @@ func GetWithExchange(symbol, exchange string, indicatorConfig *store.IndicatorCo
 // primaryTimeframe: primary timeframe (used for calculating current indicators), defaults to timeframes[0]
 // count: number of K-lines for each timeframe
 func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe string, count int, indicatorConfig *store.IndicatorConfig) (*Data, error) {
+	return GetWithTimeframesForScope("", symbol, timeframes, primaryTimeframe, count, indicatorConfig)
+}
+
+// GetWithTimeframesForScope retrieves market data using adaptive weights from the provided scope.
+func GetWithTimeframesForScope(weightScope, symbol string, timeframes []string, primaryTimeframe string, count int, indicatorConfig *store.IndicatorConfig) (*Data, error) {
 	symbol = Normalize(symbol)
 	config := normalizedIndicatorConfig(indicatorConfig)
 	fetchCount := CalculateRequiredFetchCount(config, count)
@@ -154,6 +181,7 @@ func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe stri
 	if primaryTimeframe == "" {
 		primaryTimeframe = timeframes[0]
 	}
+	EnsureHeatHistoryPreloaded(symbol, primaryTimeframe)
 
 	// Ensure primary timeframe is in the list
 	hasPrimary := false
@@ -231,29 +259,189 @@ func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe stri
 	priceChange1h := calculatePriceChangeByBars(primaryKlines, primaryTimeframe, 60)  // 1 hour
 	priceChange4h := calculatePriceChangeByBars(primaryKlines, primaryTimeframe, 240) // 4 hours
 
-	// Get OI data
-	oiData, err := getOpenInterestData(symbol)
-	if err != nil {
-		oiData = &OIData{Latest: 0, Average: 0}
+	currentATR14 := calculateATR(primaryKlines, VolUtilLookback)
+	volUtilization := CalculateVolatilityUtilization(symbol, primaryKlines, currentATR14)
+	supplemental := fetchSupplementalMarketData(symbol, primaryTimeframe, primaryKlines, config)
+
+	data := &Data{
+		Symbol:                symbol,
+		Sector:                DetermineSector(symbol, supplemental.cexVolumeH1, supplemental.geckoSocial),
+		CurrentPrice:          currentPrice,
+		PriceChange1h:         priceChange1h,
+		PriceChange4h:         priceChange4h,
+		Indicators:            currentIndicators,
+		OpenInterest:          supplemental.openInterest,
+		Orderbook:             supplemental.orderbook,
+		DexScreener:           supplemental.dexScreener,
+		GeckoSentiment:        supplemental.geckoSocial,
+		VolatilityUtilization: volUtilization,
+		PrimaryTimeframe:      primaryTimeframe,
+		FundingRate:           supplemental.fundingRate,
+		TimeframeData:         timeframeData,
 	}
+	data.HeatScore = buildHeatScore(weightScope, symbol, data, supplemental.quantData, time.Now().UTC())
 
-	// Get Funding Rate
-	fundingRate, _ := getFundingRate(symbol)
-
-	return &Data{
-		Symbol:        symbol,
-		CurrentPrice:  currentPrice,
-		PriceChange1h: priceChange1h,
-		PriceChange4h: priceChange4h,
-		Indicators:    currentIndicators,
-		OpenInterest:  oiData,
-		FundingRate:   fundingRate,
-		TimeframeData: timeframeData,
-	}, nil
+	return data, nil
 }
 
-// getOpenInterestData retrieves OI data
-func getOpenInterestData(symbol string) (*OIData, error) {
+func fetchQuantDataForHeat(symbol string, config store.IndicatorConfig) *nofxos.QuantData {
+	apiKey := config.NofxOSAPIKey
+	if apiKey == "" {
+		apiKey = nofxos.DefaultAuthKey
+	}
+
+	client := nofxos.NewClient(nofxos.DefaultBaseURL, apiKey)
+	quantData, err := client.GetCoinData(symbol, "netflow,oi,price")
+	if err != nil {
+		logger.Infof("⚠️ Heat quant fetch failed for %s: %v", symbol, err)
+		return nil
+	}
+
+	return quantData
+}
+
+func fetchSupplementalMarketData(symbol, primaryTimeframe string, primaryKlines []Kline, config store.IndicatorConfig) supplementalFetchResult {
+	result := supplementalFetchResult{
+		openInterest: &OIData{Latest: 0, Average: 0},
+		orderbook:    &OrderbookData{},
+	}
+
+	cexVolumeH1 := calculateCEXVolumeH1(primaryKlines, primaryTimeframe)
+	result.cexVolumeH1 = cexVolumeH1
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(6)
+
+	go func() {
+		defer wg.Done()
+		oiData, err := getOpenInterestData(symbol, primaryTimeframe, defaultOIHistorySamples)
+		if err == nil && oiData != nil {
+			mu.Lock()
+			result.openInterest = oiData
+			mu.Unlock()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		fundingRate, _ := getFundingRate(symbol)
+		mu.Lock()
+		result.fundingRate = fundingRate
+		mu.Unlock()
+	}()
+
+	go func() {
+		defer wg.Done()
+		orderbook, err := fetchOrderbookImbalance(symbol)
+		if err == nil && orderbook != nil {
+			mu.Lock()
+			result.orderbook = orderbook
+			mu.Unlock()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		currentPrice := 0.0
+		if len(primaryKlines) > 0 {
+			currentPrice = primaryKlines[len(primaryKlines)-1].Close
+		}
+		dexData, err := fetchDexScreenerData(symbol, currentPrice, cexVolumeH1)
+		if err == nil && dexData != nil {
+			mu.Lock()
+			result.dexScreener = dexData
+			mu.Unlock()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		geckoData, err := fetchGeckoSentimentForSymbol(symbol)
+		if err == nil && geckoData != nil {
+			mu.Lock()
+			result.geckoSocial = geckoData
+			mu.Unlock()
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		quantData := fetchQuantDataForHeat(symbol, config)
+		mu.Lock()
+		result.quantData = quantData
+		mu.Unlock()
+	}()
+
+	wg.Wait()
+	return result
+}
+
+func calculateCEXVolumeH1(klines []Kline, timeframe string) float64 {
+	if len(klines) == 0 {
+		return 0
+	}
+
+	minutes := timeframeToMinutes(timeframe)
+	if minutes <= 0 {
+		return 0
+	}
+
+	barsNeeded := int(math.Ceil(60.0 / float64(minutes)))
+	if barsNeeded < 1 {
+		barsNeeded = 1
+	}
+	if barsNeeded > len(klines) {
+		barsNeeded = len(klines)
+	}
+
+	total := 0.0
+	start := len(klines) - barsNeeded
+	for _, kline := range klines[start:] {
+		if kline.QuoteVolume > 0 {
+			total += kline.QuoteVolume
+			continue
+		}
+		if kline.Close > 0 && kline.Volume > 0 {
+			total += kline.Close * kline.Volume
+		}
+	}
+	return total
+}
+
+func timeframeToMinutes(timeframe string) int {
+	switch timeframe {
+	case "1m":
+		return 1
+	case "3m":
+		return 3
+	case "5m":
+		return 5
+	case "15m":
+		return 15
+	case "30m":
+		return 30
+	case "1h":
+		return 60
+	case "2h":
+		return 120
+	case "4h":
+		return 240
+	case "6h":
+		return 360
+	case "8h":
+		return 480
+	case "12h":
+		return 720
+	case "1d":
+		return 1440
+	default:
+		return 0
+	}
+}
+
+// getOpenInterestData retrieves live OI and computes a true arithmetic average
+// over recent historical samples from Binance openInterestHist.
+func getOpenInterestData(symbol, timeframe string, samples int) (*OIData, error) {
 	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/openInterest?symbol=%s", symbol)
 
 	apiClient := NewAPIClient()
@@ -280,9 +468,176 @@ func getOpenInterestData(symbol string) (*OIData, error) {
 
 	oi, _ := strconv.ParseFloat(result.OpenInterest, 64)
 
+	period := normalizeOIPeriod(timeframe)
+	average, sampleCount, err := fetchOpenInterestHistory(symbol, period, samples)
+	if err != nil {
+		return nil, err
+	}
+
 	return &OIData{
-		Latest:  oi,
-		Average: oi * 0.999, // Approximate average
+		Latest:      oi,
+		Average:     average,
+		SampleCount: sampleCount,
+		Period:      period,
+	}, nil
+}
+
+func normalizeOIPeriod(timeframe string) string {
+	switch timeframe {
+	case "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d":
+		return timeframe
+	case "1m", "3m":
+		return "5m"
+	case "8h":
+		return "4h"
+	case "3d", "1w":
+		return "1d"
+	default:
+		return "5m"
+	}
+}
+
+func fetchOpenInterestHistory(symbol, period string, samples int) (float64, int, error) {
+	if samples <= 0 {
+		samples = defaultOIHistorySamples
+	}
+
+	url := fmt.Sprintf("https://fapi.binance.com/futures/data/openInterestHist?symbol=%s&period=%s&limit=%d", symbol, period, samples)
+	apiClient := NewAPIClient()
+	resp, err := apiClient.client.Get(url)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	var result []struct {
+		SumOpenInterest string `json:"sumOpenInterest"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, 0, err
+	}
+	if len(result) == 0 {
+		return 0, 0, fmt.Errorf("open interest history is empty for %s %s", symbol, period)
+	}
+
+	total := 0.0
+	used := 0
+	for _, entry := range result {
+		value, err := strconv.ParseFloat(entry.SumOpenInterest, 64)
+		if err != nil {
+			continue
+		}
+		total += value
+		used++
+	}
+	if used == 0 {
+		return 0, 0, fmt.Errorf("open interest history parse failed for %s %s", symbol, period)
+	}
+
+	return total / float64(used), used, nil
+}
+
+func fetchOpenInterestHistorySeries(symbol, period string, samples int) ([]float64, error) {
+	if samples <= 0 {
+		samples = defaultOIHistorySamples
+	}
+
+	url := fmt.Sprintf("https://fapi.binance.com/futures/data/openInterestHist?symbol=%s&period=%s&limit=%d", symbol, period, samples)
+	apiClient := NewAPIClient()
+	resp, err := apiClient.client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []struct {
+		SumOpenInterest string `json:"sumOpenInterest"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("open interest history is empty for %s %s", symbol, period)
+	}
+
+	series := make([]float64, 0, len(result))
+	for _, entry := range result {
+		value, err := strconv.ParseFloat(entry.SumOpenInterest, 64)
+		if err != nil {
+			continue
+		}
+		series = append(series, value)
+	}
+	if len(series) == 0 {
+		return nil, fmt.Errorf("open interest history parse failed for %s %s", symbol, period)
+	}
+
+	return series, nil
+}
+
+func fetchOrderbookImbalance(symbol string) (*OrderbookData, error) {
+	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/depth?symbol=%s&limit=100", symbol)
+
+	apiClient := NewAPIClient()
+	resp, err := apiClient.client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Bids [][]string `json:"bids"`
+		Asks [][]string `json:"asks"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+
+	sumLevels := func(levels [][]string) float64 {
+		total := 0.0
+		for _, level := range levels {
+			if len(level) < 2 {
+				continue
+			}
+			price, err1 := strconv.ParseFloat(level[0], 64)
+			qty, err2 := strconv.ParseFloat(level[1], 64)
+			if err1 != nil || err2 != nil {
+				continue
+			}
+			total += price * qty
+		}
+		return total
+	}
+
+	bidTotal := sumLevels(result.Bids)
+	askTotal := sumLevels(result.Asks)
+	denominator := bidTotal + askTotal
+	imbalance := 0.0
+	if denominator > 0 {
+		imbalance = (bidTotal - askTotal) / denominator
+	}
+
+	logger.Infof("V3_AUDIT_DEPTH: %s, BidTotal=%.2f, AskTotal=%.2f, Imb=%.2f%%", symbol, bidTotal, askTotal, imbalance*100)
+
+	return &OrderbookData{
+		BidTotal:  bidTotal,
+		AskTotal:  askTotal,
+		Imbalance: imbalance,
 	}, nil
 }
 

@@ -110,11 +110,11 @@ func (s *TraderStore) Update(trader *Trader) error {
 		trader.ID, trader.Name, trader.AIModelID, trader.StrategyID)
 
 	updates := map[string]interface{}{
-		"name":           trader.Name,
-		"ai_model_id":    trader.AIModelID,
-		"exchange_id":    trader.ExchangeID,
-		"strategy_id":    trader.StrategyID,
-		"is_cross_margin": trader.IsCrossMargin,
+		"name":                trader.Name,
+		"ai_model_id":         trader.AIModelID,
+		"exchange_id":         trader.ExchangeID,
+		"strategy_id":         trader.StrategyID,
+		"is_cross_margin":     trader.IsCrossMargin,
 		"show_in_competition": trader.ShowInCompetition,
 	}
 
@@ -155,6 +155,7 @@ func (s *TraderStore) UpdateCustomPrompt(userID, id string, customPrompt string,
 func (s *TraderStore) Delete(userID, id string) error {
 	// Delete associated equity snapshots first
 	s.db.Where("trader_id = ?", id).Delete(&EquitySnapshot{})
+	s.db.Where("trader_id = ?", id).Delete(&ShadowSnapshot{})
 
 	// Delete the trader
 	return s.db.Where("id = ? AND user_id = ?", id, userID).Delete(&Trader{}).Error

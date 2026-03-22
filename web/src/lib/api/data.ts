@@ -6,6 +6,8 @@ import type {
   Statistics,
   CompetitionData,
   PositionHistoryResponse,
+  ShadowSnapshot,
+  AdaptiveWeightState,
 } from '../../types'
 import { API_BASE, httpClient } from './helpers'
 
@@ -118,5 +120,46 @@ export const dataApi = {
     )
     if (!result.success) throw new Error('Failed to fetch position history')
     return result.data!
+  },
+
+  async getShadowSnapshots(traderId: string, limit: number = 200): Promise<ShadowSnapshot[]> {
+    const result = await httpClient.get<ShadowSnapshot[]>(
+      `${API_BASE}/shadow-snapshots?trader_id=${encodeURIComponent(traderId)}&limit=${limit}`
+    )
+    if (!result.success) throw new Error('Failed to fetch shadow snapshots')
+    return Array.isArray(result.data) ? result.data : []
+  },
+
+  async getAdaptiveWeights(
+    traderId: string,
+    symbol?: string,
+    sector?: string
+  ): Promise<AdaptiveWeightState> {
+    const params = new URLSearchParams()
+    params.append('trader_id', traderId)
+    if (symbol) {
+      params.append('symbol', symbol)
+    }
+    if (sector) {
+      params.append('sector', sector)
+    }
+
+    const result = await httpClient.get<AdaptiveWeightState>(
+      `${API_BASE}/adaptive-weights?${params.toString()}`
+    )
+    if (!result.success) throw new Error('Failed to fetch adaptive weights')
+    return (
+      result.data || {
+        sample_count: 0,
+        sector_sample_count: 0,
+        coin_sample_count: 0,
+        alpha: 0,
+        sample_target: 30,
+        blend_default: 1,
+        blend_adaptive: 0,
+        factors: [],
+        updated_at: 0,
+      }
+    )
   },
 }

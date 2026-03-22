@@ -5,6 +5,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"nofx/kernel"
 	"nofx/logger"
+	"nofx/market"
 	"nofx/mcp"
 	_ "nofx/mcp/payment"
 	_ "nofx/mcp/provider"
@@ -148,6 +149,63 @@ type AutoTrader struct {
 	userID                string             // User ID
 	gridState             *GridState         // Grid trading state (only used when StrategyType == "grid_trading")
 	claw402WalletAddr     string             // Claw402 wallet address (derived from private key at start)
+	candidateSnapshot     CandidateSnapshot  // Latest candidate-market snapshot aligned with the most recent AI cycle
+	candidateSnapshotMu   sync.RWMutex
+	shadowTargetWindow    time.Duration
+	shadowPollInterval    time.Duration
+	shadowPriceFetcher    func(symbol string, target time.Time) (float64, error)
+}
+
+type DonchianBoxSnapshot struct {
+	Period int     `json:"period"`
+	Upper  float64 `json:"upper"`
+	Lower  float64 `json:"lower"`
+	Mid    float64 `json:"mid"`
+	State  string  `json:"state"`
+}
+
+type EMASignalSnapshot struct {
+	State   string          `json:"state"`
+	Values  map[int]float64 `json:"values,omitempty"`
+	Periods []int           `json:"periods,omitempty"`
+}
+
+type TimeframeTrendSnapshot struct {
+	Timeframe      string  `json:"timeframe"`
+	RSI            float64 `json:"rsi,omitempty"`
+	MACD           float64 `json:"macd,omitempty"`
+	MACDState      string  `json:"macd_state,omitempty"`
+	EMAState       string  `json:"ema_state,omitempty"`
+	DonchianState  string  `json:"donchian_state,omitempty"`
+	DonchianPeriod int     `json:"donchian_period,omitempty"`
+}
+
+type CandidateMarketSnapshot struct {
+	Symbol         string                            `json:"symbol"`
+	Sector         string                            `json:"sector,omitempty"`
+	CurrentPrice   float64                           `json:"current_price"`
+	Timeframes     []string                          `json:"timeframes"`
+	DonchianBoxes  map[int]DonchianBoxSnapshot       `json:"donchian_boxes,omitempty"`
+	TrendContexts  map[string]TimeframeTrendSnapshot `json:"trend_contexts,omitempty"`
+	EMASignals     EMASignalSnapshot                 `json:"ema_signals"`
+	OpenInterest   *market.OIData                    `json:"open_interest,omitempty"`
+	Orderbook      *market.OrderbookData             `json:"orderbook,omitempty"`
+	DexScreener    *market.DexScreenerData           `json:"dex_screener,omitempty"`
+	GeckoSentiment *market.GeckoSentimentData        `json:"gecko_sentiment,omitempty"`
+	HeatScore      *market.HeatScoreData             `json:"heat_score,omitempty"`
+	VolUtilization float64                           `json:"vol_utilization"`
+	VolUtilBasis   string                            `json:"vol_util_basis,omitempty"`
+	FundingRate    float64                           `json:"funding_rate,omitempty"`
+	AI500Score     *float64                          `json:"ai500_score,omitempty"`
+	Sources        []string                          `json:"sources,omitempty"`
+	UpdatedAt      time.Time                         `json:"updated_at"`
+}
+
+type CandidateSnapshot struct {
+	TraderID   string                    `json:"trader_id"`
+	TraderName string                    `json:"trader_name"`
+	UpdatedAt  time.Time                 `json:"updated_at"`
+	Candidates []CandidateMarketSnapshot `json:"candidates"`
 }
 
 // NewAutoTrader creates an automatic trader
@@ -358,6 +416,8 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		peakPnLCacheMutex:     sync.RWMutex{},
 		lastBalanceSyncTime:   time.Now(),
 		userID:                userID,
+		shadowTargetWindow:    defaultShadowTargetWindow,
+		shadowPollInterval:    defaultShadowPollInterval,
 	}, nil
 }
 
@@ -382,6 +442,7 @@ func (at *AutoTrader) Run() error {
 
 	// Start drawdown monitoring
 	at.startDrawdownMonitor()
+	at.startShadowTrackerDaemon()
 
 	// Start Lighter order sync if using Lighter exchange
 	if at.exchange == "lighter" {

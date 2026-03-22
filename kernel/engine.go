@@ -89,6 +89,7 @@ type RecentOrder struct {
 
 // Context trading context (complete information passed to AI)
 type Context struct {
+	TraderID           string                             `json:"trader_id,omitempty"`
 	CurrentTime        string                             `json:"current_time"`
 	RuntimeMinutes     int                                `json:"runtime_minutes"`
 	CallCount          int                                `json:"call_count"`

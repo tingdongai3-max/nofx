@@ -1,5 +1,6 @@
-import { useState, useEffect, useMemo } from 'react'
+import { Fragment, useState, useEffect, useMemo } from 'react'
 import { api } from '../../lib/api'
+import { PositionTelemetryChart } from '../charts/PositionTelemetryChart'
 import { useLanguage } from '../../contexts/LanguageContext'
 import { t, type Language } from '../../i18n/translations'
 import { MetricTooltip } from '../common/MetricTooltip'
@@ -229,7 +230,15 @@ function DirectionStatsCard({ stat, language }: { stat: DirectionStats; language
 }
 
 // Position Row Component
-function PositionRow({ position }: { position: HistoricalPosition }) {
+function PositionRow({
+  position,
+  isExpanded,
+  onToggle,
+}: {
+  position: HistoricalPosition
+  isExpanded: boolean
+  onToggle: () => void
+}) {
   const side = position.side || ''
   const isLong = side.toUpperCase() === 'LONG'
   const realizedPnl = position.realized_pnl || 0
@@ -258,78 +267,83 @@ function PositionRow({ position }: { position: HistoricalPosition }) {
   const displayQty = position.entry_quantity || position.quantity || 0
 
   return (
-    <tr
-      className="transition-all duration-200 hover:bg-white/5"
-      style={{ borderBottom: '1px solid #2B3139' }}
-    >
-      {/* Symbol */}
-      <td className="py-3 px-4">
-        <div className="flex items-center gap-2">
-          <span className="font-mono font-semibold" style={{ color: '#EAECEF' }}>
-            {(position.symbol || '').replace('USDT', '')}
-          </span>
-          <span
-            className="px-2 py-0.5 rounded text-xs font-semibold uppercase"
-            style={{
-              background: `${sideColor}22`,
-              color: sideColor,
-              border: `1px solid ${sideColor}44`,
-            }}
-          >
-            {side}
-          </span>
-        </div>
-      </td>
+    <Fragment>
+      <tr
+        className="cursor-pointer transition-all duration-200 hover:bg-white/5"
+        style={{ borderBottom: isExpanded ? '0' : '1px solid #2B3139' }}
+        onClick={onToggle}
+      >
+        <td className="py-3 px-4">
+          <div className="flex items-center gap-2">
+            <span className="font-mono font-semibold" style={{ color: '#EAECEF' }}>
+              {(position.symbol || '').replace('USDT', '')}
+            </span>
+            <span
+              className="px-2 py-0.5 rounded text-xs font-semibold uppercase"
+              style={{
+                background: `${sideColor}22`,
+                color: sideColor,
+                border: `1px solid ${sideColor}44`,
+              }}
+            >
+              {side}
+            </span>
+          </div>
+        </td>
 
-      {/* Entry Price */}
-      <td className="py-3 px-4 text-right font-mono" style={{ color: '#EAECEF' }}>
-        {formatPrice(entryPrice)}
-      </td>
+        <td className="py-3 px-4 text-right font-mono" style={{ color: '#EAECEF' }}>
+          {formatPrice(entryPrice)}
+        </td>
 
-      {/* Exit Price */}
-      <td className="py-3 px-4 text-right font-mono" style={{ color: '#EAECEF' }}>
-        {formatPrice(exitPrice)}
-      </td>
+        <td className="py-3 px-4 text-right font-mono" style={{ color: '#EAECEF' }}>
+          {formatPrice(exitPrice)}
+        </td>
 
-      {/* Quantity */}
-      <td className="py-3 px-4 text-right font-mono" style={{ color: '#848E9C' }}>
-        {formatQuantity(displayQty)}
-      </td>
+        <td className="py-3 px-4 text-right font-mono" style={{ color: '#848E9C' }}>
+          {formatQuantity(displayQty)}
+        </td>
 
-      {/* Position Value (Entry Price * Quantity) */}
-      <td className="py-3 px-4 text-right font-mono" style={{ color: '#EAECEF' }}>
-        {formatNumber(entryPrice * displayQty)}
-      </td>
+        <td className="py-3 px-4 text-right font-mono" style={{ color: '#EAECEF' }}>
+          {formatNumber(entryPrice * displayQty)}
+        </td>
 
-      {/* P&L */}
-      <td className="py-3 px-4 text-right">
-        <div className="font-mono font-semibold" style={{ color: pnlColor }}>
-          {isProfitable ? '+' : ''}
-          {formatNumber(realizedPnl)}
-        </div>
-        <div className="text-xs" style={{ color: pnlColor }}>
-          {pnlPct >= 0 ? '+' : ''}
-          {pnlPct.toFixed(2)}%
-        </div>
-      </td>
+        <td className="py-3 px-4 text-right">
+          <div className="font-mono font-semibold" style={{ color: pnlColor }}>
+            {isProfitable ? '+' : ''}
+            {formatNumber(realizedPnl)}
+          </div>
+          <div className="text-xs" style={{ color: pnlColor }}>
+            {pnlPct >= 0 ? '+' : ''}
+            {pnlPct.toFixed(2)}%
+          </div>
+        </td>
 
-      {/* Fee - show more precision for small fees */}
-      <td className="py-3 px-4 text-right font-mono text-xs" style={{ color: '#848E9C' }}>
-        -{((position.fee || 0) < 0.01 && (position.fee || 0) > 0)
-          ? (position.fee || 0).toFixed(4)
-          : (position.fee || 0).toFixed(2)}
-      </td>
+        <td className="py-3 px-4 text-right font-mono text-xs" style={{ color: '#848E9C' }}>
+          -{((position.fee || 0) < 0.01 && (position.fee || 0) > 0)
+            ? (position.fee || 0).toFixed(4)
+            : (position.fee || 0).toFixed(2)}
+        </td>
 
-      {/* Duration */}
-      <td className="py-3 px-4 text-center text-sm" style={{ color: '#848E9C' }}>
-        {formatDuration(holdingMinutes)}
-      </td>
+        <td className="py-3 px-4 text-center text-sm" style={{ color: '#848E9C' }}>
+          {formatDuration(holdingMinutes)}
+        </td>
 
-      {/* Exit Time */}
-      <td className="py-3 px-4 text-right text-xs" style={{ color: '#848E9C' }}>
-        {formatDate(position.exit_time)}
-      </td>
-    </tr>
+        <td className="py-3 px-4 text-right text-xs" style={{ color: '#848E9C' }}>
+          {formatDate(position.exit_time)}
+        </td>
+      </tr>
+      {isExpanded && (
+        <tr style={{ borderBottom: '1px solid #2B3139' }}>
+          <td colSpan={9} className="px-4 pb-4 pt-1">
+            <PositionTelemetryChart
+              telemetry={position.telemetry}
+              title={`${position.symbol} ${(position.side || '').toUpperCase()} · Lifecycle Telemetry`}
+              emptyLabel="No archived telemetry was captured for this position yet."
+            />
+          </td>
+        </tr>
+      )}
+    </Fragment>
   )
 }
 
@@ -351,6 +365,7 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
   const [filterSide, setFilterSide] = useState<string>('all')
   const [sortBy, setSortBy] = useState<'time' | 'pnl' | 'pnl_pct'>('time')
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc')
+  const [expandedPositionId, setExpandedPositionId] = useState<number | null>(null)
 
   useEffect(() => {
     const fetchData = async () => {
@@ -429,6 +444,10 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
   useEffect(() => {
     setCurrentPage(1)
   }, [filterSymbol, filterSide, sortBy, sortOrder, pageSize])
+
+  useEffect(() => {
+    setExpandedPositionId(null)
+  }, [traderId, currentPage, filterSymbol, filterSide, sortBy, sortOrder, pageSize])
 
   // Paginated positions (for display)
   const paginatedPositions = useMemo(() => {
@@ -796,7 +815,14 @@ export function PositionHistory({ traderId }: PositionHistoryProps) {
             </thead>
             <tbody>
               {filteredPositions.map((position) => (
-                <PositionRow key={position.id} position={position} />
+                <PositionRow
+                  key={position.id}
+                  position={position}
+                  isExpanded={expandedPositionId === position.id}
+                  onToggle={() => {
+                    setExpandedPositionId((current) => current === position.id ? null : position.id)
+                  }}
+                />
               ))}
             </tbody>
           </table>

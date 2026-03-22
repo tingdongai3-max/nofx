@@ -1,6 +1,14 @@
 package market
 
-import "math"
+import (
+	"math"
+	"nofx/logger"
+)
+
+const (
+	VolUtilMultiplier = 1.5
+	VolUtilLookback   = 14
+)
 
 // calculateEMA calculates EMA
 func calculateEMA(klines []Kline, period int) float64 {
@@ -114,6 +122,24 @@ func calculateATR(klines []Kline, period int) float64 {
 	}
 
 	return atr
+}
+
+func CalculateVolatilityUtilization(symbol string, klines []Kline, currentATR float64) float64 {
+	if len(klines) <= VolUtilLookback || currentATR <= 0 {
+		logger.Infof("V3_AUDIT_VU: %s, DeltaP=%.4f, ATR=%.4f, VU=%.2f", symbol, 0.0, currentATR, 0.0)
+		return 0
+	}
+
+	deltaPrice := math.Abs(klines[len(klines)-1].Close - klines[len(klines)-1-VolUtilLookback].Close)
+	denominator := currentATR * VolUtilMultiplier
+	if denominator <= 0 {
+		logger.Infof("V3_AUDIT_VU: %s, DeltaP=%.4f, ATR=%.4f, VU=%.2f", symbol, deltaPrice, currentATR, 0.0)
+		return 0
+	}
+
+	vu := deltaPrice / denominator
+	logger.Infof("V3_AUDIT_VU: %s, DeltaP=%.4f, ATR=%.4f, VU=%.2f", symbol, deltaPrice, currentATR, vu)
+	return vu
 }
 
 // calculateBOLL calculates Bollinger Bands (upper, middle, lower)

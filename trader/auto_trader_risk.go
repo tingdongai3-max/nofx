@@ -55,6 +55,8 @@ func (at *AutoTrader) checkPositionDrawdown() {
 			leverage = int(lev)
 		}
 
+		at.recordPositionTelemetry(symbol, side, markPrice)
+
 		var currentPnLPct float64
 		if side == "long" {
 			currentPnLPct = ((markPrice - entryPrice) / entryPrice) * float64(leverage) * 100

@@ -2,6 +2,7 @@ import type {
   TraderInfo,
   TraderConfigData,
   CreateTraderRequest,
+  CandidateSnapshotResponse,
 } from '../../types'
 import { API_BASE, httpClient } from './helpers'
 
@@ -89,6 +90,14 @@ export const traderApi = {
       request
     )
     if (!result.success) throw new Error('Failed to update trader')
+    return result.data!
+  },
+
+  async getTraderCandidates(traderId: string): Promise<CandidateSnapshotResponse> {
+    const result = await httpClient.get<CandidateSnapshotResponse>(
+      `${API_BASE}/trader/candidates?trader_id=${encodeURIComponent(traderId)}`
+    )
+    if (!result.success) throw new Error('Failed to fetch trader candidates')
     return result.data!
   },
 }

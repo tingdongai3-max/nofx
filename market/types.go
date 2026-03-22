@@ -47,14 +47,21 @@ type IndicatorSeries struct {
 
 // Data market data structure
 type Data struct {
-	Symbol        string
-	CurrentPrice  float64
-	PriceChange1h float64 // 1-hour price change percentage
-	PriceChange4h float64 // 4-hour price change percentage
-	Indicators    IndicatorResult
-	OpenInterest  *OIData
-	FundingRate   float64
-	TimeframeData map[string]*TimeframeSeriesData `json:"timeframe_data,omitempty"`
+	Symbol                string
+	Sector                string `json:"sector,omitempty"`
+	CurrentPrice          float64
+	PriceChange1h         float64 // 1-hour price change percentage
+	PriceChange4h         float64 // 4-hour price change percentage
+	Indicators            IndicatorResult
+	OpenInterest          *OIData
+	Orderbook             *OrderbookData
+	DexScreener           *DexScreenerData    `json:"dex_screener,omitempty"`
+	GeckoSentiment        *GeckoSentimentData `json:"gecko_sentiment,omitempty"`
+	HeatScore             *HeatScoreData      `json:"heat_score,omitempty"`
+	VolatilityUtilization float64             `json:"vol_utilization"`
+	PrimaryTimeframe      string              `json:"primary_timeframe,omitempty"`
+	FundingRate           float64
+	TimeframeData         map[string]*TimeframeSeriesData `json:"timeframe_data,omitempty"`
 }
 
 // KlineBar single kline bar with OHLCV data
@@ -78,8 +85,54 @@ type TimeframeSeriesData struct {
 
 // OIData Open Interest data
 type OIData struct {
-	Latest  float64
-	Average float64
+	Latest      float64 `json:"Latest"`
+	Average     float64 `json:"Average"`
+	SampleCount int     `json:"sample_count,omitempty"`
+	Period      string  `json:"period,omitempty"`
+}
+
+type OrderbookData struct {
+	BidTotal  float64 `json:"bid_total"`
+	AskTotal  float64 `json:"ask_total"`
+	Imbalance float64 `json:"imbalance"`
+}
+
+type DexScreenerData struct {
+	ChainID           string  `json:"chain_id,omitempty"`
+	PairAddress       string  `json:"pair_address,omitempty"`
+	PairURL           string  `json:"pair_url,omitempty"`
+	LiquidityUSD      float64 `json:"liquidity_usd"`
+	VolumeH1          float64 `json:"volume_h1"`
+	BuyTxnsH1         int     `json:"buy_txns_h1"`
+	SellTxnsH1        int     `json:"sell_txns_h1"`
+	BuyRatio          float64 `json:"buy_ratio"`
+	BuySellRatio      float64 `json:"buy_sell_ratio"`
+	CEXVolumeH1       float64 `json:"cex_volume_h1"`
+	OnchainToCEXRatio float64 `json:"onchain_to_cex_ratio"`
+}
+
+type GeckoSentimentData struct {
+	CoinID                     string    `json:"coin_id,omitempty"`
+	Categories                 []string  `json:"categories,omitempty"`
+	PublicInterestScore        float64   `json:"public_interest_score"`
+	SentimentVotesUpPercentage float64   `json:"sentiment_votes_up_percentage"`
+	UsingPrivateKey            bool      `json:"using_private_key,omitempty"`
+	CachedAt                   time.Time `json:"cached_at,omitempty"`
+}
+
+type HeatScoreData struct {
+	CompositeScore          float64            `json:"composite_score"`
+	TradingScore            float64            `json:"trading_score"`
+	QuantScore              float64            `json:"quant_score"`
+	MarketScore             float64            `json:"market_score"`
+	TrendScore              float64            `json:"trend_score"`
+	VolumeSpikeScore        float64            `json:"volume_spike_score"`
+	DonchianFactorScore     float64            `json:"-"`
+	MTFResonanceFactorScore float64            `json:"-"`
+	QuantFactorScore        float64            `json:"quant_factor_score"`
+	SocialScore             float64            `json:"social_score"`
+	OnChainScore            float64            `json:"onchain_score"`
+	SourceWeights           map[string]float64 `json:"source_weights,omitempty"`
 }
 
 // Binance API response structure

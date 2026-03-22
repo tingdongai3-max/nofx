@@ -1,6 +1,8 @@
 package store
 
 import (
+	"database/sql/driver"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -8,6 +10,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 // adaptivePriceRound rounds a price based on its magnitude to preserve meaningful precision.
@@ -94,30 +97,96 @@ func formatDurationMs(ms int64) string {
 
 // TraderPosition position record
 // All time fields use int64 millisecond timestamps (UTC) to avoid timezone issues
+type FactorTelemetry struct {
+	Timestamp  int64   `json:"timestamp"`
+	Price      float64 `json:"price"`
+	HeatScore  float64 `json:"heat_score"`
+	TradingSub float64 `json:"trading_sub"`
+	QuantSub   float64 `json:"quant_sub"`
+}
+
+type FactorTelemetrySeries []FactorTelemetry
+
+func (s FactorTelemetrySeries) Value() (driver.Value, error) {
+	if len(s) == 0 {
+		return "[]", nil
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+	return string(data), nil
+}
+
+func (s *FactorTelemetrySeries) Scan(value interface{}) error {
+	if value == nil {
+		*s = FactorTelemetrySeries{}
+		return nil
+	}
+
+	var raw []byte
+	switch v := value.(type) {
+	case []byte:
+		raw = v
+	case string:
+		raw = []byte(v)
+	default:
+		return fmt.Errorf("unsupported telemetry scan type: %T", value)
+	}
+
+	if len(raw) == 0 || string(raw) == "null" {
+		*s = FactorTelemetrySeries{}
+		return nil
+	}
+
+	var items []FactorTelemetry
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return err
+	}
+	*s = FactorTelemetrySeries(items)
+	return nil
+}
+
+func (s FactorTelemetrySeries) MarshalJSON() ([]byte, error) {
+	return json.Marshal([]FactorTelemetry(s))
+}
+
+func (s FactorTelemetrySeries) GormDataType() string {
+	return "json"
+}
+
+func (FactorTelemetrySeries) GormDBDataType(db *gorm.DB, _ *schema.Field) string {
+	if db.Dialector.Name() == "postgres" {
+		return "JSONB"
+	}
+	return "TEXT"
+}
+
 type TraderPosition struct {
-	ID                 int64   `gorm:"primaryKey;autoIncrement" json:"id"`
-	TraderID           string  `gorm:"column:trader_id;not null;index:idx_positions_trader" json:"trader_id"`
-	ExchangeID         string  `gorm:"column:exchange_id;not null;default:'';index:idx_positions_exchange" json:"exchange_id"`
-	ExchangeType       string  `gorm:"column:exchange_type;not null;default:''" json:"exchange_type"`
-	ExchangePositionID string  `gorm:"column:exchange_position_id;not null;default:''" json:"exchange_position_id"`
-	Symbol             string  `gorm:"column:symbol;not null" json:"symbol"`
-	Side               string  `gorm:"column:side;not null" json:"side"`
-	EntryQuantity      float64 `gorm:"column:entry_quantity;default:0" json:"entry_quantity"`
-	Quantity           float64 `gorm:"column:quantity;not null" json:"quantity"`
-	EntryPrice         float64 `gorm:"column:entry_price;not null" json:"entry_price"`
-	EntryOrderID       string  `gorm:"column:entry_order_id;default:''" json:"entry_order_id"`
-	EntryTime          int64   `gorm:"column:entry_time;not null;index:idx_positions_entry" json:"entry_time"` // Unix milliseconds UTC
-	ExitPrice          float64 `gorm:"column:exit_price;default:0" json:"exit_price"`
-	ExitOrderID        string  `gorm:"column:exit_order_id;default:''" json:"exit_order_id"`
-	ExitTime           int64   `gorm:"column:exit_time;index:idx_positions_exit" json:"exit_time"` // Unix milliseconds UTC, 0 means not set
-	RealizedPnL        float64 `gorm:"column:realized_pnl;default:0" json:"realized_pnl"`
-	Fee                float64 `gorm:"column:fee;default:0" json:"fee"`
-	Leverage           int     `gorm:"column:leverage;default:1" json:"leverage"`
-	Status             string  `gorm:"column:status;default:OPEN;index:idx_positions_status" json:"status"`
-	CloseReason        string  `gorm:"column:close_reason;default:''" json:"close_reason"`
-	Source             string  `gorm:"column:source;default:system" json:"source"`
-	CreatedAt          int64   `gorm:"column:created_at" json:"created_at"`   // Unix milliseconds UTC
-	UpdatedAt          int64   `gorm:"column:updated_at" json:"updated_at"`   // Unix milliseconds UTC
+	ID                 int64                 `gorm:"primaryKey;autoIncrement" json:"id"`
+	TraderID           string                `gorm:"column:trader_id;not null;index:idx_positions_trader" json:"trader_id"`
+	ExchangeID         string                `gorm:"column:exchange_id;not null;default:'';index:idx_positions_exchange" json:"exchange_id"`
+	ExchangeType       string                `gorm:"column:exchange_type;not null;default:''" json:"exchange_type"`
+	ExchangePositionID string                `gorm:"column:exchange_position_id;not null;default:''" json:"exchange_position_id"`
+	Symbol             string                `gorm:"column:symbol;not null" json:"symbol"`
+	Side               string                `gorm:"column:side;not null" json:"side"`
+	EntryQuantity      float64               `gorm:"column:entry_quantity;default:0" json:"entry_quantity"`
+	Quantity           float64               `gorm:"column:quantity;not null" json:"quantity"`
+	EntryPrice         float64               `gorm:"column:entry_price;not null" json:"entry_price"`
+	EntryOrderID       string                `gorm:"column:entry_order_id;default:''" json:"entry_order_id"`
+	EntryTime          int64                 `gorm:"column:entry_time;not null;index:idx_positions_entry" json:"entry_time"` // Unix milliseconds UTC
+	ExitPrice          float64               `gorm:"column:exit_price;default:0" json:"exit_price"`
+	ExitOrderID        string                `gorm:"column:exit_order_id;default:''" json:"exit_order_id"`
+	ExitTime           int64                 `gorm:"column:exit_time;index:idx_positions_exit" json:"exit_time"` // Unix milliseconds UTC, 0 means not set
+	RealizedPnL        float64               `gorm:"column:realized_pnl;default:0" json:"realized_pnl"`
+	Fee                float64               `gorm:"column:fee;default:0" json:"fee"`
+	Leverage           int                   `gorm:"column:leverage;default:1" json:"leverage"`
+	Status             string                `gorm:"column:status;default:OPEN;index:idx_positions_status" json:"status"`
+	CloseReason        string                `gorm:"column:close_reason;default:''" json:"close_reason"`
+	Source             string                `gorm:"column:source;default:system" json:"source"`
+	Telemetry          FactorTelemetrySeries `gorm:"column:telemetry;not null;default:'[]'" json:"telemetry"`
+	CreatedAt          int64                 `gorm:"column:created_at" json:"created_at"` // Unix milliseconds UTC
+	UpdatedAt          int64                 `gorm:"column:updated_at" json:"updated_at"` // Unix milliseconds UTC
 }
 
 // TableName returns the table name
@@ -159,6 +228,8 @@ func (s *PositionStore) InitTables() error {
 				}
 			}
 
+			s.db.Exec(`ALTER TABLE trader_positions ADD COLUMN IF NOT EXISTS telemetry JSONB NOT NULL DEFAULT '[]'::jsonb`)
+
 			// Just ensure index exists
 			s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_exchange_pos_unique ON trader_positions(exchange_id, exchange_position_id) WHERE exchange_position_id != ''`)
 			return nil
@@ -185,12 +256,22 @@ func (s *PositionStore) InitTables() error {
 	return nil
 }
 
+const maxTelemetryPointsPerPosition = 2048
+
+func normalizeTelemetrySeries(series FactorTelemetrySeries) FactorTelemetrySeries {
+	if len(series) == 0 {
+		return FactorTelemetrySeries{}
+	}
+	return series
+}
+
 // Create creates position record
 func (s *PositionStore) Create(pos *TraderPosition) error {
 	pos.Status = "OPEN"
 	if pos.EntryQuantity == 0 {
 		pos.EntryQuantity = pos.Quantity
 	}
+	pos.Telemetry = normalizeTelemetrySeries(pos.Telemetry)
 	return s.db.Create(pos).Error
 }
 
@@ -198,14 +279,14 @@ func (s *PositionStore) Create(pos *TraderPosition) error {
 func (s *PositionStore) ClosePosition(id int64, exitPrice float64, exitOrderID string, realizedPnL float64, fee float64, closeReason string) error {
 	nowMs := time.Now().UTC().UnixMilli()
 	return s.db.Model(&TraderPosition{}).Where("id = ?", id).Updates(map[string]interface{}{
-		"exit_price":   exitPrice,
+		"exit_price":    exitPrice,
 		"exit_order_id": exitOrderID,
-		"exit_time":    nowMs,
-		"realized_pnl": realizedPnL,
-		"fee":          fee,
-		"status":       "CLOSED",
-		"close_reason": closeReason,
-		"updated_at":   nowMs,
+		"exit_time":     nowMs,
+		"realized_pnl":  realizedPnL,
+		"fee":           fee,
+		"status":        "CLOSED",
+		"close_reason":  closeReason,
+		"updated_at":    nowMs,
 	}).Error
 }
 
@@ -311,15 +392,15 @@ func (s *PositionStore) ClosePositionFully(id int64, exitPrice float64, exitOrde
 	}
 
 	return s.db.Model(&TraderPosition{}).Where("id = ?", id).Updates(map[string]interface{}{
-		"quantity":       quantity,
-		"exit_price":     exitPrice,
-		"exit_order_id":  exitOrderID,
-		"exit_time":      exitTimeMs,
-		"realized_pnl":   totalRealizedPnL,
-		"fee":            totalFee,
-		"status":         "CLOSED",
-		"close_reason":   closeReason,
-		"updated_at":     time.Now().UTC().UnixMilli(),
+		"quantity":      quantity,
+		"exit_price":    exitPrice,
+		"exit_order_id": exitOrderID,
+		"exit_time":     exitTimeMs,
+		"realized_pnl":  totalRealizedPnL,
+		"fee":           totalFee,
+		"status":        "CLOSED",
+		"close_reason":  closeReason,
+		"updated_at":    time.Now().UTC().UnixMilli(),
 	}).Error
 }
 
@@ -343,6 +424,7 @@ func (s *PositionStore) GetOpenPositions(traderID string) ([]*TraderPosition, er
 		if pos.EntryQuantity == 0 {
 			pos.EntryQuantity = pos.Quantity
 		}
+		pos.Telemetry = normalizeTelemetrySeries(pos.Telemetry)
 	}
 	return positions, nil
 }
@@ -358,6 +440,7 @@ func (s *PositionStore) GetOpenPositionBySymbol(traderID, symbol, side string) (
 		if pos.EntryQuantity == 0 {
 			pos.EntryQuantity = pos.Quantity
 		}
+		pos.Telemetry = normalizeTelemetrySeries(pos.Telemetry)
 		return &pos, nil
 	}
 
@@ -372,6 +455,7 @@ func (s *PositionStore) GetOpenPositionBySymbol(traderID, symbol, side string) (
 				if pos.EntryQuantity == 0 {
 					pos.EntryQuantity = pos.Quantity
 				}
+				pos.Telemetry = normalizeTelemetrySeries(pos.Telemetry)
 				return &pos, nil
 			}
 		}
@@ -395,6 +479,7 @@ func (s *PositionStore) GetClosedPositions(traderID string, limit int) ([]*Trade
 		if pos.EntryQuantity == 0 {
 			pos.EntryQuantity = pos.Quantity
 		}
+		pos.Telemetry = normalizeTelemetrySeries(pos.Telemetry)
 	}
 	return positions, nil
 }
@@ -413,6 +498,7 @@ func (s *PositionStore) GetAllOpenPositions() ([]*TraderPosition, error) {
 		if pos.EntryQuantity == 0 {
 			pos.EntryQuantity = pos.Quantity
 		}
+		pos.Telemetry = normalizeTelemetrySeries(pos.Telemetry)
 	}
 	return positions, nil
 }
@@ -452,6 +538,7 @@ func (s *PositionStore) GetOpenPositionByExchangePositionID(exchangeID, exchange
 	if pos.EntryQuantity == 0 {
 		pos.EntryQuantity = pos.Quantity
 	}
+	pos.Telemetry = normalizeTelemetrySeries(pos.Telemetry)
 	return &pos, nil
 }
 
@@ -483,6 +570,7 @@ func (s *PositionStore) CreateOpenPosition(pos *TraderPosition) error {
 	if pos.EntryQuantity == 0 {
 		pos.EntryQuantity = pos.Quantity
 	}
+	pos.Telemetry = normalizeTelemetrySeries(pos.Telemetry)
 
 	err := s.db.Create(pos).Error
 	if err != nil {
@@ -500,6 +588,27 @@ func (s *PositionStore) CreateOpenPosition(pos *TraderPosition) error {
 	}
 
 	return nil
+}
+
+// AppendTelemetryPoint appends a factor telemetry point to a position.
+func (s *PositionStore) AppendTelemetryPoint(id int64, point FactorTelemetry) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var pos TraderPosition
+		if err := tx.First(&pos, id).Error; err != nil {
+			return fmt.Errorf("failed to get position for telemetry append: %w", err)
+		}
+
+		telemetry := append(normalizeTelemetrySeries(pos.Telemetry), point)
+		if len(telemetry) > maxTelemetryPointsPerPosition {
+			telemetry = telemetry[len(telemetry)-maxTelemetryPointsPerPosition:]
+		}
+
+		nowMs := time.Now().UTC().UnixMilli()
+		return tx.Model(&TraderPosition{}).Where("id = ?", id).Updates(map[string]interface{}{
+			"telemetry":  telemetry,
+			"updated_at": nowMs,
+		}).Error
+	})
 }
 
 // ClosePositionWithAccurateData closes a position with accurate data from exchange

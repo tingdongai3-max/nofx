@@ -3,10 +3,13 @@ package trader
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"nofx/kernel"
 	"nofx/logger"
+	"nofx/market"
 	"nofx/store"
 	"nofx/wallet"
+	"sort"
 	"strings"
 	"time"
 )
@@ -106,6 +109,7 @@ func (at *AutoTrader) runCycle() error {
 
 	// If no candidate coins available, log but do not error
 	if len(ctx.CandidateCoins) == 0 {
+		at.updateCandidateSnapshot(ctx)
 		logger.Infof("ℹ️  No candidate coins available, skipping this cycle")
 		record.Success = true // Not an error, just no candidate coins
 		record.ExecutionLog = append(record.ExecutionLog, "No candidate coins available, cycle skipped")
@@ -128,6 +132,8 @@ func (at *AutoTrader) runCycle() error {
 	logger.Infof("📊 Account equity: %.2f USDT | Available: %.2f USDT | Positions: %d",
 		ctx.Account.TotalEquity, ctx.Account.AvailableBalance, ctx.Account.PositionCount)
 
+	decisionTime := time.Now().UTC()
+
 	// 5. Use strategy engine to call AI for decision
 	logger.Infof("🤖 Requesting AI analysis and decision... [Strategy Engine]")
 	aiDecision, err := kernel.GetFullDecisionWithStrategy(ctx, at.mcpClient, at.strategyEngine, "balanced")
@@ -139,8 +145,16 @@ func (at *AutoTrader) runCycle() error {
 			fmt.Sprintf("AI call duration: %d ms", record.AIRequestDurationMs))
 	}
 
+	at.updateCandidateSnapshot(ctx)
+	if shadowErr := at.persistShadowSnapshots(decisionTime); shadowErr != nil {
+		logger.Warnf("⚠️ Failed to persist shadow snapshots: %v", shadowErr)
+	}
+
 	// Save chain of thought, decisions, and input prompt even if there's an error (for debugging)
 	if aiDecision != nil {
+		if shadowErr := at.markShadowActions(decisionTime, aiDecision.Decisions); shadowErr != nil {
+			logger.Warnf("⚠️ Failed to mark shadow actions: %v", shadowErr)
+		}
 		record.SystemPrompt = aiDecision.SystemPrompt // Save system prompt
 		record.InputPrompt = aiDecision.UserPrompt
 		record.CoTTrace = aiDecision.CoTTrace
@@ -274,6 +288,211 @@ func (at *AutoTrader) runCycle() error {
 	}
 
 	return nil
+}
+
+func (at *AutoTrader) updateCandidateSnapshot(ctx *kernel.Context) {
+	if ctx == nil {
+		return
+	}
+
+	snapshot := CandidateSnapshot{
+		TraderID:   at.id,
+		TraderName: at.name,
+		UpdatedAt:  time.Now().UTC(),
+		Candidates: make([]CandidateMarketSnapshot, 0, len(ctx.CandidateCoins)),
+	}
+
+	for _, coin := range ctx.CandidateCoins {
+		data, ok := ctx.MarketDataMap[coin.Symbol]
+		if !ok || data == nil {
+			continue
+		}
+
+		timeframes := make([]string, 0, len(data.TimeframeData))
+		for tf := range data.TimeframeData {
+			timeframes = append(timeframes, tf)
+		}
+		sort.Strings(timeframes)
+
+		snapshot.Candidates = append(snapshot.Candidates, CandidateMarketSnapshot{
+			Symbol:         coin.Symbol,
+			Sector:         data.Sector,
+			CurrentPrice:   data.CurrentPrice,
+			Timeframes:     timeframes,
+			DonchianBoxes:  buildDonchianBoxSnapshots(data.CurrentPrice, data.Indicators.Donchians),
+			TrendContexts:  buildTimeframeTrendSnapshots(data, at.config.StrategyConfig),
+			EMASignals:     buildEMASignalSnapshot(data.Indicators.EMAs),
+			OpenInterest:   data.OpenInterest,
+			Orderbook:      data.Orderbook,
+			DexScreener:    data.DexScreener,
+			GeckoSentiment: data.GeckoSentiment,
+			HeatScore:      data.HeatScore,
+			VolUtilization: data.VolatilityUtilization,
+			VolUtilBasis:   fmt.Sprintf("%dx%s", market.VolUtilLookback, data.PrimaryTimeframe),
+			FundingRate:    data.FundingRate,
+			AI500Score:     nil,
+			Sources:        append([]string(nil), coin.Sources...),
+			UpdatedAt:      snapshot.UpdatedAt,
+		})
+	}
+
+	at.candidateSnapshotMu.Lock()
+	at.candidateSnapshot = snapshot
+	at.candidateSnapshotMu.Unlock()
+
+	if len(ctx.CandidateCoins) > 0 && len(snapshot.Candidates) == 0 {
+		logger.Warnf("⚠️ Candidate snapshot is empty despite %d candidate coins; market data map size=%d", len(ctx.CandidateCoins), len(ctx.MarketDataMap))
+	}
+}
+
+func buildDonchianBoxSnapshots(currentPrice float64, donchians map[int]market.DonchianResult) map[int]DonchianBoxSnapshot {
+	if len(donchians) == 0 {
+		return nil
+	}
+
+	snapshots := make(map[int]DonchianBoxSnapshot, len(donchians))
+	for period, box := range donchians {
+		snapshots[period] = DonchianBoxSnapshot{
+			Period: period,
+			Upper:  box.Upper,
+			Lower:  box.Lower,
+			Mid:    box.Mid,
+			State:  describeDonchianPhysicalState(currentPrice, box),
+		}
+	}
+	return snapshots
+}
+
+func buildEMASignalSnapshot(emas map[int]float64) EMASignalSnapshot {
+	snapshot := EMASignalSnapshot{
+		State:  "unavailable",
+		Values: make(map[int]float64),
+	}
+	if len(emas) == 0 {
+		return snapshot
+	}
+
+	periods := make([]int, 0, len(emas))
+	for period, value := range emas {
+		periods = append(periods, period)
+		snapshot.Values[period] = value
+	}
+	sort.Ints(periods)
+	snapshot.Periods = periods
+
+	if len(periods) < 2 {
+		snapshot.State = "single_ema"
+		return snapshot
+	}
+
+	bullish := true
+	bearish := true
+	for i := 1; i < len(periods); i++ {
+		prev := snapshot.Values[periods[i-1]]
+		curr := snapshot.Values[periods[i]]
+		if prev <= curr {
+			bullish = false
+		}
+		if prev >= curr {
+			bearish = false
+		}
+	}
+
+	switch {
+	case bullish:
+		snapshot.State = "bullish_stack"
+	case bearish:
+		snapshot.State = "bearish_stack"
+	default:
+		snapshot.State = "mixed"
+	}
+
+	return snapshot
+}
+
+func buildTimeframeTrendSnapshots(data *market.Data, strategyConfig *store.StrategyConfig) map[string]TimeframeTrendSnapshot {
+	if data == nil || len(data.TimeframeData) == 0 {
+		return nil
+	}
+
+	indicatorConfig := store.GetDefaultStrategyConfig("en").Indicators
+	if strategyConfig != nil {
+		indicatorConfig = strategyConfig.Indicators
+	}
+
+	snapshots := make(map[string]TimeframeTrendSnapshot, len(data.TimeframeData))
+	for timeframe, tfData := range data.TimeframeData {
+		if tfData == nil {
+			continue
+		}
+
+		emaValues := make(map[int]float64)
+		for _, period := range indicatorConfig.EMAPeriods {
+			value := tfData.LatestEMA(period)
+			if value > 0 {
+				emaValues[period] = value
+			}
+		}
+
+		rsiValue := 0.0
+		if len(indicatorConfig.RSIPeriods) > 0 {
+			rsiValue = tfData.LatestRSI(indicatorConfig.RSIPeriods[0])
+		}
+
+		donchianState := ""
+		donchianPeriod := 0
+		currentPrice := tfData.LatestClose()
+		if len(indicatorConfig.DonchianPeriods) > 0 {
+			donchianPeriod = indicatorConfig.DonchianPeriods[0]
+			donchian := tfData.LatestDonchian(donchianPeriod)
+			if donchian.Upper > 0 || donchian.Lower > 0 {
+				donchianState = describeDonchianPhysicalState(currentPrice, donchian)
+			}
+		}
+
+		snapshots[timeframe] = TimeframeTrendSnapshot{
+			Timeframe:      timeframe,
+			RSI:            rsiValue,
+			MACD:           tfData.LatestMACD(),
+			MACDState:      describeMACDState(tfData.LatestMACD()),
+			EMAState:       buildEMASignalSnapshot(emaValues).State,
+			DonchianState:  donchianState,
+			DonchianPeriod: donchianPeriod,
+		}
+	}
+
+	return snapshots
+}
+
+func describeDonchianPhysicalState(currentPrice float64, box market.DonchianResult) string {
+	width := box.Upper - box.Lower
+	if width <= 0 || math.IsNaN(width) {
+		return "Price is inside the Donchian Box"
+	}
+
+	switch {
+	case currentPrice > box.Upper:
+		return "Price is currently above the upper bound"
+	case currentPrice < box.Lower:
+		return "Price is currently below the lower bound"
+	case currentPrice >= box.Upper-width*0.02:
+		return "Price is within 2% range of the upper bound"
+	case currentPrice <= box.Lower+width*0.02:
+		return "Price is within 2% range of the lower bound"
+	default:
+		return "Price is currently between the upper and lower bounds"
+	}
+}
+
+func describeMACDState(macd float64) string {
+	switch {
+	case macd > 0:
+		return "Bullish"
+	case macd < 0:
+		return "Bearish"
+	default:
+		return "Neutral"
+	}
 }
 
 // buildTradingContext builds trading context
@@ -439,6 +658,7 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 
 	// 6. Build context
 	ctx := &kernel.Context{
+		TraderID:        at.id,
 		CurrentTime:     time.Now().UTC().Format("2006-01-02 15:04:05 UTC"),
 		RuntimeMinutes:  int(time.Since(at.startTime).Minutes()),
 		CallCount:       at.callCount,

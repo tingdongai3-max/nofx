@@ -70,3 +70,32 @@ func (t *TimeframeSeriesData) LatestBoll(period int) BollResult {
 		Lower:  latestValue(series.Lower),
 	}
 }
+
+func (t *TimeframeSeriesData) LatestMACD() float64 {
+	if t == nil {
+		return 0
+	}
+	return latestValue(t.Indicators.MACD)
+}
+
+func (t *TimeframeSeriesData) LatestDonchian(period int) DonchianResult {
+	if t == nil {
+		return DonchianResult{}
+	}
+	series, ok := t.Indicators.Donchians[period]
+	if !ok {
+		return DonchianResult{}
+	}
+	return DonchianResult{
+		Upper: latestValue(series.Upper),
+		Lower: latestValue(series.Lower),
+		Mid:   latestValue(series.Mid),
+	}
+}
+
+func (t *TimeframeSeriesData) LatestClose() float64 {
+	if t == nil || len(t.Klines) == 0 {
+		return 0
+	}
+	return t.Klines[len(t.Klines)-1].Close
+}

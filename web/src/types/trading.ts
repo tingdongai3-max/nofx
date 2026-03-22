@@ -29,6 +29,68 @@ export interface AccountInfo {
   margin_used_pct: number
 }
 
+export interface FactorTelemetry {
+  timestamp: number
+  price: number
+  heat_score: number
+  trading_sub: number
+  quant_sub: number
+}
+
+export interface ShadowSnapshot {
+  id: number
+  trader_id: string
+  decision_time: number
+  symbol: string
+  sector: string
+  action_taken: number
+  price_t0: number
+  heat_score: number
+  trading_sub: number
+  quant_sub: number
+  market_factor: number
+  trend_factor: number
+  volume_spike_factor: number
+  quant_factor: number
+  social_factor: number
+  onchain_factor: number
+  vol_utilization: number
+  funding_rate: number
+  source_summary: string
+  filled: boolean
+  price_t1: number
+  return_pct: number
+  filled_at: number
+  created_at: number
+  updated_at: number
+}
+
+export interface AdaptiveFactorState {
+  name: string
+  ic: number
+  sector_ic: number
+  coin_ic: number
+  final_ic: number
+  default_weight: number
+  empirical_weight: number
+  final_weight: number
+}
+
+export interface AdaptiveWeightState {
+  trader_id?: string
+  symbol?: string
+  sector?: string
+  sample_count: number
+  sector_sample_count: number
+  coin_sample_count: number
+  alpha: number
+  sample_target: number
+  blend_default: number
+  blend_adaptive: number
+  factors: AdaptiveFactorState[]
+  updated_at: number
+}
+
 export interface Position {
   symbol: string
   side: string
@@ -40,6 +102,7 @@ export interface Position {
   unrealized_pnl_pct: number
   liquidation_price: number
   margin_used: number
+  telemetry?: FactorTelemetry[]
 }
 
 export interface DecisionAction {
@@ -48,10 +111,10 @@ export interface DecisionAction {
   quantity: number
   leverage: number
   price: number
-  stop_loss?: number      // Stop loss price
-  take_profit?: number    // Take profit price
-  confidence?: number     // AI confidence (0-100)
-  reasoning?: string      // Brief reasoning
+  stop_loss?: number // Stop loss price
+  take_profit?: number // Take profit price
+  confidence?: number // AI confidence (0-100)
+  reasoning?: string // Brief reasoning
   order_id: number
   timestamp: string
   success: boolean
@@ -131,10 +194,10 @@ export interface TraderConfigData {
   trader_name: string
   ai_model: string
   exchange_id: string
-  strategy_id?: string  // 策略ID
-  strategy_name?: string  // 策略名称
+  strategy_id?: string // 策略ID
+  strategy_name?: string // 策略名称
   is_cross_margin: boolean
-  show_in_competition: boolean  // 是否在竞技场显示
+  show_in_competition: boolean // 是否在竞技场显示
   scan_interval_minutes: number
   initial_balance: number
   is_running: boolean
@@ -170,6 +233,7 @@ export interface HistoricalPosition {
   leverage: number
   status: string
   close_reason: string
+  telemetry?: FactorTelemetry[]
   created_at: string
   updated_at: string
 }
@@ -247,4 +311,92 @@ export interface GridRiskInfo {
   // Breakout state
   breakout_level: string
   breakout_direction: string
+}
+
+export interface CandidateDonchianBox {
+  period: number
+  upper: number
+  lower: number
+  mid: number
+  state: string
+}
+
+export interface CandidateEmaSignals {
+  state:
+    | 'bullish_stack'
+    | 'bearish_stack'
+    | 'mixed'
+    | 'single_ema'
+    | 'unavailable'
+  values?: Record<number, number>
+  periods?: number[]
+}
+
+export interface CandidateTrendContext {
+  timeframe: string
+  rsi?: number
+  macd?: number
+  macd_state?: string
+  ema_state?: CandidateEmaSignals['state'] | string
+  donchian_state?: string
+  donchian_period?: number
+}
+
+export interface CandidateMarketItem {
+  symbol: string
+  current_price: number
+  timeframes: string[]
+  donchian_boxes?: Record<string, CandidateDonchianBox>
+  trend_contexts?: Record<string, CandidateTrendContext>
+  ema_signals: CandidateEmaSignals
+  open_interest?: {
+    Latest: number
+    Average: number
+    sample_count?: number
+    period?: string
+  }
+  orderbook?: {
+    bid_total: number
+    ask_total: number
+    imbalance: number
+  }
+  dex_screener?: {
+    chain_id?: string
+    pair_address?: string
+    pair_url?: string
+    liquidity_usd: number
+    volume_h1: number
+    buy_txns_h1: number
+    sell_txns_h1: number
+    buy_ratio: number
+    buy_sell_ratio: number
+    cex_volume_h1: number
+    onchain_to_cex_ratio: number
+  }
+  gecko_sentiment?: {
+    coin_id?: string
+    public_interest_score: number
+    sentiment_votes_up_percentage: number
+    using_private_key?: boolean
+    cached_at?: string
+  }
+  heat_score?: {
+    composite_score: number
+    trading_score: number
+    quant_score: number
+    source_weights?: Record<string, number>
+  }
+  vol_utilization?: number
+  vol_util_basis?: string
+  funding_rate?: number
+  ai500_score?: number | null
+  sources?: string[]
+  updated_at: string
+}
+
+export interface CandidateSnapshotResponse {
+  trader_id: string
+  trader_name: string
+  updated_at: string
+  candidates: CandidateMarketItem[]
 }

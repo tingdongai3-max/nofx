@@ -37,6 +37,7 @@ export function LandingPage() {
         onPageChange={(page) => {
           const pathMap: Record<string, string> = {
             'data': '/data',
+            'lab': '/lab',
             'competition': '/competition',
             'strategy-market': '/strategy-market',
             'traders': '/traders',

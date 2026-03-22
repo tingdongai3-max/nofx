@@ -169,3 +169,23 @@ Then:
 - otherwise: `fetchCount = userCount + maxWarmup`
 
 This allows the backend to fetch enough history for convergence while still trimming the prompt window back to the exact user-configured length.
+
+## CoinGecko Key Routing
+
+CoinGecko sentiment retrieval now follows a private-first routing model:
+
+1. Try the private demo key through the standard `api.coingecko.com` endpoint.
+2. If the private request returns `401` or `429`, retry the same request without the key.
+3. Keep the result in a 15-minute in-memory cache so 5-minute trader loops do not burn quota on repeated requests for the same symbol.
+
+### Security Note
+
+The current implementation uses a hardcoded demo key only as a temporary infrastructure step.
+
+For production deployment, move the CoinGecko key into:
+
+- `.env`
+- `config.yaml`
+- or another secret-management layer
+
+The application should read it from environment/config instead of keeping the credential in source control.

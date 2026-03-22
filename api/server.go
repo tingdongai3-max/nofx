@@ -173,6 +173,15 @@ Body: {"show_in_competition":<bool>}`,
 			s.routeWithSchema(protected, "GET", "/traders/:id/grid-risk", "Get grid trading risk info",
 				`:id = trader_id from GET /api/my-traders.`,
 				s.handleGetGridRiskInfo)
+			s.routeWithSchema(protected, "GET", "/trader/candidates", "Get the latest candidate-coin snapshot for a trader",
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>. Returns the latest in-memory market snapshot from the trader's most recent AI cycle.`,
+				s.handleTraderCandidates)
+			s.routeWithSchema(protected, "GET", "/shadow-snapshots", "Get recent shadow snapshots for a trader",
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&limit=<optional, default 200>. Returns recent T0 candidate snapshots and their T+15m realized returns.`,
+				s.handleShadowSnapshots)
+			s.routeWithSchema(protected, "GET", "/adaptive-weights", "Get current adaptive IC weights for a trader",
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&symbol=<optional>&sector=<optional>. Returns the hierarchical sector+coin IC state, shrinkage alpha, sample counts, and effective factor weights used by the heat scoring engine.`,
+				s.handleAdaptiveWeights)
 
 			// AI cost tracking
 			s.route(protected, "GET", "/ai-costs", "Get AI call costs for a trader (?trader_id=xxx&period=today)", s.handleGetAICosts)

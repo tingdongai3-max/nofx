@@ -14,7 +14,8 @@ import { LandingPage } from './pages/LandingPage'
 import { FAQPage } from './pages/FAQPage'
 import { StrategyStudioPage } from './pages/StrategyStudioPage'
 import { StrategyMarketPage } from './pages/StrategyMarketPage'
-import { DataPage } from './pages/DataPage'
+import { CandidateDashboardPage } from './pages/CandidateDashboardPage'
+import { DataLabPage } from './pages/DataLabPage'
 import { LoginRequiredOverlay } from './components/auth/LoginRequiredOverlay'
 import HeaderBar from './components/common/HeaderBar'
 import { LanguageProvider, useLanguage } from './contexts/LanguageContext'
@@ -42,6 +43,7 @@ type Page =
   | 'strategy'
   | 'strategy-market'
   | 'data'
+  | 'lab'
   | 'faq'
   | 'login'
   | 'register'
@@ -67,7 +69,8 @@ export function App() {
     if (path === '/traders' || hash === 'traders') return 'traders'
     if (path === '/strategy' || hash === 'strategy') return 'strategy'
     if (path === '/strategy-market' || hash === 'strategy-market') return 'strategy-market'
-    if (path === '/data' || hash === 'data') return 'data'
+    if (path === '/data' || path === '/candidate-data' || hash === 'data') return 'data'
+    if (path === '/lab' || hash === 'lab') return 'lab'
     if (path === '/dashboard' || hash === 'trader' || hash === 'details')
       return 'trader'
     return 'competition' // 默认为竞赛页面
@@ -87,7 +90,8 @@ export function App() {
     const pathMap: Record<Page, string> = {
       'competition': '/competition',
       'strategy-market': '/strategy-market',
-      'data': '/data',
+      'data': '/candidate-data',
+      'lab': '/lab',
       'traders': '/traders',
       'trader': '/dashboard',
       'strategy': '/strategy',
@@ -148,8 +152,10 @@ export function App() {
         setCurrentPage('strategy')
       } else if (path === '/strategy-market' || hash === 'strategy-market') {
         setCurrentPage('strategy-market')
-      } else if (path === '/data' || hash === 'data') {
+      } else if (path === '/data' || path === '/candidate-data' || hash === 'data') {
         setCurrentPage('data')
+      } else if (path === '/lab' || hash === 'lab') {
+        setCurrentPage('lab')
       } else if (
         path === '/dashboard' ||
         hash === 'trader' ||
@@ -307,6 +313,10 @@ export function App() {
       setCurrentPage('competition')
     } else if (route === '/traders') {
       setCurrentPage('traders')
+    } else if (route === '/candidate-data' || route === '/data') {
+      setCurrentPage('data')
+    } else if (route === '/lab') {
+      setCurrentPage('lab')
     } else if (route === '/dashboard') {
       setCurrentPage('trader')
     }
@@ -431,10 +441,14 @@ export function App() {
     )
   }
   // Data page - publicly accessible with embedded dashboard
-  if (route === '/data') {
+  if (route === '/data' || route === '/candidate-data') {
+    if (!user || !token) {
+      return <LandingPage />
+    }
     const dataPageNavigate = (page: Page) => {
       const pathMap: Record<string, string> = {
-        'data': '/data',
+        'data': '/candidate-data',
+        'lab': '/lab',
         'competition': '/competition',
         'strategy-market': '/strategy-market',
         'traders': '/traders',
@@ -463,7 +477,85 @@ export function App() {
           onPageChange={dataPageNavigate}
         />
         <main className="pt-16">
-          <DataPage />
+          <CandidateDashboardPage
+            language={language}
+            selectedTrader={selectedTrader}
+            selectedTraderId={selectedTraderId}
+            traders={traders}
+            onTraderSelect={(traderId) => {
+              setSelectedTraderId(traderId)
+              const url = new URL(window.location.href)
+              const trader = traders?.find((t) => t.trader_id === traderId)
+              if (trader) {
+                url.searchParams.set('trader', getTraderSlug(trader))
+              } else {
+                url.searchParams.delete('trader')
+              }
+              window.history.replaceState({}, '', url.toString())
+            }}
+          />
+        </main>
+        <LoginRequiredOverlay
+          isOpen={loginOverlayOpen}
+          onClose={() => setLoginOverlayOpen(false)}
+          featureName={loginOverlayFeature}
+        />
+      </div>
+    )
+  }
+  if (route === '/lab') {
+    if (!user || !token) {
+      return <LandingPage />
+    }
+    const labPageNavigate = (page: Page) => {
+      const pathMap: Record<string, string> = {
+        'data': '/candidate-data',
+        'lab': '/lab',
+        'competition': '/competition',
+        'strategy-market': '/strategy-market',
+        'traders': '/traders',
+        'trader': '/dashboard',
+        'strategy': '/strategy',
+        'faq': '/faq',
+      }
+      const path = pathMap[page]
+      if (path) {
+        window.location.href = path
+      }
+    }
+    return (
+      <div
+        className="min-h-screen"
+        style={{ background: '#0B0E11', color: '#EAECEF' }}
+      >
+        <HeaderBar
+          isLoggedIn={!!user}
+          currentPage="lab"
+          language={language}
+          onLanguageChange={setLanguage}
+          user={user}
+          onLogout={logout}
+          onLoginRequired={handleLoginRequired}
+          onPageChange={labPageNavigate}
+        />
+        <main className="pt-16">
+          <DataLabPage
+            language={language}
+            selectedTrader={selectedTrader}
+            selectedTraderId={selectedTraderId}
+            traders={traders}
+            onTraderSelect={(traderId) => {
+              setSelectedTraderId(traderId)
+              const url = new URL(window.location.href)
+              const trader = traders?.find((t) => t.trader_id === traderId)
+              if (trader) {
+                url.searchParams.set('trader', getTraderSlug(trader))
+              } else {
+                url.searchParams.delete('trader')
+              }
+              window.history.replaceState({}, '', url.toString())
+            }}
+          />
         </main>
         <LoginRequiredOverlay
           isOpen={loginOverlayOpen}
@@ -512,7 +604,37 @@ export function App() {
             {currentPage === 'competition' ? (
               <CompetitionPage />
             ) : currentPage === 'data' ? (
-              <DataPage />
+              <CandidateDashboardPage
+                language={language}
+                selectedTrader={selectedTrader}
+                selectedTraderId={selectedTraderId}
+                traders={traders}
+                onTraderSelect={(traderId) => {
+                  setSelectedTraderId(traderId)
+                  const trader = traders?.find(t => t.trader_id === traderId)
+                  if (trader) {
+                    const url = new URL(window.location.href)
+                    url.searchParams.set('trader', getTraderSlug(trader))
+                    window.history.replaceState({}, '', url.toString())
+                  }
+                }}
+              />
+            ) : currentPage === 'lab' ? (
+              <DataLabPage
+                language={language}
+                selectedTrader={selectedTrader}
+                selectedTraderId={selectedTraderId}
+                traders={traders}
+                onTraderSelect={(traderId) => {
+                  setSelectedTraderId(traderId)
+                  const trader = traders?.find(t => t.trader_id === traderId)
+                  if (trader) {
+                    const url = new URL(window.location.href)
+                    url.searchParams.set('trader', getTraderSlug(trader))
+                    window.history.replaceState({}, '', url.toString())
+                  }
+                }}
+              />
             ) : currentPage === 'strategy-market' ? (
               <StrategyMarketPage />
             ) : currentPage === 'traders' ? (

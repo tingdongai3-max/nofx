@@ -170,8 +170,8 @@ func sanitizePeriods(periods []int) []int {
 }
 
 func normalizedIndicatorConfig(config *store.IndicatorConfig) store.IndicatorConfig {
+	defaults := store.GetDefaultStrategyConfig("en").Indicators
 	if config == nil {
-		defaults := store.GetDefaultStrategyConfig("en").Indicators
 		defaults.EMAPeriods = sanitizePeriods(defaults.EMAPeriods)
 		defaults.RSIPeriods = sanitizePeriods(defaults.RSIPeriods)
 		defaults.ATRPeriods = sanitizePeriods(defaults.ATRPeriods)
@@ -181,6 +181,21 @@ func normalizedIndicatorConfig(config *store.IndicatorConfig) store.IndicatorCon
 	}
 
 	normalized := *config
+	if normalized.EnableEMA && len(normalized.EMAPeriods) == 0 {
+		normalized.EMAPeriods = append([]int(nil), defaults.EMAPeriods...)
+	}
+	if normalized.EnableRSI && len(normalized.RSIPeriods) == 0 {
+		normalized.RSIPeriods = append([]int(nil), defaults.RSIPeriods...)
+	}
+	if normalized.EnableATR && len(normalized.ATRPeriods) == 0 {
+		normalized.ATRPeriods = append([]int(nil), defaults.ATRPeriods...)
+	}
+	if normalized.EnableBOLL && len(normalized.BOLLPeriods) == 0 {
+		normalized.BOLLPeriods = append([]int(nil), defaults.BOLLPeriods...)
+	}
+	if normalized.EnableDonchianBox && len(normalized.DonchianPeriods) == 0 {
+		normalized.DonchianPeriods = append([]int(nil), defaults.DonchianPeriods...)
+	}
 	normalized.EMAPeriods = sanitizePeriods(normalized.EMAPeriods)
 	normalized.RSIPeriods = sanitizePeriods(normalized.RSIPeriods)
 	normalized.ATRPeriods = sanitizePeriods(normalized.ATRPeriods)
@@ -228,10 +243,13 @@ func CalculateRequiredFetchCount(config store.IndicatorConfig, userCount int) in
 	}
 
 	if maxWarmup == 0 {
+		logger.Infof("📐 Indicator fetch sizing: display=%d warmup=%d fetch=%d", userCount, 0, userCount)
 		return userCount
 	}
 
-	return max(userCount, userCount+maxWarmup)
+	fetchCount := max(userCount, userCount+maxWarmup)
+	logger.Infof("📐 Indicator fetch sizing: display=%d warmup=%d fetch=%d", userCount, maxWarmup, fetchCount)
+	return fetchCount
 }
 
 func buildIndicatorSnapshot(klines []Kline, config store.IndicatorConfig) IndicatorResult {
@@ -324,13 +342,11 @@ func calculateTimeframeSeries(klines []Kline, timeframe string, count int, indic
 		data.Indicators.MACD = make([]float64, 0, count)
 	}
 
-	// Get latest N data points based on count from config
-	start := len(klines) - count
-	if start < 0 {
-		start = 0
-	}
-
-	for i := start; i < len(klines); i++ {
+	// Compute indicators over the full fetched window first, then trim the visible
+	// series to the user-requested display count. This keeps long lookback factors
+	// (for example Donchian500 or EMA200) available even when the prompt only shows
+	// the latest 10 candles.
+	for i := 0; i < len(klines); i++ {
 		// Store full OHLCV kline data
 		data.Klines = append(data.Klines, KlineBar{
 			Time:   klines[i].OpenTime,
@@ -401,7 +417,44 @@ func calculateTimeframeSeries(klines []Kline, timeframe string, count int, indic
 		}
 	}
 
+	data.Klines = trimKlineBars(data.Klines, count)
+	data.MidPrices = trimFloatSlice(data.MidPrices, count)
+	data.Volume = trimFloatSlice(data.Volume, count)
+	for period, values := range data.Indicators.EMAs {
+		data.Indicators.EMAs[period] = trimFloatSlice(values, count)
+	}
+	data.Indicators.MACD = trimFloatSlice(data.Indicators.MACD, count)
+	for period, values := range data.Indicators.RSIs {
+		data.Indicators.RSIs[period] = trimFloatSlice(values, count)
+	}
+	for period, series := range data.Indicators.Bolls {
+		series.Upper = trimFloatSlice(series.Upper, count)
+		series.Middle = trimFloatSlice(series.Middle, count)
+		series.Lower = trimFloatSlice(series.Lower, count)
+		data.Indicators.Bolls[period] = series
+	}
+	for period, series := range data.Indicators.Donchians {
+		series.Upper = trimFloatSlice(series.Upper, count)
+		series.Lower = trimFloatSlice(series.Lower, count)
+		series.Mid = trimFloatSlice(series.Mid, count)
+		data.Indicators.Donchians[period] = series
+	}
+
 	return data
+}
+
+func trimFloatSlice(values []float64, count int) []float64 {
+	if count <= 0 || len(values) <= count {
+		return values
+	}
+	return values[len(values)-count:]
+}
+
+func trimKlineBars(values []KlineBar, count int) []KlineBar {
+	if count <= 0 || len(values) <= count {
+		return values
+	}
+	return values[len(values)-count:]
 }
 
 // calculatePriceChangeByBars calculates how many K-lines to look back for price change based on timeframe
