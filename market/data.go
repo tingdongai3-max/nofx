@@ -164,14 +164,37 @@ func GetWithExchangeForScope(weightScope, symbol, exchange string, indicatorConf
 // primaryTimeframe: primary timeframe (used for calculating current indicators), defaults to timeframes[0]
 // count: number of K-lines for each timeframe
 func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe string, count int, indicatorConfig *store.IndicatorConfig) (*Data, error) {
-	return GetWithTimeframesForScope("", symbol, timeframes, primaryTimeframe, count, indicatorConfig)
+	return GetWithTimeframesAtForScope("", symbol, timeframes, primaryTimeframe, count, indicatorConfig, time.Time{})
 }
 
 // GetWithTimeframesForScope retrieves market data using adaptive weights from the provided scope.
 func GetWithTimeframesForScope(weightScope, symbol string, timeframes []string, primaryTimeframe string, count int, indicatorConfig *store.IndicatorConfig) (*Data, error) {
+	return GetWithTimeframesAtForScope(weightScope, symbol, timeframes, primaryTimeframe, count, indicatorConfig, time.Time{})
+}
+
+// NormalizePriceSnapshotTime snaps any runtime to the minute boundary used for the
+// "previous fully closed 1m candle" snapshot. A decision that fires at 16:03:00 uses
+// the candle that opened at 16:02:00 and closed at 16:03:00.
+func NormalizePriceSnapshotTime(snapshotTime time.Time) time.Time {
+	if snapshotTime.IsZero() {
+		snapshotTime = time.Now().UTC()
+	}
+	return snapshotTime.UTC().Truncate(time.Minute)
+}
+
+// GetWithTimeframesAt retrieves market data and forces CurrentPrice to the latest fully
+// closed 1m candle before snapshotTime.
+func GetWithTimeframesAt(symbol string, timeframes []string, primaryTimeframe string, count int, indicatorConfig *store.IndicatorConfig, snapshotTime time.Time) (*Data, error) {
+	return GetWithTimeframesAtForScope("", symbol, timeframes, primaryTimeframe, count, indicatorConfig, snapshotTime)
+}
+
+// GetWithTimeframesAtForScope retrieves market data using adaptive weights from the provided scope
+// and forces CurrentPrice to the previous minute 1m close aligned to snapshotTime.
+func GetWithTimeframesAtForScope(weightScope, symbol string, timeframes []string, primaryTimeframe string, count int, indicatorConfig *store.IndicatorConfig, snapshotTime time.Time) (*Data, error) {
 	symbol = Normalize(symbol)
 	config := normalizedIndicatorConfig(indicatorConfig)
 	fetchCount := CalculateRequiredFetchCount(config, count)
+	priceSnapshotAt := NormalizePriceSnapshotTime(snapshotTime)
 
 	if len(timeframes) == 0 {
 		return nil, fmt.Errorf("at least one timeframe is required")
@@ -252,7 +275,10 @@ func GetWithTimeframesForScope(weightScope, symbol string, timeframes []string, 
 	}
 
 	// Calculate current indicators (based on primary timeframe latest data)
-	currentPrice := primaryKlines[len(primaryKlines)-1].Close
+	currentPrice, err := getAlignedMinuteSnapshotPrice(symbol, isXyzAsset, priceSnapshotAt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get aligned 1m snapshot price: %w", err)
+	}
 	currentIndicators := buildIndicatorSnapshot(primaryKlines, config)
 
 	// Calculate price changes
@@ -267,6 +293,7 @@ func GetWithTimeframesForScope(weightScope, symbol string, timeframes []string, 
 		Symbol:                symbol,
 		Sector:                DetermineSector(symbol, supplemental.cexVolumeH1, supplemental.geckoSocial),
 		CurrentPrice:          currentPrice,
+		CurrentPriceAt:        priceSnapshotAt,
 		PriceChange1h:         priceChange1h,
 		PriceChange4h:         priceChange4h,
 		Indicators:            currentIndicators,
@@ -282,6 +309,83 @@ func GetWithTimeframesForScope(weightScope, symbol string, timeframes []string, 
 	data.HeatScore = buildHeatScore(weightScope, symbol, data, supplemental.quantData, time.Now().UTC())
 
 	return data, nil
+}
+
+func getAlignedMinuteSnapshotPrice(symbol string, isXyzAsset bool, snapshotTime time.Time) (float64, error) {
+	snapshotTime = NormalizePriceSnapshotTime(snapshotTime)
+	targetOpen := snapshotTime.Add(-1 * time.Minute).UnixMilli()
+	var fallback float64
+	hasFallback := false
+	retryUntil := snapshotTime.Add(5 * time.Second)
+
+	for attempt := 0; attempt < 20; attempt++ {
+		var (
+			klines []Kline
+			err    error
+		)
+
+		if isXyzAsset {
+			klines, err = getKlinesFromHyperliquid(symbol, "1m", 5)
+		} else {
+			start := snapshotTime.Add(-2 * time.Minute)
+			end := snapshotTime.Add(1 * time.Minute)
+			klines, err = GetKlinesRange(symbol, "1m", start, end)
+		}
+		if err != nil {
+			return 0, err
+		}
+
+		exactClose, fallbackClose, foundExact, foundFallback := locateAlignedMinuteClose(klines, targetOpen, snapshotTime)
+		if foundExact {
+			return exactClose, nil
+		}
+		if foundFallback {
+			fallback = fallbackClose
+			hasFallback = true
+		}
+
+		if time.Now().UTC().After(retryUntil) {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	if hasFallback {
+		return fallback, nil
+	}
+	return 0, fmt.Errorf("no 1m close found for snapshot %s", snapshotTime.Format(time.RFC3339))
+}
+
+func findAlignedMinuteClose(klines []Kline, targetOpen int64, snapshotTime time.Time) (float64, error) {
+	exactClose, fallbackClose, foundExact, foundFallback := locateAlignedMinuteClose(klines, targetOpen, snapshotTime)
+	if foundExact {
+		return exactClose, nil
+	}
+	if foundFallback {
+		return fallbackClose, nil
+	}
+	return 0, fmt.Errorf("no 1m close found for snapshot %s", snapshotTime.Format(time.RFC3339))
+}
+
+func locateAlignedMinuteClose(klines []Kline, targetOpen int64, snapshotTime time.Time) (float64, float64, bool, bool) {
+	for _, kline := range klines {
+		if kline.OpenTime == targetOpen && kline.Close > 0 {
+			return kline.Close, 0, true, false
+		}
+	}
+
+	snapshotMs := snapshotTime.UnixMilli()
+	var fallback *Kline
+	for i := range klines {
+		kline := klines[i]
+		if kline.OpenTime < snapshotMs && kline.Close > 0 {
+			fallback = &kline
+		}
+	}
+	if fallback != nil {
+		return 0, fallback.Close, false, true
+	}
+	return 0, 0, false, false
 }
 
 func fetchQuantDataForHeat(symbol string, config store.IndicatorConfig) *nofxos.QuantData {

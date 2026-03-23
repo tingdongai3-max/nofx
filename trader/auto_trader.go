@@ -136,12 +136,15 @@ type AutoTrader struct {
 	lastResetTime         time.Time
 	stopUntil             time.Time
 	isRunning             bool
-	isRunningMutex        sync.RWMutex       // Mutex to protect isRunning flag
-	startTime             time.Time          // System start time
-	callCount             int                // AI call count
-	positionFirstSeenTime map[string]int64   // Position first seen time (symbol_side -> timestamp in milliseconds)
-	stopMonitorCh         chan struct{}      // Used to stop monitoring goroutine
-	monitorWg             sync.WaitGroup     // Used to wait for monitoring goroutine to finish
+	isRunningMutex        sync.RWMutex     // Mutex to protect isRunning flag
+	stateMu               sync.RWMutex     // Protects cycle counters and trader runtime state
+	startTime             time.Time        // System start time
+	callCount             int              // AI call count
+	positionFirstSeenTime map[string]int64 // Position first seen time (symbol_side -> timestamp in milliseconds)
+	positionFirstSeenMu   sync.RWMutex
+	stopMonitorCh         chan struct{}  // Used to stop monitoring goroutine
+	monitorWg             sync.WaitGroup // Used to wait for monitoring goroutine to finish
+	activeCycleWg         sync.WaitGroup
 	peakPnLCache          map[string]float64 // Peak profit cache (symbol -> peak P&L percentage)
 	peakPnLCacheMutex     sync.RWMutex       // Cache read-write lock
 	lastBalanceSyncTime   time.Time          // Last balance sync time
@@ -174,6 +177,7 @@ type CandidateDebugBinStats struct {
 
 type CandidateMarketSnapshot struct {
 	Symbol        string                  `json:"symbol"`
+	Sector        string                  `json:"sector,omitempty"`
 	CurrentPrice  float64                 `json:"current_price"`
 	LogicScore    float64                 `json:"logic_score"`
 	Bias          string                  `json:"bias,omitempty"`
@@ -182,11 +186,12 @@ type CandidateMarketSnapshot struct {
 }
 
 type CandidateSnapshot struct {
-	TraderID    string                    `json:"trader_id"`
-	TraderName  string                    `json:"trader_name"`
-	UpdatedAt   time.Time                 `json:"updated_at"`
-	ScoreEngine string                    `json:"score_engine"`
-	Candidates  []CandidateMarketSnapshot `json:"candidates"`
+	TraderID        string                    `json:"trader_id"`
+	TraderName      string                    `json:"trader_name"`
+	UpdatedAt       time.Time                 `json:"updated_at"`
+	PriceSnapshotAt time.Time                 `json:"price_snapshot_at,omitempty"`
+	ScoreEngine     string                    `json:"score_engine"`
+	Candidates      []CandidateMarketSnapshot `json:"candidates"`
 }
 
 // NewAutoTrader creates an automatic trader
@@ -514,20 +519,9 @@ func (at *AutoTrader) Run() error {
 		}
 	}
 
-	// Execute immediately on first run
-	if isGridStrategy {
-		if err := at.RunGridCycle(); err != nil {
-			logger.Infof("❌ Grid execution failed: %v", err)
-		}
-	} else {
-		if err := at.runCycle(); err != nil {
-			logger.Infof("❌ Execution failed: %v", err)
-		}
-	}
-
-	nextDelay, nextTick := calculateNextAlignment(at.config.ScanInterval, store.DefaultCandleCloseOffset)
-	logger.Infof("🕒 [%s] Next aligned decision scheduled at %s (interval: %v, offset: %v)",
-		at.name, nextTick.Format("2006-01-02 15:04:05"), at.config.ScanInterval, store.DefaultCandleCloseOffset)
+	nextDelay, nextTick := calculateNextAlignment(at.config.ScanInterval)
+	logger.Infof("🕒 [%s] Next aligned decision scheduled at %s (interval: %v)",
+		at.name, nextTick.Format(time.RFC3339), at.config.ScanInterval)
 	timer := time.NewTimer(nextDelay)
 	defer timer.Stop()
 
@@ -542,20 +536,19 @@ func (at *AutoTrader) Run() error {
 
 		select {
 		case <-timer.C:
+			scheduledTick := nextTick
+			nextDelay, nextTick = calculateNextAlignmentFrom(scheduledTick, at.config.ScanInterval)
+			logger.Infof("🕒 [%s] Next aligned decision scheduled at %s (interval: %v)",
+				at.name, nextTick.Format(time.RFC3339), at.config.ScanInterval)
+			timer.Reset(nextDelay)
+
 			if isGridStrategy {
 				if err := at.RunGridCycle(); err != nil {
 					logger.Infof("❌ Grid execution failed: %v", err)
 				}
 			} else {
-				if err := at.runCycle(); err != nil {
-					logger.Infof("❌ Execution failed: %v", err)
-				}
+				at.startAICycle(scheduledTick)
 			}
-
-			nextDelay, nextTick = calculateNextAlignment(at.config.ScanInterval, store.DefaultCandleCloseOffset)
-			logger.Infof("🕒 [%s] Next aligned decision scheduled at %s (interval: %v, offset: %v)",
-				at.name, nextTick.Format("2006-01-02 15:04:05"), at.config.ScanInterval, store.DefaultCandleCloseOffset)
-			timer.Reset(nextDelay)
 		case <-at.stopMonitorCh:
 			if !timer.Stop() {
 				select {
@@ -571,6 +564,16 @@ func (at *AutoTrader) Run() error {
 	return nil
 }
 
+func (at *AutoTrader) startAICycle(tickTime time.Time) {
+	at.activeCycleWg.Add(1)
+	go func() {
+		defer at.activeCycleWg.Done()
+		if err := at.runCycle(tickTime); err != nil {
+			logger.Infof("❌ Execution failed: %v", err)
+		}
+	}()
+}
+
 // Stop stops the automatic trading
 func (at *AutoTrader) Stop() {
 	at.isRunningMutex.Lock()
@@ -583,6 +586,7 @@ func (at *AutoTrader) Stop() {
 
 	close(at.stopMonitorCh) // Notify monitoring goroutine to stop
 	at.monitorWg.Wait()     // Wait for monitoring goroutine to finish
+	at.activeCycleWg.Wait()
 	logger.Info("⏹ Automatic trading system stopped")
 }
 

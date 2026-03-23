@@ -94,6 +94,8 @@ type Context struct {
 	CurrentTime        string                             `json:"current_time"`
 	RuntimeMinutes     int                                `json:"runtime_minutes"`
 	CallCount          int                                `json:"call_count"`
+	DecisionTime       time.Time                          `json:"-"`
+	PriceSnapshotAt    time.Time                          `json:"-"`
 	Account            AccountInfo                        `json:"account"`
 	Positions          []PositionInfo                     `json:"positions"`
 	CandidateCoins     []CandidateCoin                    `json:"candidate_coins"`
@@ -119,6 +121,7 @@ type PerformanceBinMatrices struct {
 }
 
 type PerformanceBinProvider func(traderID, sector, symbol string) (*PerformanceBinMatrices, error)
+type AdaptiveWeightStateProvider func(traderID, sector, symbol string) market.AdaptiveWeightState
 
 // Decision AI trading decision
 type Decision struct {
@@ -194,6 +197,7 @@ type StrategyEngine struct {
 	config                 *store.StrategyConfig
 	nofxosClient           *nofxos.Client
 	performanceBinProvider PerformanceBinProvider
+	adaptiveWeightProvider AdaptiveWeightStateProvider
 }
 
 // NewStrategyEngine creates strategy execution engine
@@ -236,6 +240,10 @@ func (e *StrategyEngine) GetConfig() *store.StrategyConfig {
 
 func (e *StrategyEngine) SetPerformanceBinProvider(provider PerformanceBinProvider) {
 	e.performanceBinProvider = provider
+}
+
+func (e *StrategyEngine) SetAdaptiveWeightStateProvider(provider AdaptiveWeightStateProvider) {
+	e.adaptiveWeightProvider = provider
 }
 
 // ============================================================================

@@ -14,19 +14,33 @@ import (
 var (
 	// Simple RE2 patterns only: fixed tokens plus optional whitespace and digits.
 	// No nested repetition, so there is no backtracking blow-up risk here.
-	reasoningBinPattern     = regexp.MustCompile(`(?i)(bin|ban|区间)\s*\d+`)
-	reasoningEVLongPattern  = regexp.MustCompile(`(?i)\bEV_L\b`)
-	reasoningEVShortPattern = regexp.MustCompile(`(?i)\bEV_S\b`)
-	reasoningPFLongPattern  = regexp.MustCompile(`(?i)\bPF_L\b`)
-	reasoningPFShortPattern = regexp.MustCompile(`(?i)\bPF_S\b`)
+	reasoningBinPattern      = regexp.MustCompile(`(?i)(bin|ban|区间)\s*\d+`)
+	reasoningEVLongPattern   = regexp.MustCompile(`(?i)\bEV_L\b`)
+	reasoningEVShortPattern  = regexp.MustCompile(`(?i)\bEV_S\b`)
+	reasoningPFLongPattern   = regexp.MustCompile(`(?i)\bPF_L\b`)
+	reasoningPFShortPattern  = regexp.MustCompile(`(?i)\bPF_S\b`)
+	reasoningPnLPattern      = regexp.MustCompile(`(?i)\bPnL\b|盈亏|浮亏|浮盈|亏损|盈利`)
+	reasoningOIPattern       = regexp.MustCompile(`(?i)\bOI\b|持仓量`)
+	reasoningPricePattern    = regexp.MustCompile(`(?i)\bprice\b|价格|entry|current|高点|低点`)
+	reasoningFlowPattern     = regexp.MustCompile(`(?i)\bflow\b|\bnetflow\b|资金流|资金流入|资金流出|流入|流出|大单`)
+	reasoningStatsPattern    = regexp.MustCompile(`(?i)\bN\s*[<≤]\s*\d+|\bN<\d+|样本(?:量)?不足|EV(?:_L|_S)?\s*[≈~=<>]+\s*0|PF(?:_L|_S)?\s*(?:<|<=)\s*1(?:\.2+)?|期望值|盈利因子|不满足(?:开仓)?条件|insufficiency`)
+	reasoningDrawdownPattern = regexp.MustCompile(`(?i)\bdrawdown\b|回撤|止损|止盈`)
+	reasoningNumberPattern   = regexp.MustCompile(`[+\-]?\d`)
 )
 
 type reasoningCitationEvidence struct {
-	binRef     string
-	hasEVLong  bool
-	hasEVShort bool
-	hasPFLong  bool
-	hasPFShort bool
+	binRef      string
+	hasEVLong   bool
+	hasEVShort  bool
+	hasPFLong   bool
+	hasPFShort  bool
+	hasPnL      bool
+	hasOI       bool
+	hasPrice    bool
+	hasFlow     bool
+	hasStats    bool
+	hasDrawdown bool
+	hasNumber   bool
 }
 
 func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64) error {
@@ -158,12 +172,12 @@ func validateReasoningCitation(d *Decision, reasoning string) error {
 	}
 
 	evidence := extractReasoningCitationEvidence(reasoning)
-	if evidence.binRef == "" {
-		return fmt.Errorf("reasoning must cite the referenced Bin/Ban/区间 score")
-	}
 
 	switch d.Action {
 	case "open_long":
+		if evidence.binRef == "" {
+			return fmt.Errorf("reasoning must cite the referenced Bin/Ban/区间 score")
+		}
 		if evidence.hasLongSideEvidence() {
 			return nil
 		}
@@ -172,6 +186,9 @@ func validateReasoningCitation(d *Decision, reasoning string) error {
 		}
 		logReasoningPending(d, evidence, reasoning, "open_long expects EV_L and PF_L; allowing pending-zone pass")
 	case "open_short":
+		if evidence.binRef == "" {
+			return fmt.Errorf("reasoning must cite the referenced Bin/Ban/区间 score")
+		}
 		if evidence.hasShortSideEvidence() {
 			return nil
 		}
@@ -179,7 +196,32 @@ func validateReasoningCitation(d *Decision, reasoning string) error {
 			return fmt.Errorf("open_short reasoning must cite current-side EV_S and PF_S for %s", evidence.binRef)
 		}
 		logReasoningPending(d, evidence, reasoning, "open_short expects EV_S and PF_S; allowing pending-zone pass")
+	case "close_long", "close_short", "hold":
+		if evidence.binRef != "" {
+			if !evidence.hasAnyMetric() && !evidence.hasManagementEvidence() {
+				logReasoningPending(d, evidence, reasoning, "management action cited score bin without EV/PF or risk metrics; allowing pass")
+			}
+			return nil
+		}
+		if evidence.hasManagementEvidence() {
+			return nil
+		}
+		return fmt.Errorf("management reasoning must cite either Bin/Ban/区间 score or risk evidence (PnL/OI/price/flow/drawdown)")
+	case "wait":
+		if evidence.binRef != "" {
+			if !evidence.hasAnyMetric() && !evidence.hasManagementEvidence() && !evidence.hasStatisticalEvidence() {
+				logReasoningPending(d, evidence, reasoning, "wait cited score bin without EV/PF, risk, or stats tokens; allowing pass")
+			}
+			return nil
+		}
+		if evidence.hasManagementEvidence() || evidence.hasStatisticalEvidence() {
+			return nil
+		}
+		return fmt.Errorf("wait reasoning must cite either Bin/Ban/区间 score, risk evidence, or statistical insufficiency")
 	default:
+		if evidence.binRef == "" {
+			return fmt.Errorf("reasoning must cite the referenced Bin/Ban/区间 score")
+		}
 		if !evidence.hasAnyMetric() {
 			logReasoningPending(d, evidence, reasoning, "score bin cited without EV/PF tokens; allowing pending-zone pass")
 		}
@@ -190,11 +232,18 @@ func validateReasoningCitation(d *Decision, reasoning string) error {
 
 func extractReasoningCitationEvidence(reasoning string) reasoningCitationEvidence {
 	return reasoningCitationEvidence{
-		binRef:     reasoningBinPattern.FindString(reasoning),
-		hasEVLong:  reasoningEVLongPattern.MatchString(reasoning),
-		hasEVShort: reasoningEVShortPattern.MatchString(reasoning),
-		hasPFLong:  reasoningPFLongPattern.MatchString(reasoning),
-		hasPFShort: reasoningPFShortPattern.MatchString(reasoning),
+		binRef:      reasoningBinPattern.FindString(reasoning),
+		hasEVLong:   reasoningEVLongPattern.MatchString(reasoning),
+		hasEVShort:  reasoningEVShortPattern.MatchString(reasoning),
+		hasPFLong:   reasoningPFLongPattern.MatchString(reasoning),
+		hasPFShort:  reasoningPFShortPattern.MatchString(reasoning),
+		hasPnL:      reasoningPnLPattern.MatchString(reasoning),
+		hasOI:       reasoningOIPattern.MatchString(reasoning),
+		hasPrice:    reasoningPricePattern.MatchString(reasoning),
+		hasFlow:     reasoningFlowPattern.MatchString(reasoning),
+		hasStats:    reasoningStatsPattern.MatchString(reasoning),
+		hasDrawdown: reasoningDrawdownPattern.MatchString(reasoning),
+		hasNumber:   reasoningNumberPattern.MatchString(reasoning),
 	}
 }
 
@@ -216,6 +265,18 @@ func (e reasoningCitationEvidence) hasAnyShortMetric() bool {
 
 func (e reasoningCitationEvidence) hasAnyMetric() bool {
 	return e.hasAnyLongMetric() || e.hasAnyShortMetric()
+}
+
+func (e reasoningCitationEvidence) hasAnyRiskMetric() bool {
+	return e.hasPnL || e.hasOI || e.hasPrice || e.hasFlow || e.hasDrawdown
+}
+
+func (e reasoningCitationEvidence) hasManagementEvidence() bool {
+	return e.hasAnyRiskMetric() && e.hasNumber
+}
+
+func (e reasoningCitationEvidence) hasStatisticalEvidence() bool {
+	return e.hasStats
 }
 
 func logReasoningPending(d *Decision, evidence reasoningCitationEvidence, reasoning, detail string) {

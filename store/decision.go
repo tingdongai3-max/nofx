@@ -24,6 +24,8 @@ type DecisionRecordDB struct {
 	CoTTrace            string    `gorm:"column:cot_trace;default:''"`
 	DecisionJSON        string    `gorm:"column:decision_json;default:''"`
 	RawResponse         string    `gorm:"column:raw_response;default:''"`
+	PriceSnapshotAt     time.Time `gorm:"column:price_snapshot_at"`
+	PriceSnapshots      string    `gorm:"column:price_snapshots;default:'{}'"`
 	CandidateCoins      string    `gorm:"column:candidate_coins;default:''"`
 	ExecutionLog        string    `gorm:"column:execution_log;default:''"`
 	Decisions           string    `gorm:"column:decisions;default:'[]'"`
@@ -46,6 +48,8 @@ type DecisionRecord struct {
 	CoTTrace            string             `json:"cot_trace"`
 	DecisionJSON        string             `json:"decision_json"`
 	RawResponse         string             `json:"raw_response"` // Raw AI response for debugging
+	PriceSnapshotAt     time.Time          `json:"price_snapshot_at"`
+	PriceSnapshots      map[string]float64 `json:"price_snapshots,omitempty"`
 	CandidateCoins      []string           `json:"candidate_coins"`
 	ExecutionLog        []string           `json:"execution_log"`
 	Success             bool               `json:"success"`
@@ -134,10 +138,12 @@ func (db *DecisionRecordDB) toRecord() *DecisionRecord {
 		CoTTrace:            db.CoTTrace,
 		DecisionJSON:        db.DecisionJSON,
 		RawResponse:         db.RawResponse,
+		PriceSnapshotAt:     db.PriceSnapshotAt,
 		Success:             db.Success,
 		ErrorMessage:        db.ErrorMessage,
 		AIRequestDurationMs: db.AIRequestDurationMs,
 	}
+	json.Unmarshal([]byte(db.PriceSnapshots), &record.PriceSnapshots)
 	json.Unmarshal([]byte(db.CandidateCoins), &record.CandidateCoins)
 	json.Unmarshal([]byte(db.ExecutionLog), &record.ExecutionLog)
 	json.Unmarshal([]byte(db.Decisions), &record.Decisions)
@@ -151,8 +157,15 @@ func (s *DecisionStore) LogDecision(record *DecisionRecord) error {
 	} else {
 		record.Timestamp = record.Timestamp.UTC()
 	}
+	if !record.PriceSnapshotAt.IsZero() {
+		record.PriceSnapshotAt = record.PriceSnapshotAt.UTC()
+	}
 
 	// Serialize arrays to JSON
+	if record.PriceSnapshots == nil {
+		record.PriceSnapshots = map[string]float64{}
+	}
+	priceSnapshotsJSON, _ := json.Marshal(record.PriceSnapshots)
 	candidateCoinsJSON, _ := json.Marshal(record.CandidateCoins)
 	executionLogJSON, _ := json.Marshal(record.ExecutionLog)
 	decisionsJSON, _ := json.Marshal(record.Decisions)
@@ -166,6 +179,8 @@ func (s *DecisionStore) LogDecision(record *DecisionRecord) error {
 		CoTTrace:            record.CoTTrace,
 		DecisionJSON:        record.DecisionJSON,
 		RawResponse:         record.RawResponse,
+		PriceSnapshotAt:     record.PriceSnapshotAt,
+		PriceSnapshots:      string(priceSnapshotsJSON),
 		CandidateCoins:      string(candidateCoinsJSON),
 		ExecutionLog:        string(executionLogJSON),
 		Decisions:           string(decisionsJSON),

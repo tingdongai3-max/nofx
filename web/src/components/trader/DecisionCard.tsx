@@ -42,6 +42,24 @@ function getConfidenceColor(confidence: number | undefined): string {
   return '#F6465D'
 }
 
+function resolveErrorPresentation(errorMessage: string) {
+  if (errorMessage.includes('已拦截')) {
+    return {
+      icon: '⚠️',
+      background: 'rgba(240, 185, 11, 0.10)',
+      border: '1px solid rgba(240, 185, 11, 0.38)',
+      color: '#F0B90B',
+    }
+  }
+
+  return {
+    icon: '❌',
+    background: 'rgba(246, 70, 93, 0.1)',
+    border: '1px solid rgba(246, 70, 93, 0.4)',
+    color: '#F6465D',
+  }
+}
+
 // Single Action Card Component
 function ActionCard({ action, language, onSymbolClick }: { action: DecisionAction; language: Language; onSymbolClick?: (symbol: string) => void }) {
   const config = ACTION_CONFIG[action.action] || ACTION_CONFIG.wait
@@ -465,16 +483,21 @@ export function DecisionCard({ decision, language, onSymbolClick }: DecisionCard
 
       {/* Error Message */}
       {decision.error_message && (
-        <div
-          className="rounded-lg p-3 mt-4 text-sm"
-          style={{
-            background: 'rgba(246, 70, 93, 0.1)',
-            border: '1px solid rgba(246, 70, 93, 0.4)',
-            color: '#F6465D',
-          }}
-        >
-          ❌ {decision.error_message}
-        </div>
+        (() => {
+          const tone = resolveErrorPresentation(decision.error_message)
+          return (
+            <div
+              className="rounded-lg p-3 mt-4 text-sm"
+              style={{
+                background: tone.background,
+                border: tone.border,
+                color: tone.color,
+              }}
+            >
+              {tone.icon} {decision.error_message}
+            </div>
+          )
+        })()
       )}
     </div>
   )

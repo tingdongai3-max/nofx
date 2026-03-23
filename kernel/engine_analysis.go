@@ -54,6 +54,8 @@ var (
 	reDecisionTag  = regexp.MustCompile(`(?s)<decision>(.*?)</decision>`)
 )
 
+const minimaxDecisionMaxTokens = 4096
+
 // ============================================================================
 // Entry Functions - Main API
 // ============================================================================
@@ -107,6 +109,8 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 	// 3. Build User Prompt using strategy engine
 	userPrompt := engine.BuildUserPrompt(ctx)
 
+	ensureMiniMaxDecisionTokenBudget(mcpClient)
+
 	// 4. Call AI API
 	aiCallStart := time.Now()
 	aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
@@ -127,6 +131,9 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 
 	if decision != nil {
 		decision.Timestamp = time.Now()
+		if !ctx.DecisionTime.IsZero() {
+			decision.Timestamp = ctx.DecisionTime.UTC()
+		}
 		decision.SystemPrompt = systemPrompt
 		decision.UserPrompt = userPrompt
 		decision.AIRequestDurationMs = aiCallDuration.Milliseconds()
@@ -138,6 +145,25 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 	}
 
 	return decision, nil
+}
+
+func ensureMiniMaxDecisionTokenBudget(client mcp.AIClient) {
+	embedder, ok := client.(mcp.ClientEmbedder)
+	if !ok {
+		return
+	}
+
+	base := embedder.BaseClient()
+	if base == nil || base.Provider != mcp.ProviderMiniMax {
+		return
+	}
+
+	if base.MaxTokens < minimaxDecisionMaxTokens {
+		base.MaxTokens = minimaxDecisionMaxTokens
+	}
+	if base.Cfg != nil && base.Cfg.MaxTokens < minimaxDecisionMaxTokens {
+		base.Cfg.MaxTokens = minimaxDecisionMaxTokens
+	}
 }
 
 func recalculateCandidateLogicScores(ctx *Context) {
@@ -273,7 +299,7 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 
 	// 1. First fetch data for position coins (must fetch)
 	for _, pos := range ctx.Positions {
-		data, err := market.GetWithTimeframesForScope(ctx.TraderID, pos.Symbol, timeframes, primaryTimeframe, klineCount, &config.Indicators)
+		data, err := market.GetWithTimeframesAtForScope(ctx.TraderID, pos.Symbol, timeframes, primaryTimeframe, klineCount, &config.Indicators, ctx.PriceSnapshotAt)
 		if err != nil {
 			logger.Infof("⚠️  Failed to fetch market data for position %s: %v", pos.Symbol, err)
 			continue
@@ -307,7 +333,7 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			data, err := market.GetWithTimeframesForScope(ctx.TraderID, coin.Symbol, timeframes, primaryTimeframe, klineCount, &config.Indicators)
+			data, err := market.GetWithTimeframesAtForScope(ctx.TraderID, coin.Symbol, timeframes, primaryTimeframe, klineCount, &config.Indicators, ctx.PriceSnapshotAt)
 			if err != nil {
 				logger.Infof("⚠️  Failed to fetch market data for %s: %v", coin.Symbol, err)
 				return

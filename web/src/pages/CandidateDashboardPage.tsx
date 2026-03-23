@@ -1,4 +1,5 @@
 import useSWR from 'swr'
+import { useMemo } from 'react'
 import type {
   TraderInfo,
   CandidateMarketItem,
@@ -99,6 +100,46 @@ function biasTone(bias: string) {
   }
 }
 
+function normalizeSector(sector: string | undefined) {
+  const normalized = sector?.trim()
+  if (!normalized) return 'Other'
+
+  const upper = normalized.toUpperCase()
+  if (upper === 'AI') return 'AI'
+  if (upper === 'MEME') return 'Meme'
+  if (upper === 'SMALLCAP' || upper === 'SMALL_CAP') return 'SmallCap'
+  return normalized
+}
+
+function sectorTone(sector: string) {
+  switch (sector) {
+    case 'AI':
+      return {
+        border: 'rgba(34, 211, 238, 0.36)',
+        background: 'linear-gradient(135deg, rgba(59, 130, 246, 0.18), rgba(34, 211, 238, 0.12))',
+        color: '#CFFAFE',
+      }
+    case 'Meme':
+      return {
+        border: 'rgba(217, 70, 239, 0.34)',
+        background: 'linear-gradient(135deg, rgba(168, 85, 247, 0.18), rgba(236, 72, 153, 0.12))',
+        color: '#F5D0FE',
+      }
+    case 'SmallCap':
+      return {
+        border: 'rgba(251, 146, 60, 0.34)',
+        background: 'linear-gradient(135deg, rgba(251, 146, 60, 0.16), rgba(148, 163, 184, 0.12))',
+        color: '#FED7AA',
+      }
+    default:
+      return {
+        border: 'rgba(148, 163, 184, 0.24)',
+        background: 'rgba(148, 163, 184, 0.08)',
+        color: '#CBD5E1',
+      }
+  }
+}
+
 export function CandidateDashboardPage({
   language,
   selectedTrader,
@@ -122,6 +163,23 @@ export function CandidateDashboardPage({
     language === 'zh'
       ? '只保留符号、现价、逻辑分、期望值和方向偏置。LONG / SHORT 仅在 EV > 0 且 PF > 1.2 时出现，否则一律 WAIT。'
       : 'Only symbol, price, logic score, expected value, and directional bias remain. LONG / SHORT appear only when EV > 0 and PF > 1.2; otherwise the row stays WAIT.'
+  const sortedCandidates = useMemo(() => {
+    if (!data?.candidates) return []
+
+    return [...data.candidates].sort((left, right) => {
+      const leftEV = resolveExpectedEV(left)
+      const rightEV = resolveExpectedEV(right)
+
+      if (leftEV == null && rightEV == null) {
+        return (resolveLogicScore(right) ?? Number.NEGATIVE_INFINITY) - (resolveLogicScore(left) ?? Number.NEGATIVE_INFINITY)
+      }
+      if (leftEV == null) return 1
+      if (rightEV == null) return -1
+      if (rightEV !== leftEV) return rightEV - leftEV
+
+      return (resolveLogicScore(right) ?? Number.NEGATIVE_INFINITY) - (resolveLogicScore(left) ?? Number.NEGATIVE_INFINITY)
+    })
+  }, [data?.candidates])
 
   return (
     <DeepVoidBackground className="min-h-screen pb-12" disableAnimation>
@@ -189,10 +247,11 @@ export function CandidateDashboardPage({
                 : `${data.candidates.length} live candidates`}
             </div>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[760px]">
+              <table className="w-full min-w-[920px]">
                 <thead>
                   <tr className="border-b border-white/10 text-left text-xs uppercase tracking-[0.14em] text-nofx-text-muted">
                     <th className="px-5 py-4">{language === 'zh' ? '币种' : 'Symbol'}</th>
+                    <th className="px-5 py-4">{language === 'zh' ? '赛道' : 'Sector'}</th>
                     <th className="px-5 py-4">{language === 'zh' ? '现价' : 'Price'}</th>
                     <th className="px-5 py-4">{language === 'zh' ? '逻辑分' : 'Logic Score'}</th>
                     <th className="px-5 py-4">{language === 'zh' ? '建议方向' : 'Bias'}</th>
@@ -200,16 +259,30 @@ export function CandidateDashboardPage({
                   </tr>
                 </thead>
                 <tbody>
-                  {data.candidates.map((item) => {
+                  {sortedCandidates.map((item) => {
                     const logicScore = resolveLogicScore(item)
                     const bias = resolveBias(item)
                     const expectedEV = resolveExpectedEV(item)
                     const tone = biasTone(bias)
+                    const sector = normalizeSector(item.sector)
+                    const sectorStyle = sectorTone(sector)
 
                     return (
                       <tr key={item.symbol} className="border-b border-white/5">
                         <td className="px-5 py-4 text-sm font-semibold text-nofx-text-main">
                           {item.symbol}
+                        </td>
+                        <td className="px-5 py-4">
+                          <span
+                            className="inline-flex rounded-full border px-3 py-1 text-xs font-semibold tracking-[0.08em]"
+                            style={{
+                              borderColor: sectorStyle.border,
+                              background: sectorStyle.background,
+                              color: sectorStyle.color,
+                            }}
+                          >
+                            {sector}
+                          </span>
                         </td>
                         <td className="px-5 py-4 text-sm text-nofx-text-main">
                           {formatPrice(item.current_price)}

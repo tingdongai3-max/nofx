@@ -12,14 +12,17 @@ import (
 )
 
 // saveEquitySnapshot saves equity snapshot independently (for drawing profit curve, decoupled from AI decision)
-func (at *AutoTrader) saveEquitySnapshot(ctx *kernel.Context) {
+func (at *AutoTrader) saveEquitySnapshot(ctx *kernel.Context, snapshotTime time.Time) {
 	if at.store == nil || ctx == nil {
 		return
+	}
+	if snapshotTime.IsZero() {
+		snapshotTime = time.Now().UTC()
 	}
 
 	snapshot := &store.EquitySnapshot{
 		TraderID:      at.id,
-		Timestamp:     time.Now().UTC(),
+		Timestamp:     snapshotTime.UTC(),
 		TotalEquity:   ctx.Account.TotalEquity,
 		Balance:       ctx.Account.TotalEquity - ctx.Account.UnrealizedPnL,
 		UnrealizedPnL: ctx.Account.UnrealizedPnL,
@@ -38,8 +41,9 @@ func (at *AutoTrader) saveDecision(record *store.DecisionRecord) error {
 		return nil
 	}
 
-	at.cycleNumber++
-	record.CycleNumber = at.cycleNumber
+	if record.CycleNumber <= 0 {
+		record.CycleNumber = at.reserveDecisionCycleNumber()
+	}
 	record.TraderID = at.id
 
 	if record.Timestamp.IsZero() {
@@ -51,8 +55,88 @@ func (at *AutoTrader) saveDecision(record *store.DecisionRecord) error {
 		return err
 	}
 
-	logger.Infof("📝 Decision record saved: trader=%s, cycle=%d", at.id, at.cycleNumber)
+	logger.Infof("📝 Decision record saved: trader=%s, cycle=%d", at.id, record.CycleNumber)
 	return nil
+}
+
+func (at *AutoTrader) reserveAICycle() (int, int) {
+	at.stateMu.Lock()
+	defer at.stateMu.Unlock()
+
+	at.callCount++
+	at.cycleNumber++
+	return at.cycleNumber, at.callCount
+}
+
+func (at *AutoTrader) reserveDecisionCycleNumber() int {
+	at.stateMu.Lock()
+	defer at.stateMu.Unlock()
+
+	at.cycleNumber++
+	return at.cycleNumber
+}
+
+func (at *AutoTrader) currentCallCount() int {
+	at.stateMu.RLock()
+	defer at.stateMu.RUnlock()
+	return at.callCount
+}
+
+func (at *AutoTrader) currentRuntimeState() (int, float64, time.Time, time.Time) {
+	at.stateMu.RLock()
+	defer at.stateMu.RUnlock()
+	return at.callCount, at.dailyPnL, at.lastResetTime, at.stopUntil
+}
+
+func (at *AutoTrader) currentStopUntil() time.Time {
+	at.stateMu.RLock()
+	defer at.stateMu.RUnlock()
+	return at.stopUntil
+}
+
+func (at *AutoTrader) currentDailyPnL() float64 {
+	at.stateMu.RLock()
+	defer at.stateMu.RUnlock()
+	return at.dailyPnL
+}
+
+func (at *AutoTrader) resetDailyPnLIfNeeded(now time.Time) bool {
+	at.stateMu.Lock()
+	defer at.stateMu.Unlock()
+
+	if now.Sub(at.lastResetTime) <= 24*time.Hour {
+		return false
+	}
+	at.dailyPnL = 0
+	at.lastResetTime = now.UTC()
+	return true
+}
+
+func (at *AutoTrader) positionFirstSeenAt(posKey string, seenAt time.Time) int64 {
+	at.positionFirstSeenMu.Lock()
+	defer at.positionFirstSeenMu.Unlock()
+
+	if _, exists := at.positionFirstSeenTime[posKey]; !exists {
+		at.positionFirstSeenTime[posKey] = seenAt.UTC().UnixMilli()
+	}
+	return at.positionFirstSeenTime[posKey]
+}
+
+func (at *AutoTrader) notePositionOpened(symbol, side string, openedAt time.Time) {
+	at.positionFirstSeenMu.Lock()
+	defer at.positionFirstSeenMu.Unlock()
+	at.positionFirstSeenTime[symbol+"_"+side] = openedAt.UTC().UnixMilli()
+}
+
+func (at *AutoTrader) pruneClosedPositionTracking(currentPositionKeys map[string]bool) {
+	at.positionFirstSeenMu.Lock()
+	defer at.positionFirstSeenMu.Unlock()
+
+	for key := range at.positionFirstSeenTime {
+		if !currentPositionKeys[key] {
+			delete(at.positionFirstSeenTime, key)
+		}
+	}
 }
 
 // GetStatus gets system status (for API)
@@ -65,6 +149,7 @@ func (at *AutoTrader) GetStatus() map[string]interface{} {
 	at.isRunningMutex.RLock()
 	isRunning := at.isRunning
 	at.isRunningMutex.RUnlock()
+	callCount, _, lastResetTime, stopUntil := at.currentRuntimeState()
 
 	result := map[string]interface{}{
 		"trader_id":       at.id,
@@ -74,11 +159,11 @@ func (at *AutoTrader) GetStatus() map[string]interface{} {
 		"is_running":      isRunning,
 		"start_time":      at.startTime.Format(time.RFC3339),
 		"runtime_minutes": int(time.Since(at.startTime).Minutes()),
-		"call_count":      at.callCount,
+		"call_count":      callCount,
 		"initial_balance": at.initialBalance,
 		"scan_interval":   at.config.ScanInterval.String(),
-		"stop_until":      at.stopUntil.Format(time.RFC3339),
-		"last_reset_time": at.lastResetTime.Format(time.RFC3339),
+		"stop_until":      stopUntil.Format(time.RFC3339),
+		"last_reset_time": lastResetTime.Format(time.RFC3339),
 		"ai_provider":     aiProvider,
 	}
 
@@ -98,11 +183,12 @@ func (at *AutoTrader) GetCandidateSnapshot() CandidateSnapshot {
 	defer at.candidateSnapshotMu.RUnlock()
 
 	snapshot := CandidateSnapshot{
-		TraderID:    at.candidateSnapshot.TraderID,
-		TraderName:  at.candidateSnapshot.TraderName,
-		UpdatedAt:   at.candidateSnapshot.UpdatedAt,
-		ScoreEngine: at.candidateSnapshot.ScoreEngine,
-		Candidates:  make([]CandidateMarketSnapshot, len(at.candidateSnapshot.Candidates)),
+		TraderID:        at.candidateSnapshot.TraderID,
+		TraderName:      at.candidateSnapshot.TraderName,
+		UpdatedAt:       at.candidateSnapshot.UpdatedAt,
+		PriceSnapshotAt: at.candidateSnapshot.PriceSnapshotAt,
+		ScoreEngine:     at.candidateSnapshot.ScoreEngine,
+		Candidates:      make([]CandidateMarketSnapshot, len(at.candidateSnapshot.Candidates)),
 	}
 	copy(snapshot.Candidates, at.candidateSnapshot.Candidates)
 	return snapshot
@@ -193,10 +279,10 @@ func (at *AutoTrader) GetAccountInfo() (map[string]interface{}, error) {
 		"available_balance": availableBalance,      // Available balance
 
 		// P&L statistics
-		"total_pnl":       totalPnL,          // Total P&L = equity - initial
-		"total_pnl_pct":   totalPnLPct,       // Total P&L percentage
-		"initial_balance": at.initialBalance, // Initial balance
-		"daily_pnl":       at.dailyPnL,       // Daily P&L
+		"total_pnl":       totalPnL,             // Total P&L = equity - initial
+		"total_pnl_pct":   totalPnLPct,          // Total P&L percentage
+		"initial_balance": at.initialBalance,    // Initial balance
+		"daily_pnl":       at.currentDailyPnL(), // Daily P&L
 
 		// Position information
 		"position_count":  len(positions),  // Position count

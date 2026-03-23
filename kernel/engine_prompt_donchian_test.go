@@ -1,6 +1,7 @@
 package kernel
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -149,12 +150,20 @@ func TestBuildSystemPromptIncludesScorePerformanceLogicAnchor(t *testing.T) {
 		"若当前 Symbol 的 N < 10",
 		"若 Sector 的 N < 20",
 		"禁止使用“因为胜率高”作为开仓理由",
-		"Reasoning 必须引用 Bin 编号及当前侧的 EV/PF 数据",
+		"开仓 reasoning 必须引用 Bin 编号及当前侧的 EV/PF 数据",
 		"你可以简写指标，但必须保留数字证据",
 		"虽然允许描述区间，但精确的数字证据能获得更高的执行置信度",
+		"对于 `wait` 决策，你可以引用分箱数据证明 EV/PF 不足，也可以直接引用持仓量、资金流或价格动量",
+		"## Personality DNA",
+		"先读取每个币种的 `## Personality DNA`",
+		"若 IC > +0.05：该因子属于【强正向逻辑】",
+		"若 IC < -0.05：该因子属于【强反向指标】",
+		"若 |IC| < 0.02：该因子属于【随机噪音】",
+		"趋势权重 < 10% 或 IC 归零",
 		"Bin 55: EV_L +0.5% > 0 且 PF_L 1.52 具有优势，技术面共振支持开多。",
 		"`reasoning`: required for every decision",
-		"Must cite the referenced Bin number plus the current-side EV/PF evidence",
+		"Open actions must cite the referenced Bin number plus the current-side EV/PF evidence",
+		"For `wait`, you may either cite bin-based EV/PF insufficiency or risk evidence such as OI, flow, and price momentum",
 		"Bin 48: EV_L +0.1% > 0 且 PF_L 1.08 仍低于开仓阈值，继续等待。",
 	}
 
@@ -377,5 +386,198 @@ func TestBuildUserPromptUsesRecalculatedCandidateScoreForHeaderAndMatrixFocus(t 
 	}
 	if strings.Contains(text, "11   25    +0.1 1.50   -0.1 0.70") {
 		t.Fatalf("expected prompt matrix not to focus around stale market heat score, got:\n%s", text)
+	}
+}
+
+func TestBuildUserPromptInjectsPersonalityDNABeforeMatrix(t *testing.T) {
+	config := store.GetDefaultStrategyConfig("en")
+	config.Indicators.EnableEMA = false
+	config.Indicators.EnableMACD = false
+	config.Indicators.EnableRSI = false
+	config.Indicators.EnableATR = false
+	config.Indicators.EnableBOLL = false
+	config.Indicators.EnableDonchianBox = false
+
+	engine := NewStrategyEngine(&config)
+	engine.SetAdaptiveWeightStateProvider(func(traderID, sector, symbol string) market.AdaptiveWeightState {
+		return market.AdaptiveWeightState{
+			Factors: []market.AdaptiveFactorState{
+				{Name: "market", FinalWeight: 0.101, FinalIC: 0.08},
+				{Name: "volume_spike", FinalWeight: 0.078, FinalIC: 0.14},
+				{Name: "trend", FinalWeight: 0.095, FinalIC: 0.0},
+				{Name: "quant", FinalWeight: 0.169, FinalIC: 0.10},
+				{Name: "social", FinalWeight: 0.145, FinalIC: 0.0},
+				{Name: "onchain", FinalWeight: 0.238, FinalIC: -0.08},
+			},
+		}
+	})
+	engine.SetPerformanceBinProvider(func(traderID, sector, symbol string) (*PerformanceBinMatrices, error) {
+		return &PerformanceBinMatrices{
+			Global: []*store.ScoreBinPerformance{
+				{BinStart: 50, TradeCount: 32, ExpectedValueLong: 0.007, ProfitFactorLong: 1.55, ExpectedValueShort: -0.004, ProfitFactorShort: 0.74},
+			},
+		}, nil
+	})
+
+	logicScore := 52.4
+	ctx := &Context{
+		TraderID:       "prompt-trader",
+		CurrentTime:    "2026-03-23 08:20:00 UTC",
+		CallCount:      1,
+		RuntimeMinutes: 5,
+		Account: AccountInfo{
+			TotalEquity:      1000,
+			AvailableBalance: 1000,
+		},
+		CandidateCoins: []CandidateCoin{
+			{Symbol: "RIVERUSDT", Sources: []string{"ai500"}, LogicScore: &logicScore},
+		},
+		MarketDataMap: map[string]*market.Data{
+			"RIVERUSDT": {
+				Symbol:       "RIVERUSDT",
+				Sector:       "AI",
+				CurrentPrice: 0.1234,
+			},
+		},
+	}
+
+	text := engine.BuildUserPrompt(ctx)
+	mustContain := []string{
+		"[RIVERUSDT | 0.123400 | Recalced_Score: 52.4]",
+		"## Personality DNA:",
+		"- Momentum: Weight 17.9%, IC +0.11 (Strong Logic)",
+		"- Trend: Weight 9.5%, IC +0.00 (Trend Disabled)",
+		"- Quant Flow: Weight 16.9%, IC +0.10 (Strong Logic)",
+		"- Sentiment: Weight 14.5%, IC +0.00 (Noise - IGNORE)",
+		"- On-chain: Weight 23.8%, IC -0.08 (Reverse Signal)",
+		"=== Smoothed Bin Matrix (Global - 7D) ===",
+	}
+	for _, expected := range mustContain {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("expected prompt to contain %q, got:\n%s", expected, text)
+		}
+	}
+
+	dnaIndex := strings.Index(text, "## Personality DNA:")
+	matrixIndex := strings.Index(text, "=== Smoothed Bin Matrix (Global - 7D) ===")
+	if dnaIndex == -1 || matrixIndex == -1 || dnaIndex > matrixIndex {
+		t.Fatalf("expected Personality DNA block before matrix, got:\n%s", text)
+	}
+}
+
+func TestBuildPersonalityDimensionsHandlesExtremeFactorAllocations(t *testing.T) {
+	state := market.AdaptiveWeightState{
+		Factors: []market.AdaptiveFactorState{
+			{Name: "market", FinalWeight: 0.90, FinalIC: 0.12},
+			{Name: "volume_spike", FinalWeight: 0.05, FinalIC: -0.08},
+			{Name: "trend", FinalWeight: 0.01, FinalIC: 0.60},
+			{Name: "quant", FinalWeight: 0.02, FinalIC: 0.11},
+			{Name: "social", FinalWeight: 0.01, FinalIC: -0.06},
+			{Name: "onchain", FinalWeight: 0.01, FinalIC: 0.01},
+		},
+	}
+
+	dimensions := buildPersonalityDimensions(state)
+	if len(dimensions) != 5 {
+		t.Fatalf("expected 5 personality dimensions, got %d: %#v", len(dimensions), dimensions)
+	}
+
+	expected := []personalityDimension{
+		{Label: "Momentum", Weight: 0.95, IC: 0.1094736842, Tag: "Strong Logic"},
+		{Label: "Trend", Weight: 0.01, IC: 0.60, Tag: "Trend Disabled"},
+		{Label: "Quant Flow", Weight: 0.02, IC: 0.11, Tag: "Strong Logic"},
+		{Label: "Sentiment", Weight: 0.01, IC: -0.06, Tag: "Reverse Signal"},
+		{Label: "On-chain", Weight: 0.01, IC: 0.01, Tag: "Noise - IGNORE"},
+	}
+
+	for i, got := range dimensions {
+		want := expected[i]
+		if got.Label != want.Label {
+			t.Fatalf("dimension %d label mismatch: want %q got %q", i, want.Label, got.Label)
+		}
+		if math.Abs(got.Weight-want.Weight) > 1e-9 {
+			t.Fatalf("dimension %s weight mismatch: want %.10f got %.10f", got.Label, want.Weight, got.Weight)
+		}
+		if math.Abs(got.IC-want.IC) > 1e-9 {
+			t.Fatalf("dimension %s IC mismatch: want %.10f got %.10f", got.Label, want.IC, got.IC)
+		}
+		if got.Tag != want.Tag {
+			t.Fatalf("dimension %s tag mismatch: want %q got %q", got.Label, want.Tag, got.Tag)
+		}
+	}
+}
+
+func TestBuildUserPromptPersonalityDNASanitizesInvalidFactorNumbers(t *testing.T) {
+	config := store.GetDefaultStrategyConfig("en")
+	config.Indicators.EnableEMA = false
+	config.Indicators.EnableMACD = false
+	config.Indicators.EnableRSI = false
+	config.Indicators.EnableATR = false
+	config.Indicators.EnableBOLL = false
+	config.Indicators.EnableDonchianBox = false
+
+	engine := NewStrategyEngine(&config)
+	engine.SetAdaptiveWeightStateProvider(func(traderID, sector, symbol string) market.AdaptiveWeightState {
+		return market.AdaptiveWeightState{
+			Factors: []market.AdaptiveFactorState{
+				{Name: "market", FinalWeight: math.NaN(), FinalIC: math.Inf(1)},
+				{Name: "volume_spike", FinalWeight: 0.0, FinalIC: math.Inf(-1)},
+				{Name: "trend", FinalWeight: math.NaN(), FinalIC: math.NaN()},
+				{Name: "quant", FinalWeight: 0.20, FinalIC: 0.09},
+				{Name: "social", FinalWeight: math.Inf(1), FinalIC: math.NaN()},
+				{Name: "onchain", FinalWeight: 0.15, FinalIC: -0.07},
+			},
+		}
+	})
+	engine.SetPerformanceBinProvider(func(traderID, sector, symbol string) (*PerformanceBinMatrices, error) {
+		return &PerformanceBinMatrices{
+			Global: []*store.ScoreBinPerformance{
+				{BinStart: 44, TradeCount: 20, ExpectedValueLong: 0.004, ProfitFactorLong: 1.30, ExpectedValueShort: -0.002, ProfitFactorShort: 0.80},
+			},
+		}, nil
+	})
+
+	logicScore := 44.4
+	ctx := &Context{
+		TraderID:       "prompt-trader",
+		CurrentTime:    "2026-03-23 08:20:00 UTC",
+		CallCount:      1,
+		RuntimeMinutes: 5,
+		Account: AccountInfo{
+			TotalEquity:      1000,
+			AvailableBalance: 1000,
+		},
+		CandidateCoins: []CandidateCoin{
+			{Symbol: "SAFEUSDT", Sources: []string{"ai500"}, LogicScore: &logicScore},
+		},
+		MarketDataMap: map[string]*market.Data{
+			"SAFEUSDT": {
+				Symbol:       "SAFEUSDT",
+				Sector:       "AI",
+				CurrentPrice: 1.2345,
+			},
+		},
+	}
+
+	text := engine.BuildUserPrompt(ctx)
+	mustContain := []string{
+		"## Personality DNA:",
+		"- Momentum: Weight 0.0%, IC +0.00 (Noise - IGNORE)",
+		"- Trend: Weight 0.0%, IC +0.00 (Trend Disabled)",
+		"- Quant Flow: Weight 20.0%, IC +0.09 (Strong Logic)",
+		"- Sentiment: Weight 0.0%, IC +0.00 (Noise - IGNORE)",
+		"- On-chain: Weight 15.0%, IC -0.07 (Reverse Signal)",
+	}
+	for _, expected := range mustContain {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("expected sanitized prompt to contain %q, got:\n%s", expected, text)
+		}
+	}
+
+	mustNotContain := []string{"NaN", "+Inf", "-Inf"}
+	for _, forbidden := range mustNotContain {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("expected sanitized prompt to omit %q, got:\n%s", forbidden, text)
+		}
 	}
 }

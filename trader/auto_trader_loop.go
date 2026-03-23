@@ -14,47 +14,40 @@ import (
 	"time"
 )
 
-// calculateNextAlignment returns the delay until the next decision boundary aligned to
-// the natural interval plus a fixed offset.
-//
-// It uses time.Time.Truncate to snap the current wall-clock time down to the most recent
-// interval boundary. From that anchor it first tries the current boundary plus offset:
-//
-//	(now.Truncate(interval) + offset)
-//
-// If that aligned point is already in the past, it rolls forward by one interval.
-//
-// Recomputing from time.Now() after every cycle keeps the loop anchored to candle closes
-// instead of drifting with execution time. The returned time.Time is the absolute aligned
-// wake-up point for logging and observability.
-func calculateNextAlignment(interval time.Duration, offset time.Duration) (time.Duration, time.Time) {
-	return calculateNextAlignmentFrom(time.Now(), interval, offset)
+// calculateNextAlignment returns the delay until the next natural wall-clock boundary.
+// Example: with a 3m interval, ticks align to :00, :03, :06 ...
+func calculateNextAlignment(interval time.Duration) (time.Duration, time.Time) {
+	return calculateNextAlignmentFrom(time.Now(), interval)
 }
 
-func calculateNextAlignmentFrom(now time.Time, interval time.Duration, offset time.Duration) (time.Duration, time.Time) {
+func calculateNextAlignmentFrom(now time.Time, interval time.Duration) (time.Duration, time.Time) {
 	if interval <= 0 {
-		nextTick := now.Add(offset)
+		nextTick := now.Add(time.Second)
 		if !nextTick.After(now) {
 			nextTick = now.Add(time.Second)
 		}
 		return nextTick.Sub(now), nextTick
 	}
 
-	lastTick := now.Truncate(interval)
-	nextTick := lastTick.Add(offset)
-	if !nextTick.After(now) {
-		nextTick = nextTick.Add(interval)
-	}
-
+	nextTick := now.Truncate(interval).Add(interval)
 	return nextTick.Sub(now), nextTick
 }
 
-// runCycle runs one trading cycle (using AI full decision-making)
-func (at *AutoTrader) runCycle() error {
-	at.callCount++
+// runCycle runs one trading cycle (using AI full decision-making).
+// tickTime is the logical wall-clock boundary this cycle belongs to.
+func (at *AutoTrader) runCycle(tickTime time.Time) error {
+	tickTime = tickTime.UTC()
+	cycleNumber, callCount := at.reserveAICycle()
+	startedAt := time.Now().UTC()
+	drift := startedAt.Sub(tickTime)
 
 	logger.Info("\n" + strings.Repeat("=", 70) + "\n")
-	logger.Infof("⏰ %s - AI decision cycle #%d", time.Now().Format("2006-01-02 15:04:05"), at.callCount)
+	logger.Infof("⏰ %s - AI decision cycle #%d (tick=%s, drift=%dms)",
+		startedAt.Format(time.RFC3339Nano),
+		callCount,
+		tickTime.Format(time.RFC3339),
+		drift.Milliseconds(),
+	)
 	logger.Info(strings.Repeat("=", 70))
 
 	// 0. Check if trader is stopped (early exit to prevent trades after Stop() is called)
@@ -62,24 +55,32 @@ func (at *AutoTrader) runCycle() error {
 	running := at.isRunning
 	at.isRunningMutex.RUnlock()
 	if !running {
-		logger.Infof("⏹ Trader is stopped, aborting cycle #%d", at.callCount)
+		logger.Infof("⏹ Trader is stopped, aborting cycle #%d", callCount)
 		return nil
 	}
 
 	// Check USDC balance periodically for claw402 users (every 10 cycles)
-	if at.callCount%10 == 0 && store.IsClaw402Config(at.config.AIModel) {
+	if callCount%10 == 0 && store.IsClaw402Config(at.config.AIModel) {
 		at.checkClaw402Balance()
 	}
 
 	// Create decision record
 	record := &store.DecisionRecord{
-		ExecutionLog: []string{},
-		Success:      true,
+		CycleNumber:     cycleNumber,
+		Timestamp:       tickTime,
+		PriceSnapshotAt: market.NormalizePriceSnapshotTime(tickTime),
+		ExecutionLog: []string{
+			fmt.Sprintf("Scheduled tick: %s", tickTime.Format(time.RFC3339)),
+			fmt.Sprintf("Dispatch start: %s", startedAt.Format(time.RFC3339Nano)),
+			fmt.Sprintf("Clock drift: %d ms", drift.Milliseconds()),
+		},
+		Success: true,
 	}
 
 	// 1. Check if trading needs to be stopped
-	if time.Now().Before(at.stopUntil) {
-		remaining := at.stopUntil.Sub(time.Now())
+	stopUntil := at.currentStopUntil()
+	if startedAt.Before(stopUntil) {
+		remaining := stopUntil.Sub(startedAt)
 		logger.Infof("⏸ Risk control: Trading paused, remaining %.0f minutes", remaining.Minutes())
 		record.Success = false
 		record.ErrorMessage = fmt.Sprintf("Risk control paused, remaining %.0f minutes", remaining.Minutes())
@@ -88,28 +89,27 @@ func (at *AutoTrader) runCycle() error {
 	}
 
 	// 2. Reset daily P&L (reset every day)
-	if time.Since(at.lastResetTime) > 24*time.Hour {
-		at.dailyPnL = 0
-		at.lastResetTime = time.Now()
+	if at.resetDailyPnLIfNeeded(startedAt) {
 		logger.Info("📅 Daily P&L reset")
 	}
 
 	// 4. Collect trading context
-	ctx, err := at.buildTradingContext()
+	ctx, err := at.buildTradingContext(tickTime, callCount)
 	if err != nil {
 		record.Success = false
 		record.ErrorMessage = fmt.Sprintf("Failed to build trading context: %v", err)
 		at.saveDecision(record)
 		return fmt.Errorf("failed to build trading context: %w", err)
 	}
+	record.PriceSnapshotAt = ctx.PriceSnapshotAt
 
 	// Save equity snapshot independently (decoupled from AI decision, used for drawing profit curve)
 	// NOTE: Must be called BEFORE candidate coins check to ensure equity is always recorded
-	at.saveEquitySnapshot(ctx)
+	at.saveEquitySnapshot(ctx, tickTime)
 
 	// If no candidate coins available, log but do not error
 	if len(ctx.CandidateCoins) == 0 {
-		at.updateCandidateSnapshot(ctx)
+		at.updateCandidateSnapshot(ctx, tickTime)
 		logger.Infof("ℹ️  No candidate coins available, skipping this cycle")
 		record.Success = true // Not an error, just no candidate coins
 		record.ExecutionLog = append(record.ExecutionLog, "No candidate coins available, cycle skipped")
@@ -132,11 +132,12 @@ func (at *AutoTrader) runCycle() error {
 	logger.Infof("📊 Account equity: %.2f USDT | Available: %.2f USDT | Positions: %d",
 		ctx.Account.TotalEquity, ctx.Account.AvailableBalance, ctx.Account.PositionCount)
 
-	decisionTime := time.Now().UTC()
+	decisionTime := tickTime.UTC()
 
 	// 5. Use strategy engine to call AI for decision
 	logger.Infof("🤖 Requesting AI analysis and decision... [Strategy Engine]")
 	aiDecision, err := kernel.GetFullDecisionWithStrategy(ctx, at.mcpClient, at.strategyEngine, "balanced")
+	record.PriceSnapshots = buildDecisionPriceSnapshots(ctx)
 
 	if aiDecision != nil && aiDecision.AIRequestDurationMs > 0 {
 		record.AIRequestDurationMs = aiDecision.AIRequestDurationMs
@@ -145,7 +146,7 @@ func (at *AutoTrader) runCycle() error {
 			fmt.Sprintf("AI call duration: %d ms", record.AIRequestDurationMs))
 	}
 
-	at.updateCandidateSnapshot(ctx)
+	at.updateCandidateSnapshot(ctx, tickTime)
 	if shadowErr := at.persistShadowSnapshots(decisionTime, ctx); shadowErr != nil {
 		logger.Warnf("⚠️ Failed to persist shadow snapshots: %v", shadowErr)
 	}
@@ -175,6 +176,10 @@ func (at *AutoTrader) runCycle() error {
 	if err != nil {
 		record.Success = false
 		record.ErrorMessage = fmt.Sprintf("Failed to get AI decision: %v", err)
+		if humanized, intercepted := humanizeDecisionInterception(err, aiDecision); intercepted {
+			record.ErrorMessage = humanized
+			record.ExecutionLog = append(record.ExecutionLog, fmt.Sprintf("Decision intercepted by validator: %v", err))
+		}
 
 		// Print system prompt and AI chain of thought (output even with errors for debugging)
 		if aiDecision != nil {
@@ -239,7 +244,7 @@ func (at *AutoTrader) runCycle() error {
 	running = at.isRunning
 	at.isRunningMutex.RUnlock()
 	if !running {
-		logger.Infof("⏹ Trader stopped before decision execution, aborting cycle #%d", at.callCount)
+		logger.Infof("⏹ Trader stopped before decision execution, aborting cycle #%d", callCount)
 		return nil
 	}
 
@@ -290,17 +295,39 @@ func (at *AutoTrader) runCycle() error {
 	return nil
 }
 
-func (at *AutoTrader) updateCandidateSnapshot(ctx *kernel.Context) {
+func buildDecisionPriceSnapshots(ctx *kernel.Context) map[string]float64 {
+	if ctx == nil || len(ctx.MarketDataMap) == 0 {
+		return nil
+	}
+
+	snapshots := make(map[string]float64, len(ctx.MarketDataMap))
+	for symbol, data := range ctx.MarketDataMap {
+		if data == nil || data.CurrentPrice <= 0 {
+			continue
+		}
+		snapshots[market.Normalize(symbol)] = data.CurrentPrice
+	}
+	if len(snapshots) == 0 {
+		return nil
+	}
+	return snapshots
+}
+
+func (at *AutoTrader) updateCandidateSnapshot(ctx *kernel.Context, snapshotTime time.Time) {
 	if ctx == nil {
 		return
 	}
+	if snapshotTime.IsZero() {
+		snapshotTime = time.Now().UTC()
+	}
 
 	snapshot := CandidateSnapshot{
-		TraderID:    at.id,
-		TraderName:  at.name,
-		UpdatedAt:   time.Now().UTC(),
-		ScoreEngine: "recalculated_backcast",
-		Candidates:  make([]CandidateMarketSnapshot, 0, len(ctx.CandidateCoins)),
+		TraderID:        at.id,
+		TraderName:      at.name,
+		UpdatedAt:       snapshotTime.UTC(),
+		PriceSnapshotAt: ctx.PriceSnapshotAt,
+		ScoreEngine:     "recalculated_backcast",
+		Candidates:      make([]CandidateMarketSnapshot, 0, len(ctx.CandidateCoins)),
 	}
 	telemetry := make(map[string]candidateTelemetrySnapshot, len(ctx.CandidateCoins))
 
@@ -342,6 +369,7 @@ func (at *AutoTrader) updateCandidateSnapshot(ctx *kernel.Context) {
 
 		snapshot.Candidates = append(snapshot.Candidates, CandidateMarketSnapshot{
 			Symbol:        coin.Symbol,
+			Sector:        data.Sector,
 			CurrentPrice:  data.CurrentPrice,
 			LogicScore:    logicScore,
 			Bias:          bias,
@@ -351,6 +379,10 @@ func (at *AutoTrader) updateCandidateSnapshot(ctx *kernel.Context) {
 	}
 
 	at.candidateSnapshotMu.Lock()
+	if !at.candidateSnapshot.UpdatedAt.IsZero() && at.candidateSnapshot.UpdatedAt.After(snapshot.UpdatedAt) {
+		at.candidateSnapshotMu.Unlock()
+		return
+	}
 	at.candidateSnapshot = snapshot
 	at.candidateTelemetry = telemetry
 	at.candidateSnapshotMu.Unlock()
@@ -499,7 +531,10 @@ func cloneFloatMap(source map[string]float64) map[string]float64 {
 }
 
 // buildTradingContext builds trading context
-func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
+func (at *AutoTrader) buildTradingContext(tickTime time.Time, callCount int) (*kernel.Context, error) {
+	tickTime = tickTime.UTC()
+	priceSnapshotAt := market.NormalizePriceSnapshotTime(tickTime)
+
 	// 1. Get account information
 	balance, err := at.trader.GetBalance()
 	if err != nil {
@@ -592,10 +627,7 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 		}
 		// Priority 3: Fallback to local tracking
 		if updateTime == 0 {
-			if _, exists := at.positionFirstSeenTime[posKey]; !exists {
-				at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
-			}
-			updateTime = at.positionFirstSeenTime[posKey]
+			updateTime = at.positionFirstSeenAt(posKey, tickTime)
 		}
 
 		// Get peak profit rate for this position
@@ -620,11 +652,7 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 	}
 
 	// Clean up closed position records
-	for key := range at.positionFirstSeenTime {
-		if !currentPositionKeys[key] {
-			delete(at.positionFirstSeenTime, key)
-		}
-	}
+	at.pruneClosedPositionTracking(currentPositionKeys)
 
 	// 3. Use strategy engine to get candidate coins (must have strategy engine)
 	var candidateCoins []kernel.CandidateCoin
@@ -662,9 +690,11 @@ func (at *AutoTrader) buildTradingContext() (*kernel.Context, error) {
 	// 6. Build context
 	ctx := &kernel.Context{
 		TraderID:        at.id,
-		CurrentTime:     time.Now().UTC().Format("2006-01-02 15:04:05 UTC"),
-		RuntimeMinutes:  int(time.Since(at.startTime).Minutes()),
-		CallCount:       at.callCount,
+		CurrentTime:     tickTime.Format("2006-01-02 15:04:05 UTC"),
+		RuntimeMinutes:  int(tickTime.Sub(at.startTime).Minutes()),
+		CallCount:       callCount,
+		DecisionTime:    tickTime,
+		PriceSnapshotAt: priceSnapshotAt,
 		BTCETHLeverage:  btcEthLeverage,
 		AltcoinLeverage: altcoinLeverage,
 		Account: kernel.AccountInfo{

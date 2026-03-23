@@ -317,6 +317,7 @@ export interface GridRiskInfo {
 
 export interface CandidateMarketItem {
   symbol: string
+  sector?: string
   current_price: number
   logic_score: number
   bias: 'LONG' | 'SHORT' | 'WAIT' | string

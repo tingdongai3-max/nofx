@@ -12,6 +12,13 @@ import (
 	"time"
 )
 
+type personalityDimension struct {
+	Label  string
+	Weight float64
+	IC     float64
+	Tag    string
+}
+
 // ============================================================================
 // Prompt Building - System Prompt
 // ============================================================================
@@ -138,9 +145,17 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 	sb.WriteString("   - 记住：背景环境（大盘/赛道）的稳定性在高波动新币上具有更高的决策权重。\n\n")
 	sb.WriteString("4. 推理表述要求：\n")
 	sb.WriteString("   - 禁止使用“因为胜率高”作为开仓理由。\n")
-	sb.WriteString("   - Reasoning 必须引用 Bin 编号及当前侧的 EV/PF 数据。\n")
+	sb.WriteString("   - 开仓 reasoning 必须引用 Bin 编号及当前侧的 EV/PF 数据。\n")
 	sb.WriteString("   - 你可以简写指标，但必须保留数字证据，例如 `Bin 55: EV_L +0.5% > 0 且 PF_L 1.52 具有优势，技术面共振支持开多。`\n\n")
 	sb.WriteString("   - 在描述 EV 表现时，请尽量引用当前中心分数的具体数值。虽然允许描述区间，但精确的数字证据能获得更高的执行置信度。\n\n")
+	sb.WriteString("   - 对于 `wait` 决策，你可以引用分箱数据证明 EV/PF 不足，也可以直接引用持仓量、资金流或价格动量，说明当前不适合入场。\n\n")
+	sb.WriteString("5. Personality DNA 因子权重识别准则：\n")
+	sb.WriteString("   - 先读取每个币种的 `## Personality DNA`，逐项检查 Spearman Rank IC，再决定哪些技术面/情绪面证据可以相信。\n")
+	sb.WriteString("   - 若 IC > +0.05：该因子属于【强正向逻辑】，其对应 Matrix 与因子信号具有较高参考价值。\n")
+	sb.WriteString("   - 若 IC < -0.05：该因子属于【强反向指标】，你必须进行反向推理，例如情绪越热反而越偏空。\n")
+	sb.WriteString("   - 若 |IC| < 0.02：该因子属于【随机噪音】，你必须在 reasoning 中明确声明忽略该项技术面/情绪面分析。\n")
+	sb.WriteString("   - 严禁对趋势权重 < 10% 或 IC 归零的币种，写出任何教条化的多头/空头趋势叙事；这类币种的趋势描述必须降权或直接忽略。\n")
+	sb.WriteString("   - 开仓时，优先使用 IC 显著且与 EV/PF 同向共振的因子；若 DNA 显示某因子为反向或噪音，不得把它当作直接做多/做空理由。\n\n")
 
 	// 7. Output format
 	sb.WriteString("# Output Format (Strictly Follow)\n\n")
@@ -165,7 +180,7 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 	sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
 	sb.WriteString(fmt.Sprintf("- `confidence`: 0-100 (opening recommended ≥ %d)\n", riskControl.MinConfidence))
 	sb.WriteString("- Required when opening: leverage, position_size_usd, stop_loss, take_profit, confidence, risk_usd\n")
-	sb.WriteString("- `reasoning`: required for every decision. Must cite the referenced Bin number plus the current-side EV/PF evidence. You may abbreviate indicators, and range descriptions are allowed, but precise numeric evidence earns higher execution confidence; for example `Bin 55: EV_L +0.5% > 0 且 PF_L 1.52 具有优势，技术面共振支持开多。`.\n")
+	sb.WriteString("- `reasoning`: required for every decision. Open actions must cite the referenced Bin number plus the current-side EV/PF evidence. For `wait`, you may either cite bin-based EV/PF insufficiency or risk evidence such as OI, flow, and price momentum. You may abbreviate indicators, and range descriptions are allowed, but precise numeric evidence earns higher execution confidence; for example `Bin 55: EV_L +0.5% > 0 且 PF_L 1.52 具有优势，技术面共振支持开多。`.\n")
 	sb.WriteString("- **IMPORTANT**: All numeric values must be calculated numbers, NOT formulas/expressions (e.g., use `27.76` not `3000 * 0.01`)\n\n")
 
 	// ⚡ Forced Output Format - Critical constraint for reasoning models
@@ -396,6 +411,10 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 		displayedCount++
 
 		sb.WriteString(fmt.Sprintf("%d. %s\n", displayedCount, e.formatCandidateDataIndex(coin, marketData)))
+		if personalityBlock := e.formatCandidatePersonalityDNA(ctx.TraderID, marketData); personalityBlock != "" {
+			sb.WriteString(personalityBlock)
+			sb.WriteString("\n")
+		}
 		if performanceBlock := e.formatHistoricalPerformanceMatrices(ctx.TraderID, coin, marketData); performanceBlock != "" {
 			sb.WriteString(performanceBlock)
 			sb.WriteString("\n")
@@ -451,6 +470,151 @@ func compactPromptPrice(price float64) string {
 		return fmt.Sprintf("%.4f", price)
 	default:
 		return fmt.Sprintf("%.6f", price)
+	}
+}
+
+func (e *StrategyEngine) resolveAdaptiveWeightState(traderID string, data *market.Data) market.AdaptiveWeightState {
+	if traderID == "" || data == nil || data.Symbol == "" {
+		return market.AdaptiveWeightState{}
+	}
+	if e.adaptiveWeightProvider != nil {
+		return e.adaptiveWeightProvider(traderID, data.Sector, data.Symbol)
+	}
+	return market.GetAdaptiveWeightState(traderID, data.Sector, data.Symbol)
+}
+
+func (e *StrategyEngine) formatCandidatePersonalityDNA(traderID string, data *market.Data) string {
+	state := e.resolveAdaptiveWeightState(traderID, data)
+	dimensions := buildPersonalityDimensions(state)
+	if len(dimensions) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("## Personality DNA:\n")
+	for _, dimension := range dimensions {
+		sb.WriteString(fmt.Sprintf("- %s: Weight %.1f%%, IC %+.2f (%s)\n",
+			dimension.Label,
+			dimension.Weight*100,
+			dimension.IC,
+			dimension.Tag,
+		))
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+func buildPersonalityDimensions(state market.AdaptiveWeightState) []personalityDimension {
+	factors := mapAdaptiveFactorStatesByName(state.Factors)
+	momentumWeight, momentumIC, hasMomentum := aggregateAdaptiveFactorSignals(
+		[]market.AdaptiveFactorState{
+			factors["market"],
+			factors["volume_spike"],
+		},
+	)
+	trendWeight, trendIC, hasTrend := aggregateAdaptiveFactorSignals([]market.AdaptiveFactorState{factors["trend"]})
+	quantWeight, quantIC, hasQuant := aggregateAdaptiveFactorSignals([]market.AdaptiveFactorState{factors["quant"]})
+	sentimentWeight, sentimentIC, hasSentiment := aggregateAdaptiveFactorSignals([]market.AdaptiveFactorState{factors["social"]})
+	onChainWeight, onChainIC, hasOnChain := aggregateAdaptiveFactorSignals([]market.AdaptiveFactorState{factors["onchain"]})
+
+	dimensions := make([]personalityDimension, 0, 5)
+	if hasMomentum {
+		dimensions = append(dimensions, personalityDimension{
+			Label:  "Momentum",
+			Weight: sanitizeAdaptiveNumber(momentumWeight),
+			IC:     sanitizeAdaptiveNumber(momentumIC),
+			Tag:    classifyPersonalityDimension("Momentum", momentumWeight, momentumIC),
+		})
+	}
+	if hasTrend {
+		dimensions = append(dimensions, personalityDimension{
+			Label:  "Trend",
+			Weight: sanitizeAdaptiveNumber(trendWeight),
+			IC:     sanitizeAdaptiveNumber(trendIC),
+			Tag:    classifyPersonalityDimension("Trend", trendWeight, trendIC),
+		})
+	}
+	if hasQuant {
+		dimensions = append(dimensions, personalityDimension{
+			Label:  "Quant Flow",
+			Weight: sanitizeAdaptiveNumber(quantWeight),
+			IC:     sanitizeAdaptiveNumber(quantIC),
+			Tag:    classifyPersonalityDimension("Quant Flow", quantWeight, quantIC),
+		})
+	}
+	if hasSentiment {
+		dimensions = append(dimensions, personalityDimension{
+			Label:  "Sentiment",
+			Weight: sanitizeAdaptiveNumber(sentimentWeight),
+			IC:     sanitizeAdaptiveNumber(sentimentIC),
+			Tag:    classifyPersonalityDimension("Sentiment", sentimentWeight, sentimentIC),
+		})
+	}
+	if hasOnChain {
+		dimensions = append(dimensions, personalityDimension{
+			Label:  "On-chain",
+			Weight: sanitizeAdaptiveNumber(onChainWeight),
+			IC:     sanitizeAdaptiveNumber(onChainIC),
+			Tag:    classifyPersonalityDimension("On-chain", onChainWeight, onChainIC),
+		})
+	}
+	return dimensions
+}
+
+func mapAdaptiveFactorStatesByName(factors []market.AdaptiveFactorState) map[string]market.AdaptiveFactorState {
+	index := make(map[string]market.AdaptiveFactorState, len(factors))
+	for _, factor := range factors {
+		index[factor.Name] = factor
+	}
+	return index
+}
+
+func aggregateAdaptiveFactorSignals(factors []market.AdaptiveFactorState) (float64, float64, bool) {
+	totalWeight := 0.0
+	weightedIC := 0.0
+	hasFactor := false
+	for _, factor := range factors {
+		if factor.Name == "" {
+			continue
+		}
+		weight := sanitizeAdaptiveNumber(factor.FinalWeight)
+		ic := sanitizeAdaptiveNumber(factor.FinalIC)
+		totalWeight += weight
+		weightedIC += weight * ic
+		hasFactor = true
+	}
+	if !hasFactor {
+		return 0, 0, false
+	}
+	if totalWeight <= 0 {
+		return 0, 0, true
+	}
+	return totalWeight, weightedIC / totalWeight, true
+}
+
+func sanitizeAdaptiveNumber(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	return value
+}
+
+func classifyPersonalityDimension(label string, weight, ic float64) string {
+	if label == "Trend" && (weight < 0.10 || math.Abs(ic) < 0.0001) {
+		return "Trend Disabled"
+	}
+	switch {
+	case math.Abs(ic) < 0.02:
+		return "Noise - IGNORE"
+	case ic > 0.05:
+		return "Strong Logic"
+	case ic < -0.05:
+		return "Reverse Signal"
+	case ic > 0:
+		return "Weak Positive"
+	case ic < 0:
+		return "Weak Negative"
+	default:
+		return "Neutral"
 	}
 }
 

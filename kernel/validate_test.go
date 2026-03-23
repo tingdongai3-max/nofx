@@ -227,6 +227,136 @@ func TestValidateDecisionRejectsWrongSideOnlyOpenReasoning(t *testing.T) {
 	}
 }
 
+func TestValidateDecisionAllowsCloseLongWithRiskEvidenceWithoutBin(t *testing.T) {
+	decision := Decision{
+		Symbol:    "BANANAS31USDT",
+		Action:    "close_long",
+		Reasoning: "价格从0.0163峰值回落至0.0149,OI减少-2.01M,典型多头平仓踩踏。持仓17分钟已亏损-2.17%,Peak PnL从+1.04%大幅回撤。风险控制优先,止损离场释放9 USDT保证金。",
+	}
+
+	err := validateDecision(&decision, 25.69, 5, 5, 5.0, 1.0)
+	if err != nil {
+		t.Fatalf("expected close_long risk-evidence reasoning to pass, got %v", err)
+	}
+}
+
+func TestValidateDecisionAllowsHoldWithRiskEvidenceWithoutBin(t *testing.T) {
+	decision := Decision{
+		Symbol:          "BANANAS31USDT",
+		Action:          "hold",
+		Leverage:        3,
+		PositionSizeUSD: 25.81,
+		Confidence:      82,
+		Reasoning:       "持仓已20分钟。OI -2.48M + 价格-4.07% 形成明确空头共振,当前PnL -2.18%但未触及止损。Symbol无EV矩阵但市场数据确认空头主导,持有等待回归0.0144附近止盈。",
+	}
+
+	err := validateDecision(&decision, 25.86, 5, 5, 5.0, 1.0)
+	if err != nil {
+		t.Fatalf("expected hold risk-evidence reasoning to pass, got %v", err)
+	}
+}
+
+func TestValidateDecisionAllowsWaitWithRiskEvidenceWithoutBin(t *testing.T) {
+	decision := Decision{
+		Symbol:    "BANANAS31USDT",
+		Action:    "wait",
+		Reasoning: "OI大幅下降-1.20%,价格下跌-5.41%,属于持仓减少榜第二名。短期资金持续流出,不适合开仓。",
+	}
+
+	err := validateDecision(&decision, 25.89, 5, 5, 5.0, 1.0)
+	if err != nil {
+		t.Fatalf("expected wait risk-evidence reasoning to pass, got %v", err)
+	}
+}
+
+func TestValidateDecisionAllowsWaitWithStatisticalEvidenceWithoutBin(t *testing.T) {
+	decision := Decision{
+		Symbol:    "AAVEUSDT",
+		Action:    "wait",
+		Reasoning: "Symbol矩阵N<30样本不足,Sector Matrix EV≈0且PF<1.2,不满足开仓条件。",
+	}
+
+	err := validateDecision(&decision, 25.95, 5, 5, 5.0, 1.0)
+	if err != nil {
+		t.Fatalf("expected wait statistical-insufficiency reasoning to pass, got %v", err)
+	}
+}
+
+func TestValidateDecisionStillRejectsManagementReasoningWithoutBinOrRiskEvidence(t *testing.T) {
+	decision := Decision{
+		Symbol:    "BANANAS31USDT",
+		Action:    "close_long",
+		Reasoning: "技术面转弱，先离场观望。",
+	}
+
+	err := validateDecision(&decision, 25.69, 5, 5, 5.0, 1.0)
+	if err == nil {
+		t.Fatal("expected management reasoning without bin or risk evidence to fail")
+	}
+	if !contains(err.Error(), "risk evidence") {
+		t.Fatalf("expected management evidence requirement error, got %v", err)
+	}
+}
+
+func TestParseFullDecisionResponseAllowsHistoricalCloseAndWaitRiskBatch(t *testing.T) {
+	rawResponse := `<reasoning>
+**候选币种分析：**
+1. RIVERUSDT：Symbol Bin 57-63显示EV_L转负,等待企稳。
+2. BANANAS31USDT：OI大幅下降-1.20%,价格下跌-5.41%,短期资金持续流出,不适合开仓。
+</reasoning>
+
+<decision>
+[
+  {"symbol": "SIGNUSDT", "action": "close_long", "reasoning": "持仓接近成本价（Entry 0.0546, Current 0.0545, PnL+0.43%）,15M出现-0.60%回调,OI减少-158.31K显示短期多头动能减弱。无明确方向优势,平仓等待更清晰信号。"},
+  {"symbol": "RIVERUSDT", "action": "wait", "reasoning": "OI减少-0.43%,价格下跌-2.79%,大单流出-733.22K,短期偏空。Symbol Bin 57-63显示EV_L转负,等待企稳。"},
+  {"symbol": "BANANAS31USDT", "action": "wait", "reasoning": "OI大幅下降-1.20%,价格下跌-5.41%,属于持仓减少榜第二名。短期资金持续流出,不适合开仓。"}
+]
+</decision>`
+
+	decision, err := parseFullDecisionResponse(rawResponse, 25.89, 5, 5, 5.0, 1.0)
+	if err != nil {
+		t.Fatalf("expected historical close+wait batch to pass, got %v", err)
+	}
+	if decision == nil || len(decision.Decisions) != 3 {
+		t.Fatalf("expected three parsed decisions, got %+v", decision)
+	}
+	if decision.Decisions[0].Action != "close_long" {
+		t.Fatalf("expected first decision to remain executable close_long, got %+v", decision.Decisions[0])
+	}
+	if decision.Decisions[2].Action != "wait" || decision.Decisions[2].Symbol != "BANANAS31USDT" {
+		t.Fatalf("unexpected third decision: %+v", decision.Decisions[2])
+	}
+}
+
+func TestParseFullDecisionResponseAllowsHistoricalCloseAndWaitStatsBatch(t *testing.T) {
+	rawResponse := `<reasoning>
+## 决策分析
+1. SIGNUSDT：持仓浮盈有限，资金流转弱，先平仓。
+2. AAVEUSDT：Symbol矩阵N<30样本不足,Sector Matrix EV≈0且PF<1.2,不满足开仓条件。
+</reasoning>
+
+<decision>
+[
+  {"symbol": "SIGNUSDT", "action": "close_long", "reasoning": "Bin 50: 方向模糊,无EV支撑。OI收缩(-54.58K 4h) + 大单净流出(-281.81K 4h) + 5M动能衰减三重看跌共振。当前PnL +0.80%,执行止盈离场规避噪音暴露。"},
+  {"symbol": "AAVEUSDT", "action": "wait", "reasoning": "Symbol矩阵N<30样本不足,Sector Matrix EV≈0且PF<1.2,不满足开仓条件。"}
+]
+</decision>`
+
+	decision, err := parseFullDecisionResponse(rawResponse, 25.95, 5, 5, 5.0, 1.0)
+	if err != nil {
+		t.Fatalf("expected historical close+wait stats batch to pass, got %v", err)
+	}
+	if decision == nil || len(decision.Decisions) != 2 {
+		t.Fatalf("expected two parsed decisions, got %+v", decision)
+	}
+	if decision.Decisions[0].Action != "close_long" || decision.Decisions[0].Symbol != "SIGNUSDT" {
+		t.Fatalf("unexpected first decision: %+v", decision.Decisions[0])
+	}
+	if decision.Decisions[1].Action != "wait" || decision.Decisions[1].Symbol != "AAVEUSDT" {
+		t.Fatalf("unexpected second decision: %+v", decision.Decisions[1])
+	}
+}
+
 func TestParseFullDecisionResponseAcceptsHistoricalBanCitation(t *testing.T) {
 	rawResponse := `<reasoning>
 ## 核心决策

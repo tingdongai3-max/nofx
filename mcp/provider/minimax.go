@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"nofx/mcp"
 )
@@ -106,11 +107,12 @@ func (c *MiniMaxClient) ParseMCPResponse(body []byte) (string, error) {
 func (c *MiniMaxClient) ParseMCPResponseFull(body []byte) (*mcp.LLMResponse, error) {
 	var raw struct {
 		Content []struct {
-			Type  string          `json:"type"`
-			Text  string          `json:"text,omitempty"`
-			ID    string          `json:"id,omitempty"`
-			Name  string          `json:"name,omitempty"`
-			Input json.RawMessage `json:"input,omitempty"`
+			Type     string          `json:"type"`
+			Text     string          `json:"text,omitempty"`
+			Thinking string          `json:"thinking,omitempty"`
+			ID       string          `json:"id,omitempty"`
+			Name     string          `json:"name,omitempty"`
+			Input    json.RawMessage `json:"input,omitempty"`
 		} `json:"content"`
 		Usage struct {
 			InputTokens  int `json:"input_tokens"`
@@ -141,10 +143,14 @@ func (c *MiniMaxClient) ParseMCPResponseFull(body []byte) (*mcp.LLMResponse, err
 	}
 
 	result := &mcp.LLMResponse{}
+	contentParts := make([]string, 0, len(raw.Content))
 	for _, block := range raw.Content {
 		switch block.Type {
+		case "thinking":
+			appendMiniMaxContentBlock(&contentParts, block.Thinking)
+
 		case "text":
-			result.Content = block.Text
+			appendMiniMaxContentBlock(&contentParts, block.Text)
 
 		case "tool_use":
 			argsJSON, err := json.Marshal(block.Input)
@@ -161,5 +167,14 @@ func (c *MiniMaxClient) ParseMCPResponseFull(body []byte) (*mcp.LLMResponse, err
 			})
 		}
 	}
+	result.Content = strings.Join(contentParts, "\n\n")
 	return result, nil
+}
+
+func appendMiniMaxContentBlock(parts *[]string, content string) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return
+	}
+	*parts = append(*parts, content)
 }

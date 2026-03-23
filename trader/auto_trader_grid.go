@@ -576,12 +576,16 @@ func (at *AutoTrader) saveGridDecisionRecord(decision *kernel.FullDecision) {
 		return
 	}
 
-	at.cycleNumber++
+	cycleNumber := at.reserveDecisionCycleNumber()
+	recordTimestamp := time.Now().UTC()
+	if !decision.Timestamp.IsZero() {
+		recordTimestamp = decision.Timestamp.UTC()
+	}
 
 	record := &store.DecisionRecord{
 		TraderID:            at.id,
-		CycleNumber:         at.cycleNumber,
-		Timestamp:           time.Now().UTC(),
+		CycleNumber:         cycleNumber,
+		Timestamp:           recordTimestamp,
 		SystemPrompt:        decision.SystemPrompt,
 		InputPrompt:         decision.UserPrompt,
 		CoTTrace:            decision.CoTTrace,

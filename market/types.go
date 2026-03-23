@@ -50,8 +50,9 @@ type Data struct {
 	Symbol                string
 	Sector                string `json:"sector,omitempty"`
 	CurrentPrice          float64
-	PriceChange1h         float64 // 1-hour price change percentage
-	PriceChange4h         float64 // 4-hour price change percentage
+	CurrentPriceAt        time.Time `json:"current_price_at,omitempty"`
+	PriceChange1h         float64   // 1-hour price change percentage
+	PriceChange4h         float64   // 4-hour price change percentage
 	Indicators            IndicatorResult
 	OpenInterest          *OIData
 	Orderbook             *OrderbookData
