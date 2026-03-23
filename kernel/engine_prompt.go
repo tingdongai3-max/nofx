@@ -2,6 +2,8 @@ package kernel
 
 import (
 	"fmt"
+	"math"
+	"nofx/logger"
 	"nofx/market"
 	"nofx/provider/nofxos"
 	"nofx/store"
@@ -118,6 +120,28 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 		sb.WriteString("3. Write chain of thought first, then output structured JSON\n\n")
 	}
 
+	sb.WriteString("## 核心决策逻辑：数据驱动方向 (Data-Driven Directional Bias)\n")
+	sb.WriteString("1. 废弃固定分数方向：重算后的 LogicScore 不再硬性代表做多或做空，它仅作为【历史表现索引】。\n")
+	sb.WriteString("2. 方向判定规则：\n")
+	sb.WriteString("   - 查找当前 Recalced LogicScore 对应的 Bin（例如 32 分对应 Bin 30）。\n")
+	sb.WriteString("   - 现在的 EV 曲线来自滑动窗口平滑趋势；例如当前逻辑分数在 42 分时，也要参考 40-44 一带的表现，而不是只盯单个离散桶。\n")
+	sb.WriteString("   - 阅读矩阵时，同时检查 EV_L / EV_S（平均对数回报率）与 PF_L / PF_S（盈利因子）。\n")
+	sb.WriteString("   - EV_L / EV_S > 0 表示该方向在统计上是增长的；EV <= 0 说明该方向没有正期望。\n")
+	sb.WriteString("   - 【绝对原则】：仅在 EV > 0 且 PF > 1.2 的分段执行对应方向的开仓。\n")
+	sb.WriteString("   - 【相对优势原则】：若一侧 PF 显著高于另一侧，则该方向为主攻方向。\n")
+	sb.WriteString("   - 【风险对冲原则】：若两边 EV 均 <= 0，或两边 PF 均 <= 1.2，视为噪音区，禁止开仓。\n")
+	sb.WriteString("   - 【极端反转识别】：若低分段（Bin < 40）的 PF_L 显著占优，应识别为超卖反弹；若高分段（Bin > 70）的 PF_S 显著占优，应识别为末尾派发或假突破。\n")
+	sb.WriteString("3. 统计置信度：\n")
+	sb.WriteString("   - 样本量 N > 30 时，严格遵守该矩阵的 EV / PF 指标。\n")
+	sb.WriteString("   - 若当前 Symbol 的 N < 10，请忽略 Symbol 矩阵，优先参考 Sector 矩阵。\n")
+	sb.WriteString("   - 若 Sector 的 N < 20，请优先参考 Global 矩阵。\n")
+	sb.WriteString("   - 记住：背景环境（大盘/赛道）的稳定性在高波动新币上具有更高的决策权重。\n\n")
+	sb.WriteString("4. 推理表述要求：\n")
+	sb.WriteString("   - 禁止使用“因为胜率高”作为开仓理由。\n")
+	sb.WriteString("   - Reasoning 必须引用 Bin 编号及当前侧的 EV/PF 数据。\n")
+	sb.WriteString("   - 你可以简写指标，但必须保留数字证据，例如 `Bin 55: EV_L +0.5% > 0 且 PF_L 1.52 具有优势，技术面共振支持开多。`\n\n")
+	sb.WriteString("   - 在描述 EV 表现时，请尽量引用当前中心分数的具体数值。虽然允许描述区间，但精确的数字证据能获得更高的执行置信度。\n\n")
+
 	// 7. Output format
 	sb.WriteString("# Output Format (Strictly Follow)\n\n")
 	sb.WriteString("**Must use XML tags <reasoning> and <decision> to separate chain of thought and decision JSON, avoiding parsing errors**\n\n")
@@ -131,15 +155,17 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 	sb.WriteString("```json\n[\n")
 	// Use the actual configured position value ratio for BTC/ETH in the example
 	examplePositionSize := accountEquity * btcEthPosValueRatio
-	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300},\n",
+	sb.WriteString(fmt.Sprintf("  {\"symbol\": \"BTCUSDT\", \"action\": \"open_short\", \"leverage\": %d, \"position_size_usd\": %.0f, \"stop_loss\": 97000, \"take_profit\": 91000, \"confidence\": 85, \"risk_usd\": 300, \"reasoning\": \"Bin 80: EV_S +1.3%% > 0 且 PF_S 2.40 具有优势，高分衰竭支持开空。\"},\n",
 		riskControl.BTCETHMaxLeverage, examplePositionSize))
-	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"close_long\"}\n")
+	sb.WriteString("  {\"symbol\": \"ETHUSDT\", \"action\": \"close_long\", \"reasoning\": \"Bin 50: EV_L -0.1% <= 0 且 PF_L 1.02 失去优势，先平多降低噪音暴露。\"},\n")
+	sb.WriteString("  {\"symbol\": \"SOLUSDT\", \"action\": \"wait\", \"reasoning\": \"Bin 48: EV_L +0.1% > 0 且 PF_L 1.08 仍低于开仓阈值，继续等待。\"}\n")
 	sb.WriteString("]\n```\n")
 	sb.WriteString("</decision>\n\n")
 	sb.WriteString("## Field Description\n\n")
 	sb.WriteString("- `action`: open_long | open_short | close_long | close_short | hold | wait\n")
 	sb.WriteString(fmt.Sprintf("- `confidence`: 0-100 (opening recommended ≥ %d)\n", riskControl.MinConfidence))
 	sb.WriteString("- Required when opening: leverage, position_size_usd, stop_loss, take_profit, confidence, risk_usd\n")
+	sb.WriteString("- `reasoning`: required for every decision. Must cite the referenced Bin number plus the current-side EV/PF evidence. You may abbreviate indicators, and range descriptions are allowed, but precise numeric evidence earns higher execution confidence; for example `Bin 55: EV_L +0.5% > 0 且 PF_L 1.52 具有优势，技术面共振支持开多。`.\n")
 	sb.WriteString("- **IMPORTANT**: All numeric values must be calculated numbers, NOT formulas/expressions (e.g., use `27.76` not `3000 * 0.01`)\n\n")
 
 	// ⚡ Forced Output Format - Critical constraint for reasoning models
@@ -354,7 +380,7 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 		positionSymbols[normalizedSymbol] = true
 	}
 
-	sb.WriteString(fmt.Sprintf("## Candidate Coins (%d coins)\n\n", len(ctx.MarketDataMap)))
+	sb.WriteString(fmt.Sprintf("## Candidate Coins (%d coins)\n\n", len(ctx.CandidateCoins)))
 	displayedCount := 0
 	for _, coin := range ctx.CandidateCoins {
 		// Skip if this coin is already a position (data already shown in positions section)
@@ -369,14 +395,10 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 		}
 		displayedCount++
 
-		sourceTags := e.formatCoinSourceTag(coin.Sources)
-		sb.WriteString(fmt.Sprintf("### %d. %s%s\n\n", displayedCount, coin.Symbol, sourceTags))
-		sb.WriteString(e.formatMarketData(marketData))
-
-		if ctx.QuantDataMap != nil {
-			if quantData, hasQuant := ctx.QuantDataMap[coin.Symbol]; hasQuant {
-				sb.WriteString(e.formatQuantData(quantData))
-			}
+		sb.WriteString(fmt.Sprintf("%d. %s\n", displayedCount, e.formatCandidateDataIndex(coin, marketData)))
+		if performanceBlock := e.formatHistoricalPerformanceMatrices(ctx.TraderID, coin, marketData); performanceBlock != "" {
+			sb.WriteString(performanceBlock)
+			sb.WriteString("\n")
 		}
 		sb.WriteString("\n")
 	}
@@ -407,6 +429,224 @@ func (e *StrategyEngine) BuildUserPrompt(ctx *Context) string {
 	sb.WriteString("Now please analyze and output your decision (Chain of Thought + JSON)\n")
 
 	return sb.String()
+}
+
+func (e *StrategyEngine) formatCandidateDataIndex(candidate CandidateCoin, data *market.Data) string {
+	if data == nil {
+		return ""
+	}
+	if candidate.LogicScore != nil && !math.IsNaN(*candidate.LogicScore) && !math.IsInf(*candidate.LogicScore, 0) {
+		return fmt.Sprintf("[%s | %s | Recalced_Score: %.1f]", candidate.Symbol, compactPromptPrice(data.CurrentPrice), *candidate.LogicScore)
+	}
+	return fmt.Sprintf("[%s | %s | Recalced_Score: --]", candidate.Symbol, compactPromptPrice(data.CurrentPrice))
+}
+
+func compactPromptPrice(price float64) string {
+	switch {
+	case math.IsNaN(price), math.IsInf(price, 0):
+		return "--"
+	case math.Abs(price) >= 1000:
+		return fmt.Sprintf("%.2f", price)
+	case math.Abs(price) >= 1:
+		return fmt.Sprintf("%.4f", price)
+	default:
+		return fmt.Sprintf("%.6f", price)
+	}
+}
+
+func (e *StrategyEngine) formatHistoricalPerformanceMatrices(traderID string, candidate CandidateCoin, data *market.Data) string {
+	if e.performanceBinProvider == nil || traderID == "" || data == nil || data.Symbol == "" {
+		return ""
+	}
+
+	matrices, err := e.performanceBinProvider(traderID, data.Sector, data.Symbol)
+	if err != nil {
+		logger.Warnf("⚠️ Performance bin provider failed: trader=%s sector=%s symbol=%s err=%v",
+			traderID, data.Sector, data.Symbol, err)
+		return ""
+	}
+	if matrices == nil {
+		return ""
+	}
+
+	var sections []string
+	if block := formatPerformanceMatrix("Global - 7D", selectRelevantPerformanceBins(matrices.Global, candidate)); block != "" {
+		sections = append(sections, block)
+	}
+	if data.Sector != "" {
+		if block := formatPerformanceMatrix(fmt.Sprintf("Sector: %s - 7D", data.Sector), selectRelevantPerformanceBins(matrices.Sector, candidate)); block != "" {
+			sections = append(sections, block)
+		}
+	}
+	if totalPerformanceBinSamples(matrices.Symbol) >= 10 {
+		if block := formatPerformanceMatrix(fmt.Sprintf("Symbol: %s - %d Samples", data.Symbol, store.PERFORMANCE_SYMBOL_LIMIT), selectRelevantPerformanceBins(matrices.Symbol, candidate)); block != "" {
+			sections = append(sections, block)
+		}
+	}
+
+	if len(sections) == 0 {
+		return ""
+	}
+	return strings.Join(sections, "\n\n") + "\n"
+}
+
+func formatPerformanceMatrix(title string, bins []*store.ScoreBinPerformance) string {
+	if len(bins) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("=== Smoothed Bin Matrix (%s) ===\n", title))
+	sb.WriteString("Bin  N    EV_L%  PF_L  EV_S%  PF_S\n")
+	written := 0
+	for _, bin := range bins {
+		if bin == nil || bin.TradeCount <= 0 {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("%-4d %-4d %+5.1f %-5.2f %+5.1f %.2f\n",
+			bin.BinStart,
+			bin.TradeCount,
+			bin.ExpectedValueLong*100,
+			bin.ProfitFactorLong,
+			bin.ExpectedValueShort*100,
+			bin.ProfitFactorShort,
+		))
+		written++
+	}
+	if written == 0 {
+		return ""
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+func totalPerformanceBinSamples(bins []*store.ScoreBinPerformance) int {
+	maxTradeCount := 0
+	for _, bin := range bins {
+		if bin == nil {
+			continue
+		}
+		if bin.TradeCount > maxTradeCount {
+			maxTradeCount = bin.TradeCount
+		}
+	}
+	return maxTradeCount
+}
+
+func selectRelevantPerformanceBins(
+	bins []*store.ScoreBinPerformance,
+	candidate CandidateCoin,
+) []*store.ScoreBinPerformance {
+	if len(bins) == 0 {
+		return nil
+	}
+
+	if len(bins) <= 15 {
+		return bins
+	}
+
+	focusScore, ok := resolvePerformanceFocusScore(candidate)
+	if !ok {
+		return samplePerformanceBinsEvenly(bins, 11)
+	}
+
+	lowerBound := int(math.Floor(focusScore)) - 5
+	upperBound := int(math.Ceil(focusScore)) + 5
+	focused := make([]*store.ScoreBinPerformance, 0, 11)
+	for _, bin := range bins {
+		if bin == nil {
+			continue
+		}
+		if bin.BinStart >= lowerBound && bin.BinStart <= upperBound {
+			focused = append(focused, bin)
+		}
+	}
+	if len(focused) > 0 {
+		return focused
+	}
+
+	return nearestPerformanceBins(bins, focusScore, 11)
+}
+
+func resolvePerformanceFocusScore(candidate CandidateCoin) (float64, bool) {
+	if candidate.LogicScore == nil {
+		return 0, false
+	}
+	score := *candidate.LogicScore
+	if math.IsNaN(score) || math.IsInf(score, 0) {
+		return 0, false
+	}
+	return score, true
+}
+
+func samplePerformanceBinsEvenly(bins []*store.ScoreBinPerformance, limit int) []*store.ScoreBinPerformance {
+	if len(bins) == 0 || limit <= 0 || len(bins) <= limit {
+		return bins
+	}
+
+	step := float64(len(bins)-1) / float64(limit-1)
+	selected := make([]*store.ScoreBinPerformance, 0, limit)
+	seen := make(map[int]struct{}, limit)
+	for i := 0; i < limit; i++ {
+		index := int(math.Round(float64(i) * step))
+		if index < 0 {
+			index = 0
+		}
+		if index >= len(bins) {
+			index = len(bins) - 1
+		}
+		if _, exists := seen[index]; exists {
+			continue
+		}
+		seen[index] = struct{}{}
+		selected = append(selected, bins[index])
+	}
+	return selected
+}
+
+func nearestPerformanceBins(
+	bins []*store.ScoreBinPerformance,
+	focusScore float64,
+	limit int,
+) []*store.ScoreBinPerformance {
+	if len(bins) == 0 || limit <= 0 || len(bins) <= limit {
+		return bins
+	}
+
+	type candidate struct {
+		bin      *store.ScoreBinPerformance
+		distance float64
+		index    int
+	}
+
+	candidates := make([]candidate, 0, len(bins))
+	for index, bin := range bins {
+		if bin == nil {
+			continue
+		}
+		candidates = append(candidates, candidate{
+			bin:      bin,
+			distance: math.Abs(float64(bin.BinStart) - focusScore),
+			index:    index,
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].distance == candidates[j].distance {
+			return candidates[i].index < candidates[j].index
+		}
+		return candidates[i].distance < candidates[j].distance
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].bin.BinStart < candidates[j].bin.BinStart
+	})
+
+	selected := make([]*store.ScoreBinPerformance, 0, len(candidates))
+	for _, candidate := range candidates {
+		selected = append(selected, candidate.bin)
+	}
+	return selected
 }
 
 func (e *StrategyEngine) formatPositionInfo(index int, pos PositionInfo, ctx *Context) string {
@@ -514,8 +754,10 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 	var sb strings.Builder
 	indicators := e.config.Indicators
 
-	sb.WriteString(e.formatTechnicalContext(data))
-	sb.WriteString("\n")
+	if technicalContext := e.formatTechnicalContext(data); technicalContext != "" {
+		sb.WriteString(technicalContext)
+		sb.WriteString("\n")
+	}
 
 	// Clearly label the coin symbol
 	sb.WriteString(fmt.Sprintf("=== %s Market Data ===\n\n", data.Symbol))
@@ -592,6 +834,9 @@ func (e *StrategyEngine) formatTechnicalContext(data *market.Data) string {
 	if data == nil {
 		return ""
 	}
+	if !hasPromptTechnicalIndicators(e.config.Indicators) {
+		return ""
+	}
 
 	var sb strings.Builder
 	primaryTimeframe := data.PrimaryTimeframe
@@ -614,6 +859,15 @@ func (e *StrategyEngine) formatTechnicalContext(data *market.Data) string {
 	}
 
 	return sb.String()
+}
+
+func hasPromptTechnicalIndicators(indicators store.IndicatorConfig) bool {
+	return indicators.EnableEMA ||
+		indicators.EnableMACD ||
+		indicators.EnableRSI ||
+		indicators.EnableATR ||
+		indicators.EnableBOLL ||
+		indicators.EnableDonchianBox
 }
 
 func (e *StrategyEngine) formatTechnicalSnapshot(timeframe string, tfData *market.TimeframeSeriesData, currentPrice float64, isPrimary bool) string {

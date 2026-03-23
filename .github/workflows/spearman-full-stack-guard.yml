@@ -1,0 +1,86 @@
+name: Spearman Full-Stack Guard
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - main
+  push:
+    branches:
+      - dev
+      - main
+
+jobs:
+  spearman-full-stack-guard:
+    name: Spearman Full Regression & Guard
+    runs-on: ubuntu-latest
+    env:
+      DATA_ENCRYPTION_KEY: test-encryption-key-for-ci-only-not-production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.3'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: ./web
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: ./web
+        run: npm run build
+
+      - name: Build backend CLI
+        run: ./scripts/with_go_env.sh go build -o nofx .
+
+      - name: Run full regression
+        run: ./nofx full_regression
+
+      - name: Start temporary frontend and backend
+        run: |
+          set -euo pipefail
+          nohup python3 -m http.server 3000 -d web/dist >/tmp/nofx-frontend-ci.log 2>&1 &
+          echo $! >/tmp/nofx-frontend-ci.pid
+          nohup ./nofx >/tmp/nofx-ci.log 2>&1 &
+          echo $! >/tmp/nofx-ci.pid
+
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/api/health >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Backend failed to become ready"
+          tail -n 50 /tmp/nofx-ci.log || true
+          exit 1
+
+      - name: Run full-stack healthcheck twice
+        run: |
+          ./nofx healthcheck
+          ./nofx healthcheck
+
+      - name: Run Spearman outlier monitor
+        run: ./nofx monitor_spearman
+
+      - name: Cleanup background services
+        if: always()
+        run: |
+          if [ -f /tmp/nofx-ci.pid ]; then
+            kill "$(cat /tmp/nofx-ci.pid)" 2>/dev/null || true
+          fi
+          if [ -f /tmp/nofx-frontend-ci.pid ]; then
+            kill "$(cat /tmp/nofx-frontend-ci.pid)" 2>/dev/null || true
+          fi
+          pkill -x nofx 2>/dev/null || true
+          pkill -f "python3 -m http.server 3000 -d web/dist" 2>/dev/null || true

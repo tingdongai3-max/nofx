@@ -5,6 +5,7 @@ import (
 	"nofx/logger"
 	"nofx/provider/nofxos"
 	"nofx/store"
+	"sort"
 	"sync"
 	"time"
 )
@@ -151,6 +152,21 @@ func CalculateZScore(current float64, history []float64) float64 {
 }
 
 func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData, now time.Time) *HeatScoreData {
+	return buildHeatScoreWithMode(traderID, symbol, data, quant, now, true)
+}
+
+func RecalculateHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData) *HeatScoreData {
+	return buildHeatScoreWithMode(traderID, symbol, data, quant, time.Now().UTC(), false)
+}
+
+func buildHeatScoreWithMode(
+	traderID,
+	symbol string,
+	data *Data,
+	quant *nofxos.QuantData,
+	now time.Time,
+	commitHistory bool,
+) *HeatScoreData {
 	if data == nil {
 		return nil
 	}
@@ -165,35 +181,54 @@ func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData
 		volumeSpikeContext.shortOK,
 		volumeSpikeContext.mediumOK,
 	)
-	quantRaw, quantAvailable := computeQuantHeatRaw(quant)
-	onChainRaw, onChainAvailable := computeOnChainHeatRaw(data)
-	socialRaw, socialAvailable := computeSocialHeatRaw(data)
+	quantOIRaw, quantImbalanceRaw, quantNetflowRaw, quantOIAvailable, quantImbalanceAvailable, quantNetflowAvailable := computeQuantSubfactorRaw(data, quant)
+	quantAvailable := quantOIAvailable || quantImbalanceAvailable || quantNetflowAvailable
+	onChainRatioRaw, onChainBuyRaw, onChainRatioAvailable, onChainBuyAvailable := computeOnChainSubfactorRaw(data)
+	onChainAvailable := onChainRatioAvailable || onChainBuyAvailable
+	socialRankRaw, socialUpvoteRaw, socialRankAvailable, socialUpvoteAvailable := computeSocialSubfactorRaw(data)
+	socialAvailable := socialRankAvailable || socialUpvoteAvailable
 
-	marketZ := scoreSource(symbol, "market", marketRaw, now)
-	trendCoreZ := scoreSource(symbol, "trend", trendRaw, now)
+	marketZ := scoreSource(symbol, "market", marketRaw, now, commitHistory)
+	trendCoreZ := scoreSource(symbol, "trend", trendRaw, now, commitHistory)
 	donchianZ := 0.0
 	if donchianAvailable {
-		donchianZ = scoreSource(symbol, "donchian_factor", donchianRaw, now)
+		donchianZ = scoreSource(symbol, "donchian_factor", donchianRaw, now, commitHistory)
 	}
 	volumeSpikeCoreZ := 0.0
 	if volumeSpikeAvailable {
-		volumeSpikeCoreZ = scoreSource(symbol, "volume_spike", volumeSpikeRaw, now)
+		volumeSpikeCoreZ = scoreSource(symbol, "volume_spike", volumeSpikeRaw, now, commitHistory)
 	}
 	mtfResonanceZ := 0.0
 	if mtfResonanceAvailable {
-		mtfResonanceZ = scoreSource(symbol, "mtf_resonance", mtfResonanceRaw, now)
+		mtfResonanceZ = scoreSource(symbol, "mtf_resonance", mtfResonanceRaw, now, commitHistory)
 	}
-	quantZ := 0.0
-	if quantAvailable {
-		quantZ = scoreSource(symbol, "quant", quantRaw, now)
+	quantOIZ := 0.0
+	if quantOIAvailable {
+		quantOIZ = scoreSource(symbol, "quant_oi", quantOIRaw, now, commitHistory)
 	}
-	onChainZ := 0.0
-	if onChainAvailable {
-		onChainZ = scoreSource(symbol, "onchain", onChainRaw, now)
+	quantImbalanceZ := 0.0
+	if quantImbalanceAvailable {
+		quantImbalanceZ = scoreSource(symbol, "quant_imbalance", quantImbalanceRaw, now, commitHistory)
 	}
-	socialZ := 0.0
-	if socialAvailable {
-		socialZ = scoreSource(symbol, "social", socialRaw, now)
+	quantNetflowZ := 0.0
+	if quantNetflowAvailable {
+		quantNetflowZ = scoreSource(symbol, "quant_netflow", quantNetflowRaw, now, commitHistory)
+	}
+	onChainRatioZ := 0.0
+	if onChainRatioAvailable {
+		onChainRatioZ = scoreSource(symbol, "onchain_ratio", onChainRatioRaw, now, commitHistory)
+	}
+	onChainBuyZ := 0.0
+	if onChainBuyAvailable {
+		onChainBuyZ = scoreSource(symbol, "onchain_buy_ratio", onChainBuyRaw, now, commitHistory)
+	}
+	socialRankZ := 0.0
+	if socialRankAvailable {
+		socialRankZ = scoreSource(symbol, "social_rank", socialRankRaw, now, commitHistory)
+	}
+	socialUpvoteZ := 0.0
+	if socialUpvoteAvailable {
+		socialUpvoteZ = scoreSource(symbol, "social_upvote", socialUpvoteRaw, now, commitHistory)
 	}
 
 	adaptiveState := GetAdaptiveWeightState(traderID, data.Sector, symbol)
@@ -205,10 +240,20 @@ func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData
 	onChainWeight := adaptiveWeights["onchain"]
 	socialWeight := adaptiveWeights["social"]
 	nestedWeights := adaptiveNestedWeightsFromState(adaptiveState)
+	factorStates := adaptiveFactorStatesByName(adaptiveState.Factors, adaptiveState.HiddenFactors)
+	quantFactorState := adaptiveFactorStateByName(adaptiveState.Factors, "quant")
 	socialFactor := adaptiveFactorStateByName(adaptiveState.Factors, "social")
+	onChainFactorState := adaptiveFactorStateByName(adaptiveState.Factors, "onchain")
 	volumeSpikeFactorState := adaptiveFactorStateByName(adaptiveState.Factors, "volume_spike")
 	donchianFactorState := adaptiveFactorStateByName(adaptiveState.HiddenFactors, "donchian_factor")
 	mtfResonanceFactorState := adaptiveFactorStateByName(adaptiveState.HiddenFactors, "mtf_resonance")
+	quantOIFactorState := adaptiveFactorStateByName(adaptiveState.HiddenFactors, "quant_oi")
+	quantImbalanceFactorState := adaptiveFactorStateByName(adaptiveState.HiddenFactors, "quant_imbalance")
+	quantNetflowFactorState := adaptiveFactorStateByName(adaptiveState.HiddenFactors, "quant_netflow")
+	socialRankFactorState := adaptiveFactorStateByName(adaptiveState.HiddenFactors, "social_rank")
+	socialUpvoteFactorState := adaptiveFactorStateByName(adaptiveState.HiddenFactors, "social_upvote")
+	onChainRatioFactorState := adaptiveFactorStateByName(adaptiveState.HiddenFactors, "onchain_ratio")
+	onChainBuyFactorState := adaptiveFactorStateByName(adaptiveState.HiddenFactors, "onchain_buy_ratio")
 
 	trendNestedWeights := normalizedNestedSubweights(
 		nestedWeights,
@@ -220,7 +265,7 @@ func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData
 	)
 	trendNested := nestedFactorScoreFromZScores(trendNestedWeights, map[string]float64{
 		"trend":           trendCoreZ,
-		"donchian_factor": donchianZ,
+		"donchian_factor": adjustedZScoreForAdaptiveFactor(symbol, "donchian_factor", donchianZ, factorStates),
 	})
 
 	volumeSpikeNestedWeights := normalizedNestedSubweights(
@@ -233,7 +278,45 @@ func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData
 	)
 	volumeSpikeNested := nestedFactorScoreFromZScores(volumeSpikeNestedWeights, map[string]float64{
 		"volume_spike":  volumeSpikeCoreZ,
-		"mtf_resonance": mtfResonanceZ,
+		"mtf_resonance": adjustedZScoreForAdaptiveFactor(symbol, "mtf_resonance", mtfResonanceZ, factorStates),
+	})
+	quantNestedWeights := normalizedNestedSubweights(
+		nestedWeights,
+		[]string{"quant_oi", "quant_imbalance", "quant_netflow"},
+		map[string]bool{
+			"quant_oi":        quantOIAvailable,
+			"quant_imbalance": quantImbalanceAvailable,
+			"quant_netflow":   quantNetflowAvailable,
+		},
+	)
+	quantNested := nestedFactorScoreFromZScores(quantNestedWeights, map[string]float64{
+		"quant_oi":        adjustedZScoreForAdaptiveFactor(symbol, "quant_oi", quantOIZ, factorStates),
+		"quant_imbalance": adjustedZScoreForAdaptiveFactor(symbol, "quant_imbalance", quantImbalanceZ, factorStates),
+		"quant_netflow":   adjustedZScoreForAdaptiveFactor(symbol, "quant_netflow", quantNetflowZ, factorStates),
+	})
+	socialNestedWeights := normalizedNestedSubweights(
+		nestedWeights,
+		[]string{"social_rank", "social_upvote"},
+		map[string]bool{
+			"social_rank":   socialRankAvailable,
+			"social_upvote": socialUpvoteAvailable,
+		},
+	)
+	socialNested := nestedFactorScoreFromZScores(socialNestedWeights, map[string]float64{
+		"social_rank":   adjustedZScoreForAdaptiveFactor(symbol, "social_rank", socialRankZ, factorStates),
+		"social_upvote": adjustedZScoreForAdaptiveFactor(symbol, "social_upvote", socialUpvoteZ, factorStates),
+	})
+	onChainNestedWeights := normalizedNestedSubweights(
+		nestedWeights,
+		[]string{"onchain_ratio", "onchain_buy_ratio"},
+		map[string]bool{
+			"onchain_ratio":     onChainRatioAvailable,
+			"onchain_buy_ratio": onChainBuyAvailable,
+		},
+	)
+	onChainNested := nestedFactorScoreFromZScores(onChainNestedWeights, map[string]float64{
+		"onchain_ratio":     adjustedZScoreForAdaptiveFactor(symbol, "onchain_ratio", onChainRatioZ, factorStates),
+		"onchain_buy_ratio": adjustedZScoreForAdaptiveFactor(symbol, "onchain_buy_ratio", onChainBuyZ, factorStates),
 	})
 
 	tradingWeights := map[string]float64{
@@ -241,13 +324,13 @@ func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData
 		"trend":  trendWeight,
 	}
 	tradingScores := map[string]float64{
-		"market": marketZ,
-		"trend":  trendNested.zScore,
+		"market": adjustedZScoreForAdaptiveFactor(symbol, "market", marketZ, factorStates),
+		"trend":  adjustedZScoreForAdaptiveFactor(symbol, "trend", trendNested.zScore, factorStates),
 	}
 	tradingWeight := marketWeight + trendWeight
 	if volumeSpikeAvailable {
 		tradingWeights["volume_spike"] = volumeSpikeWeight
-		tradingScores["volume_spike"] = volumeSpikeNested.zScore
+		tradingScores["volume_spike"] = adjustedZScoreForAdaptiveFactor(symbol, "volume_spike", volumeSpikeNested.zScore, factorStates)
 		tradingWeight += volumeSpikeWeight
 	}
 	totalWeight := tradingWeight
@@ -271,6 +354,9 @@ func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData
 			VolumeSpikeScore:        50,
 			DonchianFactorScore:     50,
 			MTFResonanceFactorScore: 50,
+			QuantFactorScore:        50,
+			SocialScore:             50,
+			OnChainScore:            50,
 			SourceWeights: map[string]float64{
 				"social":       0,
 				"onchain":      0,
@@ -279,6 +365,8 @@ func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData
 				"volume_spike": 0,
 				"quant":        0,
 			},
+			RawFactorScores:    map[string]float64{},
+			RawFactorAvailable: map[string]bool{},
 		}
 	}
 
@@ -289,15 +377,15 @@ func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData
 	quantScores := map[string]float64{}
 	if quantAvailable {
 		quantWeights["quant"] = quantWeight
-		quantScores["quant"] = quantZ
+		quantScores["quant"] = adjustedZScoreForAdaptiveFactor(symbol, "quant", quantNested.zScore, factorStates)
 	}
 	if onChainAvailable {
 		quantWeights["onchain"] = onChainWeight
-		quantScores["onchain"] = onChainZ
+		quantScores["onchain"] = adjustedZScoreForAdaptiveFactor(symbol, "onchain", onChainNested.zScore, factorStates)
 	}
 	if socialAvailable {
 		quantWeights["social"] = socialWeight
-		quantScores["social"] = socialZ
+		quantScores["social"] = adjustedZScoreForAdaptiveFactor(symbol, "social", socialNested.zScore, factorStates)
 	}
 	if len(quantWeights) > 0 {
 		quantScore = combineWeightedScores(quantWeights, quantScores)
@@ -332,10 +420,13 @@ func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData
 		sourceWeights["onchain"] = onChainWeight / totalWeight
 	}
 
-	logger.Infof("V3_AUDIT_BAYES_IC: Symbol=%s, Sector=%s, Alpha=%.2f, Sector_Social_IC=%.2f, Coin_Social_IC=%.2f, Final_Social_W=%.2f",
+	logger.Infof("V3_AUDIT_BAYES_IC: Symbol=%s, Sector=%s, Alpha=%.2f, BlendAdaptive=%.2f, SectorSamples=%d, CoinSamples=%d, Sector_Social_IC=%.2f, Coin_Social_IC=%.2f, Final_Social_W=%.2f",
 		symbol,
 		data.Sector,
 		adaptiveState.Alpha,
+		adaptiveState.BlendAdaptive,
+		adaptiveState.SectorSampleCount,
+		adaptiveState.CoinSampleCount,
 		socialFactor.SectorIC,
 		socialFactor.CoinIC,
 		socialFactor.FinalWeight,
@@ -356,6 +447,39 @@ func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData
 		volumeSpikeNestedWeights["volume_spike"],
 		volumeSpikeNestedWeights["mtf_resonance"],
 	)
+	logger.Infof("V3_AUDIT_SUB_SOCIAL: Symbol=%s, Rank_W=%.2f (IC:%.2f), Upvote_W=%.2f (IC:%.2f)",
+		symbol,
+		socialNestedWeights["social_rank"],
+		socialRankFactorState.FinalIC,
+		socialNestedWeights["social_upvote"],
+		socialUpvoteFactorState.FinalIC,
+	)
+	logger.Infof("V3_AUDIT_FULL_NESTED: Symbol=%s, Group=Trend, SubWeights=[Trend:%.2f, Donchian:%.2f]",
+		symbol,
+		trendNestedWeights["trend"],
+		trendNestedWeights["donchian_factor"],
+	)
+	logger.Infof("V3_AUDIT_FULL_NESTED: Symbol=%s, Group=VolumeSpike, SubWeights=[Core:%.2f, Resonance:%.2f]",
+		symbol,
+		volumeSpikeNestedWeights["volume_spike"],
+		volumeSpikeNestedWeights["mtf_resonance"],
+	)
+	logger.Infof("V3_AUDIT_FULL_NESTED: Symbol=%s, Group=Quant, SubWeights=[OI:%.2f, Imb:%.2f, Net:%.2f]",
+		symbol,
+		quantNestedWeights["quant_oi"],
+		quantNestedWeights["quant_imbalance"],
+		quantNestedWeights["quant_netflow"],
+	)
+	logger.Infof("V3_AUDIT_FULL_NESTED: Symbol=%s, Group=Social, SubWeights=[Rank:%.2f, Upvote:%.2f]",
+		symbol,
+		socialNestedWeights["social_rank"],
+		socialNestedWeights["social_upvote"],
+	)
+	logger.Infof("V3_AUDIT_FULL_NESTED: Symbol=%s, Group=OnChain, SubWeights=[Ratio:%.2f, Buy:%.2f]",
+		symbol,
+		onChainNestedWeights["onchain_ratio"],
+		onChainNestedWeights["onchain_buy_ratio"],
+	)
 	volumeSpikeScore := volumeSpikeNested.score
 	if volumeSpikeAvailable {
 		logger.Infof("V3_AUDIT_SPIKE: Symbol=%s, Z_Vol=%.2f, Z_Price=%.2f, Final_Spike=%.1f",
@@ -374,6 +498,23 @@ func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData
 			volumeSpikeNestedWeights["mtf_resonance"],
 		)
 	}
+	if quantAvailable {
+		logger.Debugf("V3_AUDIT_SUBFACTOR_IC: Symbol=%s, Quant_IC=%.2f, OI_IC=%.2f, Imbalance_IC=%.2f, Netflow_IC=%.2f",
+			symbol,
+			quantFactorState.FinalIC,
+			quantOIFactorState.FinalIC,
+			quantImbalanceFactorState.FinalIC,
+			quantNetflowFactorState.FinalIC,
+		)
+	}
+	if onChainAvailable {
+		logger.Debugf("V3_AUDIT_SUBFACTOR_IC: Symbol=%s, OnChain_IC=%.2f, Ratio_IC=%.2f, Buy_IC=%.2f",
+			symbol,
+			onChainFactorState.FinalIC,
+			onChainRatioFactorState.FinalIC,
+			onChainBuyFactorState.FinalIC,
+		)
+	}
 	logger.Infof("V3_AUDIT_HEAT: %s, Raw_Market=%.2f, Z_Market=%.2f, Final_Score=%.1f", symbol, marketRaw, marketZ, composite)
 
 	return &HeatScoreData{
@@ -385,14 +526,57 @@ func buildHeatScore(traderID, symbol string, data *Data, quant *nofxos.QuantData
 		VolumeSpikeScore:        volumeSpikeScore,
 		DonchianFactorScore:     clamp(zScoreToPercent(donchianZ), 0, 100),
 		MTFResonanceFactorScore: clamp(zScoreToPercent(mtfResonanceZ), 0, 100),
-		QuantFactorScore:        clamp(zScoreToPercent(quantZ), 0, 100),
-		SocialScore:             clamp(zScoreToPercent(socialZ), 0, 100),
-		OnChainScore:            clamp(zScoreToPercent(onChainZ), 0, 100),
+		QuantFactorScore:        quantNested.score,
+		QuantOIRaw:              quantOIRaw,
+		QuantImbalanceRaw:       quantImbalanceRaw,
+		QuantNetflowRaw:         quantNetflowRaw,
+		SocialScore:             socialNested.score,
+		OnChainScore:            onChainNested.score,
+		OnChainRatioRaw:         onChainRatioRaw,
+		OnChainBuyRaw:           onChainBuyRaw,
 		SourceWeights:           sourceWeights,
+		RawFactorScores: map[string]float64{
+			"market":             marketZ,
+			"trend":              trendCoreZ,
+			"trend_group":        trendNested.zScore,
+			"donchian_factor":    donchianZ,
+			"volume_spike":       volumeSpikeCoreZ,
+			"volume_spike_group": volumeSpikeNested.zScore,
+			"mtf_resonance":      mtfResonanceZ,
+			"quant_group":        quantNested.zScore,
+			"quant_oi":           quantOIZ,
+			"quant_imbalance":    quantImbalanceZ,
+			"quant_netflow":      quantNetflowZ,
+			"social_group":       socialNested.zScore,
+			"social_rank":        socialRankZ,
+			"social_upvote":      socialUpvoteZ,
+			"onchain_group":      onChainNested.zScore,
+			"onchain_ratio":      onChainRatioZ,
+			"onchain_buy_ratio":  onChainBuyZ,
+		},
+		RawFactorAvailable: map[string]bool{
+			"market":             true,
+			"trend":              true,
+			"trend_group":        true,
+			"donchian_factor":    donchianAvailable,
+			"volume_spike":       volumeSpikeAvailable,
+			"volume_spike_group": volumeSpikeAvailable || mtfResonanceAvailable,
+			"mtf_resonance":      mtfResonanceAvailable,
+			"quant_group":        quantAvailable,
+			"quant_oi":           quantOIAvailable,
+			"quant_imbalance":    quantImbalanceAvailable,
+			"quant_netflow":      quantNetflowAvailable,
+			"social_group":       socialAvailable,
+			"social_rank":        socialRankAvailable,
+			"social_upvote":      socialUpvoteAvailable,
+			"onchain_group":      onChainAvailable,
+			"onchain_ratio":      onChainRatioAvailable,
+			"onchain_buy_ratio":  onChainBuyAvailable,
+		},
 	}
 }
 
-func scoreSource(symbol, source string, raw float64, now time.Time) float64 {
+func scoreSource(symbol, source string, raw float64, now time.Time, commitHistory bool) float64 {
 	if !isFinite(raw) {
 		raw = 0
 	}
@@ -400,7 +584,9 @@ func scoreSource(symbol, source string, raw float64, now time.Time) float64 {
 	series := getHeatSeries(key)
 	history := series.history(now)
 	z := CalculateZScore(raw, history)
-	series.append(now, raw)
+	if commitHistory {
+		series.append(now, raw)
+	}
 	return z
 }
 
@@ -411,6 +597,36 @@ func adaptiveFactorStateByName(factors []AdaptiveFactorState, name string) Adapt
 		}
 	}
 	return AdaptiveFactorState{Name: name}
+}
+
+func adaptiveFactorStatesByName(groups ...[]AdaptiveFactorState) map[string]AdaptiveFactorState {
+	states := make(map[string]AdaptiveFactorState)
+	for _, factors := range groups {
+		for _, factor := range factors {
+			states[factor.Name] = factor
+		}
+	}
+	return states
+}
+
+func adjustedZScoreForAdaptiveFactor(symbol, factor string, originalZ float64, states map[string]AdaptiveFactorState) float64 {
+	state := states[factor]
+	if state.Name == "" {
+		state.Name = factor
+	}
+	if state.FinalIC >= 0 || math.Abs(originalZ) <= 1e-12 {
+		return originalZ
+	}
+
+	invertedZ := -originalZ
+	logger.Infof("V3_AUDIT_INVERSION: Symbol=%s, Factor=%s, IC=%.2f, OriginalZ=%.2f, InvertedZ=%.2f",
+		symbol,
+		state.Name,
+		state.FinalIC,
+		originalZ,
+		invertedZ,
+	)
+	return invertedZ
 }
 
 func EnsureHeatHistoryPreloaded(symbol string, primaryTimeframe string) {
@@ -710,95 +926,124 @@ func computeTrendHeatRaw(data *Data) float64 {
 	return raw
 }
 
-func computeQuantHeatRaw(quant *nofxos.QuantData) (float64, bool) {
-	if quant == nil {
+func computeQuantSubfactorRaw(data *Data, quant *nofxos.QuantData) (float64, float64, float64, bool, bool, bool) {
+	oiRaw, oiAvailable := computeQuantOIRaw(quant)
+	imbalanceRaw, imbalanceAvailable := computeQuantImbalanceRaw(data)
+	netflowRaw, netflowAvailable := computeQuantNetflowRaw(quant)
+	return oiRaw, imbalanceRaw, netflowRaw, oiAvailable, imbalanceAvailable, netflowAvailable
+}
+
+func computeQuantOIRaw(quant *nofxos.QuantData) (float64, bool) {
+	if quant == nil || len(quant.OI) == 0 {
 		return 0, false
 	}
 
-	raw := 0.0
-	available := false
-
-	if change, ok := quant.PriceChange["1h"]; ok {
-		raw += math.Abs(change) * 100 * 0.35
-		available = true
+	exchanges := make([]string, 0, len(quant.OI))
+	for exchange := range quant.OI {
+		exchanges = append(exchanges, exchange)
 	}
-	if change, ok := quant.PriceChange["4h"]; ok {
-		raw += math.Abs(change) * 100 * 0.2
-		available = true
-	}
+	sort.Strings(exchanges)
 
-	for _, oi := range quant.OI {
+	total := 0.0
+	used := 0
+	for _, exchange := range exchanges {
+		oi := quant.OI[exchange]
 		if oi == nil || oi.Delta == nil {
 			continue
 		}
-		if delta, ok := oi.Delta["1h"]; ok && delta != nil {
-			raw += math.Abs(delta.OIDeltaPercent) * 0.25
-			available = true
-			break
+		delta := oi.Delta["1h"]
+		if delta == nil || !isFinite(delta.OIDeltaPercent) {
+			continue
 		}
+		total += delta.OIDeltaPercent
+		used++
 	}
-
-	if quant.Netflow != nil {
-		netflowMagnitude := 0.0
-		if quant.Netflow.Institution != nil {
-			netflowMagnitude += sumAbsoluteFlow(quant.Netflow.Institution.Future, "1h", "4h")
-			netflowMagnitude += sumAbsoluteFlow(quant.Netflow.Institution.Spot, "1h", "4h")
-		}
-		if quant.Netflow.Personal != nil {
-			netflowMagnitude += sumAbsoluteFlow(quant.Netflow.Personal.Future, "1h", "4h")
-			netflowMagnitude += sumAbsoluteFlow(quant.Netflow.Personal.Spot, "1h", "4h")
-		}
-		if netflowMagnitude > 0 {
-			raw += math.Log10(1+netflowMagnitude) * 10 * 0.2
-			available = true
-		}
+	if used == 0 {
+		return 0, false
 	}
-
-	return raw, available
+	return total / float64(used), true
 }
 
-func computeOnChainHeatRaw(data *Data) (float64, bool) {
-	if data == nil || data.DexScreener == nil {
+func computeQuantImbalanceRaw(data *Data) (float64, bool) {
+	if data == nil || data.Orderbook == nil || !isFinite(data.Orderbook.Imbalance) {
 		return 0, false
+	}
+	return data.Orderbook.Imbalance, true
+}
+
+func computeQuantNetflowRaw(quant *nofxos.QuantData) (float64, bool) {
+	if quant == nil || quant.Netflow == nil {
+		return 0, false
+	}
+
+	netflow := 0.0
+	if quant.Netflow.Institution != nil {
+		netflow += sumFlow(quant.Netflow.Institution.Future, "1h", "4h")
+		netflow += sumFlow(quant.Netflow.Institution.Spot, "1h", "4h")
+	}
+	if quant.Netflow.Personal != nil {
+		netflow += sumFlow(quant.Netflow.Personal.Future, "1h", "4h")
+		netflow += sumFlow(quant.Netflow.Personal.Spot, "1h", "4h")
+	}
+	if !isFinite(netflow) || netflow == 0 {
+		return 0, false
+	}
+
+	return math.Copysign(math.Log10(1+math.Abs(netflow)), netflow), true
+}
+
+func computeOnChainSubfactorRaw(data *Data) (float64, float64, bool, bool) {
+	if data == nil || data.DexScreener == nil {
+		return 0, 0, false, false
 	}
 
 	dex := data.DexScreener
 	if dex.LiquidityUSD < MinDexLiquidityUSD {
-		return 0, false
+		return 0, 0, false, false
 	}
 
-	raw := 0.0
-	available := false
-
-	if dex.OnchainToCEXRatio > 0 {
-		raw += math.Min(dex.OnchainToCEXRatio, 3.0) * 40
-		available = true
+	ratioRaw := 0.0
+	ratioAvailable := false
+	if isFinite(dex.OnchainToCEXRatio) && dex.OnchainToCEXRatio > 0 {
+		ratioRaw = math.Min(dex.OnchainToCEXRatio, 3.0)
+		ratioAvailable = true
 	}
 
-	if dex.BuyTxnsH1+dex.SellTxnsH1 > 0 {
-		buyBias := dex.BuyRatio - 0.5
-		if buyBias > 0 {
-			raw += buyBias * 120
-		}
-		available = true
+	buyRaw := 0.0
+	buyAvailable := false
+	if dex.BuyTxnsH1+dex.SellTxnsH1 > 0 && isFinite(dex.BuyRatio) {
+		buyRaw = dex.BuyRatio
+		buyAvailable = true
 	}
 
-	return raw, available
+	return ratioRaw, buyRaw, ratioAvailable, buyAvailable
 }
 
-func computeSocialHeatRaw(data *Data) (float64, bool) {
+func SocialSubfactorRawValues(sentiment *GeckoSentimentData) (float64, float64) {
+	if sentiment == nil {
+		return 0, 0
+	}
+
+	rankRaw := sentiment.TrendingRankScore
+	if !isFinite(rankRaw) || rankRaw < 0 {
+		rankRaw = 0
+	}
+
+	upvoteRaw := sentiment.SentimentVotesUpPercentage
+	if !isFinite(upvoteRaw) || upvoteRaw < 0 {
+		upvoteRaw = 0
+	}
+
+	return rankRaw, upvoteRaw
+}
+
+func computeSocialSubfactorRaw(data *Data) (float64, float64, bool, bool) {
 	if data == nil || data.GeckoSentiment == nil {
-		return 0, false
+		return 0, 0, false, false
 	}
 
-	interest := data.GeckoSentiment.PublicInterestScore
-	sentimentUp := data.GeckoSentiment.SentimentVotesUpPercentage
-	if interest <= 0 && sentimentUp <= 0 {
-		return 0, false
-	}
-
-	raw := (interest * 0.7) + (sentimentUp * 0.3)
-	return raw, socialSignalAvailable(interest, sentimentUp)
+	rankRaw, upvoteRaw := SocialSubfactorRawValues(data.GeckoSentiment)
+	return rankRaw, upvoteRaw, isFinite(rankRaw), isFinite(upvoteRaw)
 }
 
 func preloadHeatHistory(symbol string, primaryTimeframe string) {
@@ -957,14 +1202,14 @@ func syntheticOIData(series []float64, idx int) *OIData {
 	}
 }
 
-func sumAbsoluteFlow(values map[string]float64, keys ...string) float64 {
+func sumFlow(values map[string]float64, keys ...string) float64 {
 	if len(values) == 0 {
 		return 0
 	}
 	total := 0.0
 	for _, key := range keys {
 		if value, ok := values[key]; ok {
-			total += math.Abs(value)
+			total += value
 		}
 	}
 	return total

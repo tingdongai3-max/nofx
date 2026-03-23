@@ -7,9 +7,9 @@ import (
 	"nofx/kernel"
 	"nofx/logger"
 	"nofx/market"
+	"nofx/provider/nofxos"
 	"nofx/store"
 	"nofx/wallet"
-	"sort"
 	"strings"
 	"time"
 )
@@ -146,7 +146,7 @@ func (at *AutoTrader) runCycle() error {
 	}
 
 	at.updateCandidateSnapshot(ctx)
-	if shadowErr := at.persistShadowSnapshots(decisionTime); shadowErr != nil {
+	if shadowErr := at.persistShadowSnapshots(decisionTime, ctx); shadowErr != nil {
 		logger.Warnf("⚠️ Failed to persist shadow snapshots: %v", shadowErr)
 	}
 
@@ -296,11 +296,13 @@ func (at *AutoTrader) updateCandidateSnapshot(ctx *kernel.Context) {
 	}
 
 	snapshot := CandidateSnapshot{
-		TraderID:   at.id,
-		TraderName: at.name,
-		UpdatedAt:  time.Now().UTC(),
-		Candidates: make([]CandidateMarketSnapshot, 0, len(ctx.CandidateCoins)),
+		TraderID:    at.id,
+		TraderName:  at.name,
+		UpdatedAt:   time.Now().UTC(),
+		ScoreEngine: "recalculated_backcast",
+		Candidates:  make([]CandidateMarketSnapshot, 0, len(ctx.CandidateCoins)),
 	}
+	telemetry := make(map[string]candidateTelemetrySnapshot, len(ctx.CandidateCoins))
 
 	for _, coin := range ctx.CandidateCoins {
 		data, ok := ctx.MarketDataMap[coin.Symbol]
@@ -308,36 +310,49 @@ func (at *AutoTrader) updateCandidateSnapshot(ctx *kernel.Context) {
 			continue
 		}
 
-		timeframes := make([]string, 0, len(data.TimeframeData))
-		for tf := range data.TimeframeData {
-			timeframes = append(timeframes, tf)
+		recalculatedHeat := at.recalculateCandidateHeatScore(coin.Symbol, data, ctx.QuantDataMap)
+		logicScore := 0.0
+		hasLogicScore := false
+		if coin.LogicScore != nil && !math.IsNaN(*coin.LogicScore) && !math.IsInf(*coin.LogicScore, 0) {
+			logicScore = *coin.LogicScore
+			hasLogicScore = true
+		} else if recalculatedHeat != nil && !math.IsNaN(recalculatedHeat.CompositeScore) && !math.IsInf(recalculatedHeat.CompositeScore, 0) {
+			logicScore = recalculatedHeat.CompositeScore
+			hasLogicScore = true
 		}
-		sort.Strings(timeframes)
+
+		bias := store.PerformanceBiasWait
+		expectedEV := 0.0
+		var currentBin *store.ScoreBinPerformance
+		if hasLogicScore {
+			bias, expectedEV, currentBin = at.resolveCandidatePerformanceSummary(
+				coin.Symbol,
+				data,
+				logicScore,
+			)
+		}
+
+		if recalculatedHeat != nil {
+			telemetry[strings.ToUpper(coin.Symbol)] = candidateTelemetrySnapshot{
+				Heat:       recalculatedHeat.CompositeScore,
+				TradingSub: recalculatedHeat.TradingScore,
+				QuantSub:   recalculatedHeat.QuantScore,
+			}
+		}
 
 		snapshot.Candidates = append(snapshot.Candidates, CandidateMarketSnapshot{
-			Symbol:         coin.Symbol,
-			Sector:         data.Sector,
-			CurrentPrice:   data.CurrentPrice,
-			Timeframes:     timeframes,
-			DonchianBoxes:  buildDonchianBoxSnapshots(data.CurrentPrice, data.Indicators.Donchians),
-			TrendContexts:  buildTimeframeTrendSnapshots(data, at.config.StrategyConfig),
-			EMASignals:     buildEMASignalSnapshot(data.Indicators.EMAs),
-			OpenInterest:   data.OpenInterest,
-			Orderbook:      data.Orderbook,
-			DexScreener:    data.DexScreener,
-			GeckoSentiment: data.GeckoSentiment,
-			HeatScore:      data.HeatScore,
-			VolUtilization: data.VolatilityUtilization,
-			VolUtilBasis:   fmt.Sprintf("%dx%s", market.VolUtilLookback, data.PrimaryTimeframe),
-			FundingRate:    data.FundingRate,
-			AI500Score:     nil,
-			Sources:        append([]string(nil), coin.Sources...),
-			UpdatedAt:      snapshot.UpdatedAt,
+			Symbol:        coin.Symbol,
+			CurrentPrice:  data.CurrentPrice,
+			LogicScore:    logicScore,
+			Bias:          bias,
+			ExpectedEV:    expectedEV,
+			DebugBinStats: compactCandidateBin(currentBin),
 		})
 	}
 
 	at.candidateSnapshotMu.Lock()
 	at.candidateSnapshot = snapshot
+	at.candidateTelemetry = telemetry
 	at.candidateSnapshotMu.Unlock()
 
 	if len(ctx.CandidateCoins) > 0 && len(snapshot.Candidates) == 0 {
@@ -345,154 +360,142 @@ func (at *AutoTrader) updateCandidateSnapshot(ctx *kernel.Context) {
 	}
 }
 
-func buildDonchianBoxSnapshots(currentPrice float64, donchians map[int]market.DonchianResult) map[int]DonchianBoxSnapshot {
-	if len(donchians) == 0 {
+func (at *AutoTrader) recalculateCandidateHeatScore(
+	symbol string,
+	data *market.Data,
+	quantMap map[string]*kernel.QuantData,
+) *market.HeatScoreData {
+	if data == nil || symbol == "" {
 		return nil
 	}
 
-	snapshots := make(map[int]DonchianBoxSnapshot, len(donchians))
-	for period, box := range donchians {
-		snapshots[period] = DonchianBoxSnapshot{
-			Period: period,
-			Upper:  box.Upper,
-			Lower:  box.Lower,
-			Mid:    box.Mid,
-			State:  describeDonchianPhysicalState(currentPrice, box),
-		}
+	var quantData *nofxos.QuantData
+	if quantMap != nil {
+		quantData = toNofxosQuantData(quantMap[symbol])
 	}
-	return snapshots
+	return market.RecalculateHeatScore(at.id, symbol, data, quantData)
 }
 
-func buildEMASignalSnapshot(emas map[int]float64) EMASignalSnapshot {
-	snapshot := EMASignalSnapshot{
-		State:  "unavailable",
-		Values: make(map[int]float64),
-	}
-	if len(emas) == 0 {
-		return snapshot
-	}
-
-	periods := make([]int, 0, len(emas))
-	for period, value := range emas {
-		periods = append(periods, period)
-		snapshot.Values[period] = value
-	}
-	sort.Ints(periods)
-	snapshot.Periods = periods
-
-	if len(periods) < 2 {
-		snapshot.State = "single_ema"
-		return snapshot
+func (at *AutoTrader) resolveCandidatePerformanceSummary(
+	symbol string,
+	data *market.Data,
+	logicScore float64,
+) (string, float64, *store.ScoreBinPerformance) {
+	if at == nil || at.performanceCache == nil || data == nil || symbol == "" {
+		return store.PerformanceBiasWait, 0, nil
 	}
 
-	bullish := true
-	bearish := true
-	for i := 1; i < len(periods); i++ {
-		prev := snapshot.Values[periods[i-1]]
-		curr := snapshot.Values[periods[i]]
-		if prev <= curr {
-			bullish = false
+	matrices, err := at.performanceCache.GetMatricesWithWindow(
+		at.id,
+		data.Sector,
+		symbol,
+		store.PERFORMANCE_WINDOW_SIZE_DEFAULT,
+	)
+	if err != nil {
+		logger.Warnf("candidate performance summary failed: trader=%s symbol=%s err=%v", at.id, symbol, err)
+		return store.PerformanceBiasWait, 0, nil
+	}
+
+	var currentBin *store.ScoreBinPerformance
+	if matrices != nil {
+		currentBin = store.FindPerformanceBinForScore(matrices.Symbol, logicScore)
+		if currentBin == nil {
+			currentBin = store.FindPerformanceBinForScore(matrices.Sector, logicScore)
 		}
-		if prev >= curr {
-			bearish = false
+		if currentBin == nil {
+			currentBin = store.FindPerformanceBinForScore(matrices.Global, logicScore)
 		}
 	}
 
-	switch {
-	case bullish:
-		snapshot.State = "bullish_stack"
-	case bearish:
-		snapshot.State = "bearish_stack"
-	default:
-		snapshot.State = "mixed"
+	bias, expectedEV := store.ResolvePerformanceBias(currentBin)
+	if currentBin == nil {
+		return bias, expectedEV, nil
 	}
 
-	return snapshot
+	clonedBin := *currentBin
+	return bias, expectedEV, &clonedBin
 }
 
-func buildTimeframeTrendSnapshots(data *market.Data, strategyConfig *store.StrategyConfig) map[string]TimeframeTrendSnapshot {
-	if data == nil || len(data.TimeframeData) == 0 {
+func compactCandidateBin(bin *store.ScoreBinPerformance) *CandidateDebugBinStats {
+	if bin == nil {
+		return nil
+	}
+	return &CandidateDebugBinStats{
+		BinStart:           bin.BinStart,
+		TradeCount:         bin.TradeCount,
+		ExpectedValueLong:  bin.ExpectedValueLong,
+		ProfitFactorLong:   bin.ProfitFactorLong,
+		ExpectedValueShort: bin.ExpectedValueShort,
+		ProfitFactorShort:  bin.ProfitFactorShort,
+	}
+}
+
+func toNofxosQuantData(source *kernel.QuantData) *nofxos.QuantData {
+	if source == nil {
 		return nil
 	}
 
-	indicatorConfig := store.GetDefaultStrategyConfig("en").Indicators
-	if strategyConfig != nil {
-		indicatorConfig = strategyConfig.Indicators
+	result := &nofxos.QuantData{
+		Symbol:      source.Symbol,
+		Price:       source.Price,
+		PriceChange: make(map[string]float64, len(source.PriceChange)),
+	}
+	for key, value := range source.PriceChange {
+		result.PriceChange[key] = value
 	}
 
-	snapshots := make(map[string]TimeframeTrendSnapshot, len(data.TimeframeData))
-	for timeframe, tfData := range data.TimeframeData {
-		if tfData == nil {
-			continue
-		}
-
-		emaValues := make(map[int]float64)
-		for _, period := range indicatorConfig.EMAPeriods {
-			value := tfData.LatestEMA(period)
-			if value > 0 {
-				emaValues[period] = value
+	if source.Netflow != nil {
+		result.Netflow = &nofxos.NetflowData{}
+		if source.Netflow.Institution != nil {
+			result.Netflow.Institution = &nofxos.FlowTypeData{
+				Future: cloneFloatMap(source.Netflow.Institution.Future),
+				Spot:   cloneFloatMap(source.Netflow.Institution.Spot),
 			}
 		}
-
-		rsiValue := 0.0
-		if len(indicatorConfig.RSIPeriods) > 0 {
-			rsiValue = tfData.LatestRSI(indicatorConfig.RSIPeriods[0])
-		}
-
-		donchianState := ""
-		donchianPeriod := 0
-		currentPrice := tfData.LatestClose()
-		if len(indicatorConfig.DonchianPeriods) > 0 {
-			donchianPeriod = indicatorConfig.DonchianPeriods[0]
-			donchian := tfData.LatestDonchian(donchianPeriod)
-			if donchian.Upper > 0 || donchian.Lower > 0 {
-				donchianState = describeDonchianPhysicalState(currentPrice, donchian)
+		if source.Netflow.Personal != nil {
+			result.Netflow.Personal = &nofxos.FlowTypeData{
+				Future: cloneFloatMap(source.Netflow.Personal.Future),
+				Spot:   cloneFloatMap(source.Netflow.Personal.Spot),
 			}
 		}
+	}
 
-		snapshots[timeframe] = TimeframeTrendSnapshot{
-			Timeframe:      timeframe,
-			RSI:            rsiValue,
-			MACD:           tfData.LatestMACD(),
-			MACDState:      describeMACDState(tfData.LatestMACD()),
-			EMAState:       buildEMASignalSnapshot(emaValues).State,
-			DonchianState:  donchianState,
-			DonchianPeriod: donchianPeriod,
+	if len(source.OI) > 0 {
+		result.OI = make(map[string]*nofxos.OIData, len(source.OI))
+		for exchange, oi := range source.OI {
+			if oi == nil {
+				continue
+			}
+			target := &nofxos.OIData{
+				CurrentOI: oi.CurrentOI,
+				Delta:     make(map[string]*nofxos.OIDeltaData, len(oi.Delta)),
+			}
+			for duration, delta := range oi.Delta {
+				if delta == nil {
+					continue
+				}
+				target.Delta[duration] = &nofxos.OIDeltaData{
+					OIDelta:        delta.OIDelta,
+					OIDeltaValue:   delta.OIDeltaValue,
+					OIDeltaPercent: delta.OIDeltaPercent,
+				}
+			}
+			result.OI[exchange] = target
 		}
 	}
 
-	return snapshots
+	return result
 }
 
-func describeDonchianPhysicalState(currentPrice float64, box market.DonchianResult) string {
-	width := box.Upper - box.Lower
-	if width <= 0 || math.IsNaN(width) {
-		return "Price is inside the Donchian Box"
+func cloneFloatMap(source map[string]float64) map[string]float64 {
+	if len(source) == 0 {
+		return nil
 	}
-
-	switch {
-	case currentPrice > box.Upper:
-		return "Price is currently above the upper bound"
-	case currentPrice < box.Lower:
-		return "Price is currently below the lower bound"
-	case currentPrice >= box.Upper-width*0.02:
-		return "Price is within 2% range of the upper bound"
-	case currentPrice <= box.Lower+width*0.02:
-		return "Price is within 2% range of the lower bound"
-	default:
-		return "Price is currently between the upper and lower bounds"
+	cloned := make(map[string]float64, len(source))
+	for key, value := range source {
+		cloned[key] = value
 	}
-}
-
-func describeMACDState(macd float64) string {
-	switch {
-	case macd > 0:
-		return "Bullish"
-	case macd < 0:
-		return "Bearish"
-	default:
-		return "Neutral"
-	}
+	return cloned
 }
 
 // buildTradingContext builds trading context

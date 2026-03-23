@@ -204,9 +204,42 @@ func normalizedIndicatorConfig(config *store.IndicatorConfig) store.IndicatorCon
 	return normalized
 }
 
+func computationIndicatorConfig(config *store.IndicatorConfig) store.IndicatorConfig {
+	computed := normalizedIndicatorConfig(config)
+	defaults := normalizedIndicatorConfig(nil)
+
+	computed.EnableRawKlines = true
+	computed.EnableEMA = true
+	computed.EnableMACD = true
+	computed.EnableRSI = true
+	computed.EnableATR = true
+	computed.EnableBOLL = true
+	computed.EnableDonchianBox = true
+
+	if len(computed.EMAPeriods) == 0 {
+		computed.EMAPeriods = append([]int(nil), defaults.EMAPeriods...)
+	}
+	if len(computed.RSIPeriods) == 0 {
+		computed.RSIPeriods = append([]int(nil), defaults.RSIPeriods...)
+	}
+	if len(computed.ATRPeriods) == 0 {
+		computed.ATRPeriods = append([]int(nil), defaults.ATRPeriods...)
+	}
+	if len(computed.BOLLPeriods) == 0 {
+		computed.BOLLPeriods = append([]int(nil), defaults.BOLLPeriods...)
+	}
+	if len(computed.DonchianPeriods) == 0 {
+		computed.DonchianPeriods = append([]int(nil), defaults.DonchianPeriods...)
+	}
+
+	return computed
+}
+
 // CalculateRequiredFetchCount returns the total window needed for indicator warmup
 // plus the user-visible prompt window.
 func CalculateRequiredFetchCount(config store.IndicatorConfig, userCount int) int {
+	config = computationIndicatorConfig(&config)
+
 	if userCount <= 0 {
 		userCount = 30
 	}
@@ -253,6 +286,8 @@ func CalculateRequiredFetchCount(config store.IndicatorConfig, userCount int) in
 }
 
 func buildIndicatorSnapshot(klines []Kline, config store.IndicatorConfig) IndicatorResult {
+	config = computationIndicatorConfig(&config)
+
 	result := IndicatorResult{
 		EMAs:      make(map[int]float64),
 		RSIs:      make(map[int]float64),
@@ -303,7 +338,7 @@ func calculateTimeframeSeries(klines []Kline, timeframe string, count int, indic
 	if count <= 0 {
 		count = 10 // default
 	}
-	config := normalizedIndicatorConfig(indicatorConfig)
+	config := computationIndicatorConfig(indicatorConfig)
 
 	data := &TimeframeSeriesData{
 		Timeframe: timeframe,

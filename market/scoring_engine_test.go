@@ -1,9 +1,12 @@
 package market
 
 import (
+	"math"
 	"sync"
 	"testing"
 	"time"
+
+	"nofx/provider/nofxos"
 )
 
 func TestComputeVolumeSpikeRawMTFResonance(t *testing.T) {
@@ -105,6 +108,148 @@ func TestBuildHeatScoreSuppressesBearishVolumeDump(t *testing.T) {
 	}
 	if heat.VolumeSpikeScore >= 45 {
 		t.Fatalf("expected bearish dump score to stay muted, got %.2f", heat.VolumeSpikeScore)
+	}
+}
+
+func TestBuildHeatScoreUsesNestedQuantAndOnChainSubfactors(t *testing.T) {
+	resetHeatSeriesForTest()
+
+	now := time.Now().UTC()
+	seedHeatHistory("NESTEDUSDT", "market", now, []float64{8, 9, 8.5, 9.2, 8.9, 9.4})
+	seedHeatHistory("NESTEDUSDT", "trend", now, []float64{32, 33, 34, 35, 36, 37})
+	seedHeatHistory("NESTEDUSDT", "quant_oi", now, []float64{0.8, 1.0, 1.1, 1.3, 1.5, 1.7})
+	seedHeatHistory("NESTEDUSDT", "quant_imbalance", now, []float64{0.05, 0.06, 0.08, 0.09, 0.11, 0.12})
+	seedHeatHistory("NESTEDUSDT", "quant_netflow", now, []float64{0.6, 0.8, 1.0, 1.1, 1.3, 1.5})
+	seedHeatHistory("NESTEDUSDT", "onchain_ratio", now, []float64{0.4, 0.5, 0.6, 0.7, 0.8, 0.9})
+	seedHeatHistory("NESTEDUSDT", "onchain_buy_ratio", now, []float64{0.48, 0.50, 0.52, 0.55, 0.57, 0.60})
+
+	data := &Data{
+		Symbol:       "NESTEDUSDT",
+		Sector:       "AI",
+		CurrentPrice: 125.6,
+		Indicators: IndicatorResult{
+			Donchians: map[int]DonchianResult{
+				72: {Upper: 126.5, Lower: 111.0, Mid: 118.75},
+			},
+		},
+		Orderbook: &OrderbookData{Imbalance: 0.22},
+		DexScreener: &DexScreenerData{
+			LiquidityUSD:      250000,
+			BuyTxnsH1:         142,
+			SellTxnsH1:        88,
+			BuyRatio:          0.71,
+			OnchainToCEXRatio: 1.45,
+		},
+	}
+	quant := &nofxos.QuantData{
+		OI: map[string]*nofxos.OIData{
+			"binance": {
+				Delta: map[string]*nofxos.OIDeltaData{
+					"1h": {OIDeltaPercent: 4.8},
+				},
+			},
+		},
+		Netflow: &nofxos.NetflowData{
+			Institution: &nofxos.FlowTypeData{
+				Future: map[string]float64{"1h": 380000, "4h": 620000},
+				Spot:   map[string]float64{"1h": 110000},
+			},
+		},
+	}
+
+	heat := buildHeatScore("nested-audit", data.Symbol, data, quant, now)
+	if heat == nil {
+		t.Fatal("expected heat score")
+	}
+	if heat.QuantFactorScore <= 50 {
+		t.Fatalf("expected nested quant factor score above neutral, got %.2f", heat.QuantFactorScore)
+	}
+	if heat.OnChainScore <= 50 {
+		t.Fatalf("expected nested onchain factor score above neutral, got %.2f", heat.OnChainScore)
+	}
+	if heat.QuantOIRaw <= 0 || heat.QuantImbalanceRaw <= 0 || heat.QuantNetflowRaw <= 0 {
+		t.Fatalf("expected persisted quant raw fields, got oi=%.4f imbalance=%.4f netflow=%.4f",
+			heat.QuantOIRaw, heat.QuantImbalanceRaw, heat.QuantNetflowRaw)
+	}
+	if heat.OnChainRatioRaw <= 0 || heat.OnChainBuyRaw <= 0 {
+		t.Fatalf("expected persisted onchain raw fields, got ratio=%.4f buy=%.4f",
+			heat.OnChainRatioRaw, heat.OnChainBuyRaw)
+	}
+}
+
+func TestAdjustedZScoreForAdaptiveFactorInvertsNegativeIC(t *testing.T) {
+	states := map[string]AdaptiveFactorState{
+		"social_rank": {Name: "social_rank", FinalIC: -0.42},
+		"trend":       {Name: "trend", FinalIC: 0.18},
+	}
+
+	inverted := adjustedZScoreForAdaptiveFactor("ANTIUSDT", "social_rank", 2.5, states)
+	if inverted != -2.5 {
+		t.Fatalf("expected negative IC to invert z-score, got %.2f", inverted)
+	}
+
+	unchanged := adjustedZScoreForAdaptiveFactor("ANTIUSDT", "trend", 1.8, states)
+	if unchanged != 1.8 {
+		t.Fatalf("expected positive IC to keep z-score unchanged, got %.2f", unchanged)
+	}
+}
+
+func TestNestedFactorScoreUsesInvertedSubfactorSignal(t *testing.T) {
+	states := map[string]AdaptiveFactorState{
+		"social_rank":   {Name: "social_rank", FinalIC: -0.5},
+		"social_upvote": {Name: "social_upvote", FinalIC: 0.4},
+	}
+	weights := map[string]float64{
+		"social_rank":   0.7,
+		"social_upvote": 0.3,
+	}
+	zScores := map[string]float64{
+		"social_rank":   adjustedZScoreForAdaptiveFactor("ANTIUSDT", "social_rank", 2.0, states),
+		"social_upvote": adjustedZScoreForAdaptiveFactor("ANTIUSDT", "social_upvote", 1.0, states),
+	}
+
+	nested := nestedFactorScoreFromZScores(weights, zScores)
+	expectedZ := -2.0*0.7 + 1.0*0.3
+	if math.Abs(nested.zScore-expectedZ) > 1e-9 {
+		t.Fatalf("expected nested z-score %.6f after anti-factor inversion, got %.6f", expectedZ, nested.zScore)
+	}
+}
+
+func TestCoreSubfactorDoesNotDoubleInvertParentTrend(t *testing.T) {
+	states := map[string]AdaptiveFactorState{
+		"trend": {Name: "trend", FinalIC: -0.4},
+	}
+	weights := map[string]float64{
+		"trend":           1.0,
+		"donchian_factor": 0.0,
+	}
+	nested := nestedFactorScoreFromZScores(weights, map[string]float64{
+		"trend":           2.0,
+		"donchian_factor": 0.0,
+	})
+
+	finalZ := adjustedZScoreForAdaptiveFactor("ANTIUSDT", "trend", nested.zScore, states)
+	if finalZ != -2.0 {
+		t.Fatalf("expected parent trend inversion to happen exactly once, got %.2f", finalZ)
+	}
+}
+
+func TestCoreSubfactorDoesNotDoubleInvertParentVolumeSpike(t *testing.T) {
+	states := map[string]AdaptiveFactorState{
+		"volume_spike": {Name: "volume_spike", FinalIC: -0.35},
+	}
+	weights := map[string]float64{
+		"volume_spike":  1.0,
+		"mtf_resonance": 0.0,
+	}
+	nested := nestedFactorScoreFromZScores(weights, map[string]float64{
+		"volume_spike":  1.5,
+		"mtf_resonance": 0.0,
+	})
+
+	finalZ := adjustedZScoreForAdaptiveFactor("ANTIUSDT", "volume_spike", nested.zScore, states)
+	if finalZ != -1.5 {
+		t.Fatalf("expected parent volume_spike inversion to happen exactly once, got %.2f", finalZ)
 	}
 }
 

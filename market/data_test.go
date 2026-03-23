@@ -2,6 +2,7 @@ package market
 
 import (
 	"math"
+	"nofx/store"
 	"testing"
 )
 
@@ -125,6 +126,40 @@ func TestCalculateIntradaySeries_VolumeValues(t *testing.T) {
 		if data.Volume[i] != expected {
 			t.Errorf("Volume[%d] = %.2f, want %.2f", i, data.Volume[i], expected)
 		}
+	}
+}
+
+func TestBuildIndicatorSnapshotComputesCoreIndicatorsWhenPromptIndicatorsDisabled(t *testing.T) {
+	klines := generateTestKlines(600)
+	result := buildIndicatorSnapshot(klines, store.IndicatorConfig{})
+
+	if len(result.EMAs) == 0 {
+		t.Fatal("expected EMA values to be computed even when prompt indicators are disabled")
+	}
+	if len(result.RSIs) == 0 {
+		t.Fatal("expected RSI values to be computed even when prompt indicators are disabled")
+	}
+	if len(result.ATRs) == 0 {
+		t.Fatal("expected ATR values to be computed even when prompt indicators are disabled")
+	}
+	if len(result.Donchians) == 0 {
+		t.Fatal("expected Donchian values to be computed even when prompt indicators are disabled")
+	}
+	if math.Abs(result.MACD) <= 1e-9 {
+		t.Fatalf("expected MACD to be computed even when prompt indicators are disabled, got %.6f", result.MACD)
+	}
+
+	if ema20 := result.EMAs[20]; ema20 <= 0 {
+		t.Fatalf("expected EMA20 to be present, got %.6f", ema20)
+	}
+	if rsi14 := result.RSIs[14]; rsi14 <= 0 {
+		t.Fatalf("expected RSI14 to be present, got %.6f", rsi14)
+	}
+	if atr14 := result.ATRs[14]; atr14 <= 0 {
+		t.Fatalf("expected ATR14 to be present, got %.6f", atr14)
+	}
+	if donchian72 := result.Donchians[72]; donchian72.Upper <= 0 || donchian72.Lower <= 0 {
+		t.Fatalf("expected Donchian72 to be present, got upper=%.6f lower=%.6f", donchian72.Upper, donchian72.Lower)
 	}
 }
 

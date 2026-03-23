@@ -2,6 +2,7 @@ package trader
 
 import (
 	"fmt"
+	"math"
 	"nofx/kernel"
 	"nofx/logger"
 	"nofx/market"
@@ -44,32 +45,33 @@ func (at *AutoTrader) startShadowTrackerDaemon() {
 	}()
 }
 
-func (at *AutoTrader) persistShadowSnapshots(decisionTime time.Time) error {
-	if at.store == nil {
+func (at *AutoTrader) persistShadowSnapshots(decisionTime time.Time, ctx *kernel.Context) error {
+	if at.store == nil || ctx == nil {
 		return nil
 	}
-
-	snapshot := at.GetCandidateSnapshot()
-	if len(snapshot.Candidates) == 0 {
+	if len(ctx.CandidateCoins) == 0 {
 		return nil
 	}
 
 	decisionTime = decisionTime.UTC()
 	decisionTimeMs := decisionTime.UnixMilli()
-	rows := make([]*store.ShadowSnapshot, 0, len(snapshot.Candidates))
-	for _, candidate := range snapshot.Candidates {
-		if candidate.Symbol == "" || candidate.CurrentPrice <= 0 {
+	rows := make([]*store.ShadowSnapshot, 0, len(ctx.CandidateCoins))
+	for _, candidate := range ctx.CandidateCoins {
+		data := ctx.MarketDataMap[candidate.Symbol]
+		if data == nil || candidate.Symbol == "" || data.CurrentPrice <= 0 {
 			continue
 		}
 
-		heatSlice := extractShadowHeatScores(candidate.HeatScore)
+		heatSlice := extractShadowHeatScores(data.HeatScore)
+		rawFactors := extractShadowRawFactors(data.HeatScore)
+		socialRankRaw, socialUpvoteRaw := market.SocialSubfactorRawValues(data.GeckoSentiment)
 		row := &store.ShadowSnapshot{
 			TraderID:           at.id,
 			DecisionTime:       decisionTimeMs,
 			Symbol:             market.Normalize(candidate.Symbol),
-			Sector:             candidate.Sector,
+			Sector:             data.Sector,
 			ActionTaken:        0,
-			PriceT0:            candidate.CurrentPrice,
+			PriceT0:            data.CurrentPrice,
 			HeatScore:          heatSlice.Heat,
 			TradingSub:         heatSlice.TradingSub,
 			QuantSub:           heatSlice.QuantSub,
@@ -79,10 +81,18 @@ func (at *AutoTrader) persistShadowSnapshots(decisionTime time.Time) error {
 			VolumeSpikeFactor:  heatSlice.VolumeSpikeFactor,
 			MTFResonanceFactor: heatSlice.MTFResonanceFactor,
 			QuantFactor:        heatSlice.QuantFactor,
+			QuantOIRaw:         heatSlice.QuantOIRaw,
+			QuantImbalanceRaw:  heatSlice.QuantImbalanceRaw,
+			QuantNetflowRaw:    heatSlice.QuantNetflowRaw,
 			SocialFactor:       heatSlice.SocialFactor,
+			SocialRankRaw:      socialRankRaw,
+			SocialUpvoteRaw:    socialUpvoteRaw,
 			OnChainFactor:      heatSlice.OnChainFactor,
-			VolUtilization:     candidate.VolUtilization,
-			FundingRate:        candidate.FundingRate,
+			OnChainRatioRaw:    heatSlice.OnChainRatioRaw,
+			OnChainBuyRaw:      heatSlice.OnChainBuyRaw,
+			RawFactors:         rawFactors.MarshalText(),
+			VolUtilization:     data.VolatilityUtilization,
+			FundingRate:        data.FundingRate,
 			SourceSummary:      strings.Join(candidate.Sources, ","),
 			Filled:             false,
 			CreatedAt:          decisionTimeMs,
@@ -206,8 +216,13 @@ type shadowHeatSlice struct {
 	VolumeSpikeFactor  float64
 	MTFResonanceFactor float64
 	QuantFactor        float64
+	QuantOIRaw         float64
+	QuantImbalanceRaw  float64
+	QuantNetflowRaw    float64
 	SocialFactor       float64
 	OnChainFactor      float64
+	OnChainRatioRaw    float64
+	OnChainBuyRaw      float64
 }
 
 func extractShadowHeatScores(heat *market.HeatScoreData) shadowHeatSlice {
@@ -224,8 +239,43 @@ func extractShadowHeatScores(heat *market.HeatScoreData) shadowHeatSlice {
 		VolumeSpikeFactor:  sanitizeTelemetryScore(heat.VolumeSpikeScore),
 		MTFResonanceFactor: sanitizeTelemetryScore(heat.MTFResonanceFactorScore),
 		QuantFactor:        sanitizeTelemetryScore(heat.QuantFactorScore),
+		QuantOIRaw:         sanitizeShadowRawFactor(heat.QuantOIRaw),
+		QuantImbalanceRaw:  sanitizeShadowRawFactor(heat.QuantImbalanceRaw),
+		QuantNetflowRaw:    sanitizeShadowRawFactor(heat.QuantNetflowRaw),
 		SocialFactor:       sanitizeTelemetryScore(heat.SocialScore),
 		OnChainFactor:      sanitizeTelemetryScore(heat.OnChainScore),
+		OnChainRatioRaw:    sanitizeShadowRawFactor(heat.OnChainRatioRaw),
+		OnChainBuyRaw:      sanitizeShadowRawFactor(heat.OnChainBuyRaw),
+	}
+}
+
+func extractShadowRawFactors(heat *market.HeatScoreData) store.ShadowRawFactors {
+	if heat == nil {
+		return store.ShadowRawFactors{}
+	}
+
+	scores := make(map[string]float64, len(heat.RawFactorScores))
+	for key, value := range heat.RawFactorScores {
+		scores[key] = sanitizeShadowRawFactor(value)
+	}
+
+	available := make(map[string]bool, len(heat.RawFactorAvailable))
+	for key, value := range heat.RawFactorAvailable {
+		available[key] = value
+	}
+
+	return store.ShadowRawFactors{
+		Scores:    scores,
+		Available: available,
+	}
+}
+
+func sanitizeShadowRawFactor(v float64) float64 {
+	switch {
+	case math.IsNaN(v), math.IsInf(v, 0):
+		return 0
+	default:
+		return v
 	}
 }
 

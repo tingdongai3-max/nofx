@@ -50,8 +50,9 @@ type AccountInfo struct {
 
 // CandidateCoin candidate coin (from coin pool)
 type CandidateCoin struct {
-	Symbol  string   `json:"symbol"`
-	Sources []string `json:"sources"` // Sources: "ai500" and/or "oi_top"
+	Symbol     string   `json:"symbol"`
+	Sources    []string `json:"sources"`               // Sources: "ai500" and/or "oi_top"
+	LogicScore *float64 `json:"logic_score,omitempty"` // Recalculated score used as the prompt/bin anchor
 }
 
 // OITopData open interest growth top data (for AI decision reference)
@@ -110,6 +111,14 @@ type Context struct {
 	AltcoinLeverage    int                                `json:"-"`
 	Timeframes         []string                           `json:"-"`
 }
+
+type PerformanceBinMatrices struct {
+	Global []*store.ScoreBinPerformance
+	Sector []*store.ScoreBinPerformance
+	Symbol []*store.ScoreBinPerformance
+}
+
+type PerformanceBinProvider func(traderID, sector, symbol string) (*PerformanceBinMatrices, error)
 
 // Decision AI trading decision
 type Decision struct {
@@ -182,8 +191,9 @@ type OIDeltaData struct {
 
 // StrategyEngine strategy execution engine
 type StrategyEngine struct {
-	config       *store.StrategyConfig
-	nofxosClient *nofxos.Client
+	config                 *store.StrategyConfig
+	nofxosClient           *nofxos.Client
+	performanceBinProvider PerformanceBinProvider
 }
 
 // NewStrategyEngine creates strategy execution engine
@@ -222,6 +232,10 @@ func (e *StrategyEngine) GetLanguage() Language {
 // GetConfig gets complete strategy configuration
 func (e *StrategyEngine) GetConfig() *store.StrategyConfig {
 	return e.config
+}
+
+func (e *StrategyEngine) SetPerformanceBinProvider(provider PerformanceBinProvider) {
+	e.performanceBinProvider = provider
 }
 
 // ============================================================================

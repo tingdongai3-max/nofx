@@ -8,8 +8,33 @@ import type {
   PositionHistoryResponse,
   ShadowSnapshot,
   AdaptiveWeightState,
+  ScoreBinPerformance,
 } from '../../types'
 import { API_BASE, httpClient } from './helpers'
+
+async function fetchPerformanceBins(
+  path: 'performance-bins' | 'performance-bins/backcast',
+  traderId: string,
+  scope: 'global' | 'sector' | 'symbol' = 'global',
+  target?: string,
+  windowSize?: number
+): Promise<ScoreBinPerformance[]> {
+  const params = new URLSearchParams()
+  params.append('trader_id', traderId)
+  params.append('scope', scope)
+  if (target) {
+    params.append('target', target)
+  }
+  if (typeof windowSize === 'number' && Number.isFinite(windowSize) && windowSize > 0) {
+    params.append('window_size', Math.round(windowSize).toString())
+  }
+
+  const result = await httpClient.get<ScoreBinPerformance[]>(
+    `${API_BASE}/data-lab/${path}?${params.toString()}`
+  )
+  if (!result.success) throw new Error('Failed to fetch performance bins')
+  return Array.isArray(result.data) ? result.data : []
+}
 
 export const dataApi = {
   async getStatus(traderId?: string): Promise<SystemStatus> {
@@ -132,16 +157,14 @@ export const dataApi = {
 
   async getAdaptiveWeights(
     traderId: string,
-    symbol?: string,
-    sector?: string
+    scope: 'global' | 'sector' | 'symbol' = 'global',
+    target?: string
   ): Promise<AdaptiveWeightState> {
     const params = new URLSearchParams()
     params.append('trader_id', traderId)
-    if (symbol) {
-      params.append('symbol', symbol)
-    }
-    if (sector) {
-      params.append('sector', sector)
+    params.append('scope', scope)
+    if (target) {
+      params.append('target', target)
     }
 
     const result = await httpClient.get<AdaptiveWeightState>(
@@ -154,12 +177,40 @@ export const dataApi = {
         sector_sample_count: 0,
         coin_sample_count: 0,
         alpha: 0,
-        sample_target: 30,
+        sample_target: 2000,
         blend_default: 1,
         blend_adaptive: 0,
         factors: [],
+        hidden_factors: [],
+        nested_weights: {},
         updated_at: 0,
       }
     )
+  },
+
+  async getPerformanceBins(
+    traderId: string,
+    scope: 'global' | 'sector' | 'symbol' = 'global',
+    target?: string,
+    windowSize?: number
+  ): Promise<ScoreBinPerformance[]> {
+    return fetchPerformanceBins('performance-bins', traderId, scope, target, windowSize)
+  },
+
+  async getBackcastPerformanceBins(
+    traderId: string,
+    scope: 'global' | 'sector' | 'symbol' = 'global',
+    target?: string,
+    windowSize?: number
+  ): Promise<ScoreBinPerformance[]> {
+    return fetchPerformanceBins('performance-bins/backcast', traderId, scope, target, windowSize)
+  },
+
+  async checkFullStackHealth(): Promise<{ status: string; full_stack?: boolean; error?: string }> {
+    const result = await httpClient.get<{ status: string; full_stack?: boolean; error?: string }>(
+      `${API_BASE}/healthcheck`
+    )
+    if (!result.success) throw new Error('Failed to check full stack health')
+    return result.data || { status: 'unknown' }
   },
 }

@@ -95,16 +95,12 @@ func (at *AutoTrader) lookupTelemetryScores(symbol string, fallback store.Factor
 	defer at.candidateSnapshotMu.RUnlock()
 
 	normalized := strings.ToUpper(symbol)
-	for _, candidate := range at.candidateSnapshot.Candidates {
-		if strings.ToUpper(candidate.Symbol) != normalized {
-			continue
+	if at.candidateTelemetry != nil {
+		if candidate, ok := at.candidateTelemetry[normalized]; ok {
+			return sanitizeTelemetryScore(candidate.Heat),
+				sanitizeTelemetryScore(candidate.TradingSub),
+				sanitizeTelemetryScore(candidate.QuantSub)
 		}
-		if candidate.HeatScore == nil {
-			break
-		}
-		return sanitizeTelemetryScore(candidate.HeatScore.CompositeScore),
-			sanitizeTelemetryScore(candidate.HeatScore.TradingScore),
-			sanitizeTelemetryScore(candidate.HeatScore.QuantScore)
 	}
 
 	if len(fallback) == 0 {

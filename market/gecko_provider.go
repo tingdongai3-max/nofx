@@ -15,6 +15,7 @@ import (
 const (
 	coinGeckoBaseURL = "https://api.coingecko.com/api/v3"
 	geckoCacheTTL    = 15 * time.Minute
+	geckoTrendingTTL = 10 * time.Minute
 	PrivateGeckoKey  = "CG-GcrHJEAHMCpM6UzMdVK2bwkM"
 )
 
@@ -29,10 +30,16 @@ type geckoIDCacheEntry struct {
 }
 
 var (
-	geckoCacheMu sync.Mutex
-	geckoCache   = map[string]geckoCacheEntry{}
-	geckoIDCache = map[string]geckoIDCacheEntry{}
+	geckoCacheMu  sync.Mutex
+	geckoCache    = map[string]geckoCacheEntry{}
+	geckoIDCache  = map[string]geckoIDCacheEntry{}
+	geckoTrending = geckoTrendingCacheEntry{}
 )
+
+type geckoTrendingCacheEntry struct {
+	ranks     map[string]int
+	expiresAt time.Time
+}
 
 type geckoSearchResponse struct {
 	Coins []struct {
@@ -47,6 +54,15 @@ type geckoCoinResponse struct {
 	Categories                 []string `json:"categories"`
 	SentimentVotesUpPercentage float64  `json:"sentiment_votes_up_percentage"`
 	PublicInterestScore        float64  `json:"public_interest_score"`
+}
+
+type geckoTrendingResponse struct {
+	Coins []struct {
+		Item struct {
+			ID    string `json:"id"`
+			Score int    `json:"score"`
+		} `json:"item"`
+	} `json:"coins"`
 }
 
 func resolveGeckoCoinID(symbol string) (string, error) {
@@ -163,7 +179,84 @@ func fetchGeckoSentimentForSymbol(symbol string) (*GeckoSentimentData, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fetchGeckoSentiment(coinID)
+	data, err := fetchGeckoSentiment(coinID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := *data
+	if ranks, rankErr := fetchGeckoTrendingRanks(); rankErr == nil {
+		result.TrendingRank = ranks[coinID]
+		result.TrendingRankScore = normalizeTrendingRankScore(result.TrendingRank)
+	} else {
+		logger.Warnf("V3_AUDIT_GECKO_TRENDING: symbol=%s coin_id=%s err=%v", symbol, coinID, rankErr)
+	}
+
+	logger.Infof("V3_AUDIT_GECKO: %s, Rank=%d, RankScore=%.2f, Interest=%.2f, Sentiment=%.2f%%",
+		coinID,
+		result.TrendingRank,
+		result.TrendingRankScore,
+		result.PublicInterestScore,
+		result.SentimentVotesUpPercentage,
+	)
+	return &result, nil
+}
+
+func fetchGeckoTrendingRanks() (map[string]int, error) {
+	now := time.Now().UTC()
+
+	geckoCacheMu.Lock()
+	if geckoTrending.ranks != nil && now.Before(geckoTrending.expiresAt) {
+		cached := make(map[string]int, len(geckoTrending.ranks))
+		for key, value := range geckoTrending.ranks {
+			cached[key] = value
+		}
+		geckoCacheMu.Unlock()
+		return cached, nil
+	}
+	geckoCacheMu.Unlock()
+
+	body, _, _, err := geckoGET(fmt.Sprintf("%s/search/trending?show_max=coins", coinGeckoBaseURL), "trending")
+	if err != nil {
+		return nil, err
+	}
+
+	var response geckoTrendingResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, err
+	}
+
+	ranks := make(map[string]int, len(response.Coins))
+	for index, coin := range response.Coins {
+		rank := index + 1
+		if coin.Item.Score >= 0 && coin.Item.Score < 30 {
+			rank = coin.Item.Score + 1
+		}
+		if coin.Item.ID == "" || rank <= 0 || rank > 30 {
+			continue
+		}
+		ranks[coin.Item.ID] = rank
+	}
+
+	geckoCacheMu.Lock()
+	geckoTrending = geckoTrendingCacheEntry{
+		ranks:     ranks,
+		expiresAt: now.Add(geckoTrendingTTL),
+	}
+	geckoCacheMu.Unlock()
+
+	cached := make(map[string]int, len(ranks))
+	for key, value := range ranks {
+		cached[key] = value
+	}
+	return cached, nil
+}
+
+func normalizeTrendingRankScore(rank int) float64 {
+	if rank <= 0 || rank > 30 {
+		return 0
+	}
+	return float64(31-rank) / 30.0
 }
 
 func geckoGET(url string, symbol string) ([]byte, int, bool, error) {

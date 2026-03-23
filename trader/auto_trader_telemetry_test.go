@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"nofx/market"
 	"nofx/store"
 )
 
@@ -60,19 +59,11 @@ func TestAutoTraderRecordPositionTelemetryAudit(t *testing.T) {
 	}
 
 	for _, cycle := range cycles {
-		at.candidateSnapshot = CandidateSnapshot{
-			TraderID:   "audit-trader",
-			TraderName: "audit-trader",
-			UpdatedAt:  time.Now().UTC(),
-			Candidates: []CandidateMarketSnapshot{
-				{
-					Symbol: "ETHUSDT",
-					HeatScore: &market.HeatScoreData{
-						CompositeScore: cycle.heat,
-						TradingScore:   cycle.trading,
-						QuantScore:     cycle.quant,
-					},
-				},
+		at.candidateTelemetry = map[string]candidateTelemetrySnapshot{
+			"ETHUSDT": {
+				Heat:       cycle.heat,
+				TradingSub: cycle.trading,
+				QuantSub:   cycle.quant,
 			},
 		}
 		at.recordPositionTelemetry("ETHUSDT", "long", cycle.price)

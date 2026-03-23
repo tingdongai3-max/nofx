@@ -192,6 +192,20 @@ else
     exit 1
 fi
 
+# 5. Full-stack health guard
+log_info "Running Go full-stack health guard..."
+if ./nofx healthcheck; then
+    log_info "Full-stack health guard OK"
+else
+    if [ "${NOFX_DEV_GUARD_RETRY:-0}" != "1" ]; then
+        log_warn "Full-stack health guard failed, attempting one automatic make dev restart..."
+        NOFX_DEV_GUARD_RETRY=1 make dev
+        exit $?
+    fi
+    log_error "Full-stack health guard failed after retry"
+    exit 1
+fi
+
 echo ""
 log_info "=========================================="
 log_info "  ALL SYSTEMS OPERATIONAL"

@@ -3,9 +3,11 @@ package kernel
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"nofx/logger"
 	"nofx/market"
 	"nofx/mcp"
+	"nofx/provider/nofxos"
 	"nofx/store"
 	"regexp"
 	"strings"
@@ -80,6 +82,7 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 			return nil, fmt.Errorf("failed to fetch market data: %w", err)
 		}
 	}
+	recalculateCandidateLogicScores(ctx)
 
 	// Ensure OITopDataMap is initialized
 	if ctx.OITopDataMap == nil {
@@ -135,6 +138,104 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 	}
 
 	return decision, nil
+}
+
+func recalculateCandidateLogicScores(ctx *Context) {
+	if ctx == nil || len(ctx.CandidateCoins) == 0 || len(ctx.MarketDataMap) == 0 {
+		return
+	}
+
+	for i := range ctx.CandidateCoins {
+		candidate := &ctx.CandidateCoins[i]
+		data := ctx.MarketDataMap[candidate.Symbol]
+		if data == nil {
+			candidate.LogicScore = nil
+			continue
+		}
+
+		var quantData *nofxos.QuantData
+		if ctx.QuantDataMap != nil {
+			quantData = toPromptNofxosQuantData(ctx.QuantDataMap[candidate.Symbol])
+		}
+
+		recalculated := market.RecalculateHeatScore(ctx.TraderID, candidate.Symbol, data, quantData)
+		if recalculated == nil || !isFiniteScore(recalculated.CompositeScore) {
+			candidate.LogicScore = nil
+			continue
+		}
+
+		score := recalculated.CompositeScore
+		candidate.LogicScore = &score
+	}
+}
+
+func isFiniteScore(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func toPromptNofxosQuantData(source *QuantData) *nofxos.QuantData {
+	if source == nil {
+		return nil
+	}
+
+	result := &nofxos.QuantData{
+		Symbol:      source.Symbol,
+		Price:       source.Price,
+		PriceChange: clonePromptFloatMap(source.PriceChange),
+	}
+
+	if source.Netflow != nil {
+		result.Netflow = &nofxos.NetflowData{}
+		if source.Netflow.Institution != nil {
+			result.Netflow.Institution = &nofxos.FlowTypeData{
+				Future: clonePromptFloatMap(source.Netflow.Institution.Future),
+				Spot:   clonePromptFloatMap(source.Netflow.Institution.Spot),
+			}
+		}
+		if source.Netflow.Personal != nil {
+			result.Netflow.Personal = &nofxos.FlowTypeData{
+				Future: clonePromptFloatMap(source.Netflow.Personal.Future),
+				Spot:   clonePromptFloatMap(source.Netflow.Personal.Spot),
+			}
+		}
+	}
+
+	if len(source.OI) > 0 {
+		result.OI = make(map[string]*nofxos.OIData, len(source.OI))
+		for exchange, oi := range source.OI {
+			if oi == nil {
+				continue
+			}
+			target := &nofxos.OIData{
+				CurrentOI: oi.CurrentOI,
+				Delta:     make(map[string]*nofxos.OIDeltaData, len(oi.Delta)),
+			}
+			for duration, delta := range oi.Delta {
+				if delta == nil {
+					continue
+				}
+				target.Delta[duration] = &nofxos.OIDeltaData{
+					OIDelta:        delta.OIDelta,
+					OIDeltaValue:   delta.OIDeltaValue,
+					OIDeltaPercent: delta.OIDeltaPercent,
+				}
+			}
+			result.OI[exchange] = target
+		}
+	}
+
+	return result
+}
+
+func clonePromptFloatMap(source map[string]float64) map[string]float64 {
+	if len(source) == 0 {
+		return nil
+	}
+	cloned := make(map[string]float64, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 // ============================================================================
@@ -380,10 +481,6 @@ func validateJSONFormat(jsonStr string) error {
 			return fmt.Errorf("not a valid decision array (must contain objects {}), actual content: %s", trimmed[:min(50, len(trimmed))])
 		}
 		return fmt.Errorf("JSON must start with [{ (whitespace allowed), actual: %s", trimmed[:min(20, len(trimmed))])
-	}
-
-	if strings.Contains(jsonStr, "~") {
-		return fmt.Errorf("JSON cannot contain range symbol ~, all numbers must be precise single values")
 	}
 
 	for i := 0; i < len(jsonStr)-4; i++ {

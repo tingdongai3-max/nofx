@@ -98,10 +98,11 @@ func (at *AutoTrader) GetCandidateSnapshot() CandidateSnapshot {
 	defer at.candidateSnapshotMu.RUnlock()
 
 	snapshot := CandidateSnapshot{
-		TraderID:   at.candidateSnapshot.TraderID,
-		TraderName: at.candidateSnapshot.TraderName,
-		UpdatedAt:  at.candidateSnapshot.UpdatedAt,
-		Candidates: make([]CandidateMarketSnapshot, len(at.candidateSnapshot.Candidates)),
+		TraderID:    at.candidateSnapshot.TraderID,
+		TraderName:  at.candidateSnapshot.TraderName,
+		UpdatedAt:   at.candidateSnapshot.UpdatedAt,
+		ScoreEngine: at.candidateSnapshot.ScoreEngine,
+		Candidates:  make([]CandidateMarketSnapshot, len(at.candidateSnapshot.Candidates)),
 	}
 	copy(snapshot.Candidates, at.candidateSnapshot.Candidates)
 	return snapshot

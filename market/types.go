@@ -114,6 +114,8 @@ type DexScreenerData struct {
 type GeckoSentimentData struct {
 	CoinID                     string    `json:"coin_id,omitempty"`
 	Categories                 []string  `json:"categories,omitempty"`
+	TrendingRank               int       `json:"trending_rank,omitempty"`
+	TrendingRankScore          float64   `json:"trending_rank_score,omitempty"`
 	PublicInterestScore        float64   `json:"public_interest_score"`
 	SentimentVotesUpPercentage float64   `json:"sentiment_votes_up_percentage"`
 	UsingPrivateKey            bool      `json:"using_private_key,omitempty"`
@@ -130,9 +132,16 @@ type HeatScoreData struct {
 	DonchianFactorScore     float64            `json:"-"`
 	MTFResonanceFactorScore float64            `json:"-"`
 	QuantFactorScore        float64            `json:"quant_factor_score"`
+	QuantOIRaw              float64            `json:"-"`
+	QuantImbalanceRaw       float64            `json:"-"`
+	QuantNetflowRaw         float64            `json:"-"`
 	SocialScore             float64            `json:"social_score"`
 	OnChainScore            float64            `json:"onchain_score"`
+	OnChainRatioRaw         float64            `json:"-"`
+	OnChainBuyRaw           float64            `json:"-"`
 	SourceWeights           map[string]float64 `json:"source_weights,omitempty"`
+	RawFactorScores         map[string]float64 `json:"-"`
+	RawFactorAvailable      map[string]bool    `json:"-"`
 }
 
 // Binance API response structure

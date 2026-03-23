@@ -13,6 +13,7 @@ import type { Language } from '../../i18n/translations'
 interface AdaptiveRadarChartProps {
   factors?: AdaptiveFactorState[]
   language: Language
+  warningMessage?: string
 }
 
 function factorLabel(name: string, language: Language): string {
@@ -37,6 +38,7 @@ function factorLabel(name: string, language: Language): string {
 export function AdaptiveRadarChart({
   factors = [],
   language,
+  warningMessage,
 }: AdaptiveRadarChartProps) {
   const data = factors.map((factor) => ({
     label: factorLabel(factor.name, language),
@@ -55,7 +57,14 @@ export function AdaptiveRadarChart({
   }
 
   return (
-    <div className="h-72">
+    <div className="relative h-72">
+      {warningMessage ? (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+          <div className="max-w-[78%] rounded-2xl border border-[#F59E0B]/30 bg-black/70 px-5 py-4 text-center text-xs font-semibold tracking-[0.18em] text-[#FDE68A] shadow-[0_18px_50px_rgba(0,0,0,0.35)]">
+            {warningMessage}
+          </div>
+        </div>
+      ) : null}
       <ResponsiveContainer width="100%" height="100%">
         <RadarChart data={data} outerRadius="70%">
           <PolarGrid stroke="rgba(255,255,255,0.10)" />

@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 
 	"nofx/market"
 
@@ -11,6 +12,8 @@ import (
 func (s *Server) handleAdaptiveWeights(c *gin.Context) {
 	userID := c.GetString("user_id")
 	traderID := c.Query("trader_id")
+	scope := strings.ToLower(strings.TrimSpace(c.Query("scope")))
+	target := strings.TrimSpace(c.Query("target"))
 	symbol := c.Query("symbol")
 	sector := c.Query("sector")
 
@@ -40,7 +43,59 @@ func (s *Server) handleAdaptiveWeights(c *gin.Context) {
 		return
 	}
 
-	if symbol == "" {
+	if scope != "" {
+		switch scope {
+		case "global":
+			symbol = ""
+			sector = ""
+		case "sector":
+			if target == "" {
+				latest, err := s.store.Shadow().GetLatestByTrader(traderID)
+				if err != nil {
+					SafeInternalError(c, "Load latest shadow snapshot", err)
+					return
+				}
+				if latest != nil {
+					target = latest.Sector
+				}
+			}
+			if target == "" {
+				SafeBadRequest(c, "target is required for sector scope")
+				return
+			}
+			symbol = ""
+			sector = target
+		case "symbol":
+			if target == "" {
+				latest, err := s.store.Shadow().GetLatestByTrader(traderID)
+				if err != nil {
+					SafeInternalError(c, "Load latest shadow snapshot", err)
+					return
+				}
+				if latest != nil {
+					target = latest.Symbol
+				}
+			}
+			if target == "" {
+				SafeBadRequest(c, "target is required for symbol scope")
+				return
+			}
+			symbol = target
+			if sector == "" {
+				latest, err := s.store.Shadow().GetLatestBySymbol(traderID, symbol, false)
+				if err != nil {
+					SafeInternalError(c, "Load latest symbol shadow snapshot", err)
+					return
+				}
+				if latest != nil {
+					sector = latest.Sector
+				}
+			}
+		default:
+			SafeBadRequest(c, "scope must be one of: global, sector, symbol")
+			return
+		}
+	} else if symbol == "" {
 		latest, err := s.store.Shadow().GetLatestByTrader(traderID)
 		if err != nil {
 			SafeInternalError(c, "Load latest shadow snapshot", err)
@@ -51,7 +106,7 @@ func (s *Server) handleAdaptiveWeights(c *gin.Context) {
 			sector = latest.Sector
 		}
 	} else if sector == "" {
-		latest, err := s.store.Shadow().GetLatestBySymbol(traderID, symbol)
+		latest, err := s.store.Shadow().GetLatestBySymbol(traderID, symbol, false)
 		if err != nil {
 			SafeInternalError(c, "Load latest symbol shadow snapshot", err)
 			return

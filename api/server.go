@@ -10,6 +10,7 @@ import (
 	"nofx/logger"
 	"nofx/manager"
 	"nofx/store"
+	"nofx/trader"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ type Server struct {
 	cryptoHandler    *CryptoHandler
 	httpServer       *http.Server
 	port             int
+	performanceCache *trader.PerformanceMatrixCache
 	telegramReloadCh chan<- struct{} // signal Telegram bot to reload
 }
 
@@ -46,6 +48,10 @@ func NewServer(traderManager *manager.TraderManager, st *store.Store, cryptoServ
 		store:         st,
 		cryptoHandler: cryptoHandler,
 		port:          port,
+		performanceCache: trader.NewPerformanceMatrixCache(
+			st,
+			15*time.Minute,
+		),
 	}
 
 	// Setup routes
@@ -77,6 +83,7 @@ func (s *Server) setupRoutes() {
 	{
 		// Health check
 		api.Any("/health", s.handleHealth)
+		s.route(api, "GET", "/healthcheck", "Full-stack guard for backend/frontend liveness and cache refresh", s.handleFullStackHealthCheck)
 
 		// Admin login (used in admin mode, public)
 
@@ -180,8 +187,14 @@ Body: {"show_in_competition":<bool>}`,
 				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&limit=<optional, default 200>. Returns recent T0 candidate snapshots and their T+15m realized returns.`,
 				s.handleShadowSnapshots)
 			s.routeWithSchema(protected, "GET", "/adaptive-weights", "Get current adaptive IC weights for a trader",
-				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&symbol=<optional>&sector=<optional>. Returns the hierarchical sector+coin IC state, shrinkage alpha, sample counts, and effective factor weights used by the heat scoring engine.`,
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&scope=<optional: global|sector|symbol>&target=<optional>&symbol=<optional>&sector=<optional>. Returns global, sector, or symbol-scoped IC state, sample counts, and effective factor weights used by the heat scoring engine.`,
 				s.handleAdaptiveWeights)
+			s.routeWithSchema(protected, "GET", "/data-lab/performance-bins", "Get 5-point binned score performance analytics for a trader",
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&scope=<optional: global|sector|symbol>&target=<optional>. Returns snapshot-score bins with sample size, mean/median EV log returns, and profit factors from filled shadow snapshots.`,
+				s.handlePerformanceBins)
+			s.routeWithSchema(protected, "GET", "/data-lab/performance-bins/backcast", "Get real-time back-cast score performance analytics for a trader",
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&scope=<optional: global|sector|symbol>&target=<optional>. Recalculates historical logic scores using the current adaptive weights and stored raw_factors, then returns mean/median EV log returns and profit factors by score bin.`,
+				s.handlePerformanceBinsBackcast)
 
 			// AI cost tracking
 			s.route(protected, "GET", "/ai-costs", "Get AI call costs for a trader (?trader_id=xxx&period=today)", s.handleGetAICosts)

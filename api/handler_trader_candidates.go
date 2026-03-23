@@ -22,5 +22,8 @@ func (s *Server) handleTraderCandidates(c *gin.Context) {
 	}
 
 	snapshot := autoTrader.GetCandidateSnapshot()
+	if snapshot.ScoreEngine == "" {
+		snapshot.ScoreEngine = "recalculated_backcast"
+	}
 	c.JSON(http.StatusOK, snapshot)
 }

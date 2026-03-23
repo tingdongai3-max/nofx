@@ -1,8 +1,16 @@
 package market
 
 import (
+	"errors"
+	"fmt"
 	"math"
+	"net/http"
+	"nofx/logger"
 	"nofx/store"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,12 +29,13 @@ const (
 	AdaptiveSampleTarget   = 2000
 	adaptiveCacheTTL       = 1 * time.Minute
 	adaptiveSectorLimit    = 3000
-	adaptiveCoinLimit      = AdaptiveSampleTarget
+	adaptiveCoinLimit      = 500
+	ConfidenceThreshold    = 30.0
 	ICHalfLife             = 1000.0
 	adaptiveScopeGlobal    = "global"
 	adaptiveSectorFallback = "Unclassified"
-	empiricalWeightFloor   = 0.1
-	empiricalWeightCeiling = 0.9
+	empiricalWeightFloor   = 0.01
+	empiricalWeightCeiling = 0.90
 )
 
 var adaptiveFactorOrder = []string{
@@ -36,8 +45,15 @@ var adaptiveFactorOrder = []string{
 	"volume_spike",
 	"mtf_resonance",
 	"quant",
+	"quant_oi",
+	"quant_imbalance",
+	"quant_netflow",
 	"social",
+	"social_rank",
+	"social_upvote",
 	"onchain",
+	"onchain_ratio",
+	"onchain_buy_ratio",
 }
 
 var adaptiveVisibleFactorOrder = []string{
@@ -52,11 +68,45 @@ var adaptiveVisibleFactorOrder = []string{
 var adaptiveHiddenFactorOrder = []string{
 	"donchian_factor",
 	"mtf_resonance",
+	"quant_oi",
+	"quant_imbalance",
+	"quant_netflow",
+	"social_rank",
+	"social_upvote",
+	"onchain_ratio",
+	"onchain_buy_ratio",
 }
 
 var adaptiveNestedFactorGroups = map[string][]string{
 	"trend":        []string{"trend", "donchian_factor"},
 	"volume_spike": []string{"volume_spike", "mtf_resonance"},
+	"quant":        []string{"quant_oi", "quant_imbalance", "quant_netflow"},
+	"social":       []string{"social_rank", "social_upvote"},
+	"onchain":      []string{"onchain_ratio", "onchain_buy_ratio"},
+}
+
+var adaptiveNestedPriors = map[string]map[string]float64{
+	"trend": {
+		"trend":           0.5,
+		"donchian_factor": 0.5,
+	},
+	"volume_spike": {
+		"volume_spike":  0.5,
+		"mtf_resonance": 0.5,
+	},
+	"quant": {
+		"quant_oi":        0.4,
+		"quant_imbalance": 0.25,
+		"quant_netflow":   0.35,
+	},
+	"social": {
+		"social_rank":   0.7,
+		"social_upvote": 0.3,
+	},
+	"onchain": {
+		"onchain_ratio":     0.6,
+		"onchain_buy_ratio": 0.4,
+	},
 }
 
 type AdaptiveFactorState struct {
@@ -82,8 +132,8 @@ type AdaptiveWeightState struct {
 	BlendDefault      float64               `json:"blend_default"`
 	BlendAdaptive     float64               `json:"blend_adaptive"`
 	Factors           []AdaptiveFactorState `json:"factors"`
-	HiddenFactors     []AdaptiveFactorState `json:"-"`
-	NestedWeights     map[string]float64    `json:"-"`
+	HiddenFactors     []AdaptiveFactorState `json:"hidden_factors"`
+	NestedWeights     map[string]float64    `json:"nested_weights"`
 	UpdatedAt         int64                 `json:"updated_at"`
 }
 
@@ -97,6 +147,13 @@ var (
 	adaptiveStore   *store.Store
 	adaptiveCache   sync.Map
 )
+
+func init() {
+	store.RegisterCacheRefreshHook(func() error {
+		clearAdaptiveWeightCache()
+		return nil
+	})
+}
 
 func SetAdaptiveWeightStore(st *store.Store) {
 	adaptiveStoreMu.Lock()
@@ -144,12 +201,293 @@ func GetAdaptiveWeightState(traderID, sector, symbol string) AdaptiveWeightState
 	return state
 }
 
-func EWMAPearsonCorrelation(x, y []float64, halfLife float64) float64 {
-	if len(x) != len(y) || len(x) < 2 {
+func RecalculateHistoricalScores(rows []*store.ShadowSnapshot, state AdaptiveWeightState) map[uint]float64 {
+	recalculated := make(map[uint]float64, len(rows))
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		score, ok := recalculateHistoricalScore(row, state)
+		if !ok {
+			continue
+		}
+		recalculated[row.ID] = score
+	}
+	return recalculated
+}
+
+func RecalculateHistoricalBins(rows []*store.ShadowSnapshot, state AdaptiveWeightState) []*store.ScoreBinPerformance {
+	return RecalculateHistoricalBinsWithWindow(rows, state, store.PERFORMANCE_WINDOW_SIZE_DEFAULT)
+}
+
+func RecalculateHistoricalBinsWithWindow(rows []*store.ShadowSnapshot, state AdaptiveWeightState, windowSize int) []*store.ScoreBinPerformance {
+	recalculated := RecalculateHistoricalScores(rows, state)
+	return store.AggregateSmoothedPerformanceBins(rows, func(row *store.ShadowSnapshot) (float64, bool) {
+		if row == nil {
+			return 0, false
+		}
+		score, ok := recalculated[row.ID]
+		return score, ok
+	}, windowSize)
+}
+
+func recalculateHistoricalScore(row *store.ShadowSnapshot, state AdaptiveWeightState) (float64, bool) {
+	rawFactors := decodeHistoricalRawFactors(row)
+	if len(rawFactors.Scores) == 0 {
+		return 0, false
+	}
+
+	weights := adaptiveWeightsFromState(state)
+	nestedWeights := adaptiveNestedWeightsFromState(state)
+	factorStates := adaptiveFactorStatesByName(state.Factors, state.HiddenFactors)
+
+	marketZ, marketAvailable := shadowRawFactorZ(rawFactors, "market")
+	trendGroupZ, trendAvailable := recalculateNestedGroupZ(row.Symbol, rawFactors, factorStates, nestedWeights, "trend_group", []string{"trend", "donchian_factor"})
+	volumeSpikeGroupZ, volumeSpikeAvailable := recalculateNestedGroupZ(row.Symbol, rawFactors, factorStates, nestedWeights, "volume_spike_group", []string{"volume_spike", "mtf_resonance"})
+	quantGroupZ, quantAvailable := recalculateNestedGroupZ(row.Symbol, rawFactors, factorStates, nestedWeights, "quant_group", []string{"quant_oi", "quant_imbalance", "quant_netflow"})
+	socialGroupZ, socialAvailable := recalculateNestedGroupZ(row.Symbol, rawFactors, factorStates, nestedWeights, "social_group", []string{"social_rank", "social_upvote"})
+	onChainGroupZ, onChainAvailable := recalculateNestedGroupZ(row.Symbol, rawFactors, factorStates, nestedWeights, "onchain_group", []string{"onchain_ratio", "onchain_buy_ratio"})
+
+	tradingWeights := map[string]float64{}
+	tradingScores := map[string]float64{}
+	tradingWeight := 0.0
+	if marketAvailable {
+		tradingWeights["market"] = weights["market"]
+		tradingScores["market"] = adjustedZScoreForAdaptiveFactor(row.Symbol, "market", marketZ, factorStates)
+		tradingWeight += weights["market"]
+	}
+	if trendAvailable {
+		tradingWeights["trend"] = weights["trend"]
+		tradingScores["trend"] = adjustedZScoreForAdaptiveFactor(row.Symbol, "trend", trendGroupZ, factorStates)
+		tradingWeight += weights["trend"]
+	}
+	if volumeSpikeAvailable {
+		tradingWeights["volume_spike"] = weights["volume_spike"]
+		tradingScores["volume_spike"] = adjustedZScoreForAdaptiveFactor(row.Symbol, "volume_spike", volumeSpikeGroupZ, factorStates)
+		tradingWeight += weights["volume_spike"]
+	}
+	if tradingWeight <= 0 {
+		return 0, false
+	}
+
+	tradingScore := combineWeightedScores(tradingWeights, tradingScores)
+
+	quantWeights := map[string]float64{}
+	quantScores := map[string]float64{}
+	quantWeightTotal := 0.0
+	if quantAvailable {
+		quantWeights["quant"] = weights["quant"]
+		quantScores["quant"] = adjustedZScoreForAdaptiveFactor(row.Symbol, "quant", quantGroupZ, factorStates)
+		quantWeightTotal += weights["quant"]
+	}
+	if onChainAvailable {
+		quantWeights["onchain"] = weights["onchain"]
+		quantScores["onchain"] = adjustedZScoreForAdaptiveFactor(row.Symbol, "onchain", onChainGroupZ, factorStates)
+		quantWeightTotal += weights["onchain"]
+	}
+	if socialAvailable {
+		quantWeights["social"] = weights["social"]
+		quantScores["social"] = adjustedZScoreForAdaptiveFactor(row.Symbol, "social", socialGroupZ, factorStates)
+		quantWeightTotal += weights["social"]
+	}
+
+	if quantWeightTotal <= 0 {
+		return clamp(tradingScore, 0, 100), true
+	}
+
+	quantScore := combineWeightedScores(quantWeights, quantScores)
+	totalWeight := tradingWeight + quantWeightTotal
+	if totalWeight <= 0 {
+		return 0, false
+	}
+
+	composite := (tradingScore*tradingWeight + quantScore*quantWeightTotal) / totalWeight
+	return clamp(composite, 0, 100), true
+}
+
+func recalculateNestedGroupZ(
+	symbol string,
+	rawFactors store.ShadowRawFactors,
+	factorStates map[string]AdaptiveFactorState,
+	nestedWeights map[string]float64,
+	fallbackKey string,
+	order []string,
+) (float64, bool) {
+	available := make(map[string]bool, len(order))
+	zScores := make(map[string]float64, len(order))
+	hasAvailable := false
+
+	for _, factor := range order {
+		value, ok := shadowRawFactorZ(rawFactors, factor)
+		available[factor] = ok
+		if !ok {
+			continue
+		}
+		hasAvailable = true
+		zScores[factor] = adjustedZScoreForAdaptiveFactor(symbol, factor, value, factorStates)
+	}
+
+	if hasAvailable {
+		groupWeights := normalizedNestedSubweights(nestedWeights, order, available)
+		return combineWeightedZScores(groupWeights, zScores), true
+	}
+
+	return shadowRawFactorZ(rawFactors, fallbackKey)
+}
+
+func decodeHistoricalRawFactors(row *store.ShadowSnapshot) store.ShadowRawFactors {
+	if row == nil {
+		return store.ShadowRawFactors{}
+	}
+
+	rawFactors, err := row.DecodedRawFactors()
+	if err == nil && len(rawFactors.Scores) > 0 {
+		return rawFactors
+	}
+	return recoverLegacyRawFactors(row)
+}
+
+func recoverLegacyRawFactors(row *store.ShadowSnapshot) store.ShadowRawFactors {
+	if row == nil {
+		return store.ShadowRawFactors{}
+	}
+
+	hasAnyTelemetry := row.MarketFactor != 0 ||
+		row.TrendFactor != 0 ||
+		row.VolumeSpikeFactor != 0 ||
+		row.QuantFactor != 0 ||
+		row.SocialFactor != 0 ||
+		row.OnChainFactor != 0
+	if !hasAnyTelemetry {
+		return store.ShadowRawFactors{}
+	}
+
+	scores := map[string]float64{
+		"market":             percentScoreToZ(row.MarketFactor),
+		"trend":              percentScoreToZ(row.TrendFactor),
+		"trend_group":        percentScoreToZ(row.TrendFactor),
+		"donchian_factor":    percentScoreToZ(row.DonchianFactor),
+		"volume_spike":       percentScoreToZ(row.VolumeSpikeFactor),
+		"volume_spike_group": percentScoreToZ(row.VolumeSpikeFactor),
+		"mtf_resonance":      percentScoreToZ(row.MTFResonanceFactor),
+		"quant_group":        percentScoreToZ(row.QuantFactor),
+		"social_group":       percentScoreToZ(row.SocialFactor),
+		"onchain_group":      percentScoreToZ(row.OnChainFactor),
+		"onchain_ratio":      percentScoreToZ(row.OnChainFactor),
+		"onchain_buy_ratio":  percentScoreToZ(row.OnChainFactor),
+	}
+
+	available := map[string]bool{
+		"market":             true,
+		"trend":              true,
+		"trend_group":        true,
+		"donchian_factor":    row.DonchianFactor != 0,
+		"volume_spike":       row.VolumeSpikeFactor != 0,
+		"volume_spike_group": row.VolumeSpikeFactor != 0 || row.MTFResonanceFactor != 0,
+		"mtf_resonance":      row.MTFResonanceFactor != 0,
+		"quant_group":        row.QuantFactor != 0,
+		"social_group":       row.SocialFactor != 0,
+		"onchain_group":      row.OnChainFactor != 0,
+		"onchain_ratio":      row.OnChainFactor != 0,
+		"onchain_buy_ratio":  row.OnChainFactor != 0,
+	}
+
+	return store.ShadowRawFactors{
+		Scores:    scores,
+		Available: available,
+	}
+}
+
+func shadowRawFactorZ(rawFactors store.ShadowRawFactors, name string) (float64, bool) {
+	value, exists := rawFactors.Scores[name]
+	if !exists || !isFinite(value) {
+		return 0, false
+	}
+
+	if len(rawFactors.Available) == 0 {
+		return value, true
+	}
+	available, ok := rawFactors.Available[name]
+	if !ok {
+		return value, true
+	}
+	return value, available
+}
+
+func percentScoreToZ(score float64) float64 {
+	if !isFinite(score) {
 		return 0
 	}
-	if halfLife <= 0 {
+	normalized := (clamp(score, 0, 100) - 50) / 50
+	normalized = clamp(normalized, -0.999999, 0.999999)
+	return 2 * math.Atanh(normalized)
+}
+
+// RankData converts raw numeric values into 1-based average ranks so tied values
+// share the mean rank across the tied span.
+func RankData(data []float64) []float64 {
+	ranks := make([]float64, len(data))
+	if len(data) == 0 {
+		return ranks
+	}
+
+	type rankPoint struct {
+		index int
+		value float64
+	}
+
+	points := make([]rankPoint, 0, len(data))
+	for index, value := range data {
+		points = append(points, rankPoint{
+			index: index,
+			value: value,
+		})
+	}
+
+	sort.Slice(points, func(i, j int) bool {
+		if points[i].value == points[j].value {
+			return points[i].index < points[j].index
+		}
+		return points[i].value < points[j].value
+	})
+
+	for start := 0; start < len(points); {
+		end := start + 1
+		for end < len(points) && points[end].value == points[start].value {
+			end++
+		}
+
+		averageRank := (float64(start+1) + float64(end)) / 2.0
+		for index := start; index < end; index++ {
+			ranks[points[index].index] = averageRank
+		}
+		start = end
+	}
+
+	return ranks
+}
+
+func EWMAPearsonCorrelation(x, y []float64, halfLife float64) float64 {
+	filteredX, filteredY := filterFiniteCorrelationPairs(x, y)
+	return ewmaWeightedPearson(filteredX, filteredY, halfLife)
+}
+
+// EWMASpearmanCorrelation computes Spearman rank IC by ranking both inputs first
+// and then applying the EWMA-weighted Pearson correlation over the ranked series.
+func EWMASpearmanCorrelation(x, y []float64, halfLife float64) float64 {
+	filteredX, filteredY := filterFiniteCorrelationPairs(x, y)
+	if len(filteredX) < 2 {
 		return 0
+	}
+
+	rankedX := RankData(filteredX)
+	rankedY := RankData(filteredY)
+	return ewmaWeightedPearson(rankedX, rankedY, halfLife)
+}
+
+func filterFiniteCorrelationPairs(x, y []float64) ([]float64, []float64) {
+	if len(x) != len(y) || len(x) < 2 {
+		return nil, nil
 	}
 
 	filteredX := make([]float64, 0, len(x))
@@ -161,14 +499,21 @@ func EWMAPearsonCorrelation(x, y []float64, halfLife float64) float64 {
 		filteredX = append(filteredX, x[i])
 		filteredY = append(filteredY, y[i])
 	}
-	if len(filteredX) < 2 {
+	return filteredX, filteredY
+}
+
+func ewmaWeightedPearson(x, y []float64, halfLife float64) float64 {
+	if len(x) != len(y) || len(x) < 2 {
+		return 0
+	}
+	if halfLife <= 0 {
 		return 0
 	}
 
-	weights := make([]float64, len(filteredX))
+	weights := make([]float64, len(x))
 	weightSum := 0.0
-	for i := range filteredX {
-		age := float64(len(filteredX)-1-i) / halfLife
+	for i := range x {
+		age := float64(len(x)-1-i) / halfLife
 		weight := math.Pow(2, -age)
 		weights[i] = weight
 		weightSum += weight
@@ -179,9 +524,9 @@ func EWMAPearsonCorrelation(x, y []float64, halfLife float64) float64 {
 
 	meanX := 0.0
 	meanY := 0.0
-	for i := range filteredX {
-		meanX += weights[i] * filteredX[i]
-		meanY += weights[i] * filteredY[i]
+	for i := range x {
+		meanX += weights[i] * x[i]
+		meanY += weights[i] * y[i]
 	}
 	meanX /= weightSum
 	meanY /= weightSum
@@ -189,9 +534,9 @@ func EWMAPearsonCorrelation(x, y []float64, halfLife float64) float64 {
 	var covariance float64
 	var varianceX float64
 	var varianceY float64
-	for i := range filteredX {
-		dx := filteredX[i] - meanX
-		dy := filteredY[i] - meanY
+	for i := range x {
+		dx := x[i] - meanX
+		dy := y[i] - meanY
 		weight := weights[i]
 		covariance += weight * dx * dy
 		varianceX += weight * dx * dx
@@ -211,6 +556,7 @@ func EWMAPearsonCorrelation(x, y []float64, halfLife float64) float64 {
 func computeAdaptiveWeightState(traderID, sector, symbol string) AdaptiveWeightState {
 	defaults := defaultAdaptiveWeights()
 	hiddenDefaults := defaultHiddenAdaptiveWeights()
+	globalICs := zeroAdaptiveValues()
 	sectorICs := zeroAdaptiveValues()
 	coinICs := zeroAdaptiveValues()
 	finalICs := zeroAdaptiveValues()
@@ -220,55 +566,91 @@ func computeAdaptiveWeightState(traderID, sector, symbol string) AdaptiveWeightS
 	hiddenFinalWeights := copyWeightMap(hiddenDefaults)
 	nestedWeights := defaultNestedAdaptiveWeights()
 
+	rawSector := strings.TrimSpace(sector)
 	normalizedTrader := normalizedAdaptiveTrader(traderID)
-	normalizedSector := normalizeAdaptiveSector(sector)
-	normalizedSymbol := Normalize(symbol)
+	normalizedSector := normalizeAdaptiveSector(rawSector)
+	normalizedSymbol := normalizeAdaptiveSymbol(symbol)
 
 	state := AdaptiveWeightState{
 		TraderID:     normalizedTrader,
 		Symbol:       normalizedSymbol,
-		Sector:       normalizedSector,
+		Sector:       rawSector,
 		SampleTarget: AdaptiveSampleTarget,
 		UpdatedAt:    time.Now().UTC().UnixMilli(),
 	}
 
+	finalizeState := func() AdaptiveWeightState {
+		state.Factors = buildAdaptiveFactorStatesForOrder(adaptiveVisibleFactorOrder, defaults, empirical, finalWeights, sectorICs, coinICs, finalICs)
+		state.HiddenFactors = buildAdaptiveFactorStatesForOrder(adaptiveHiddenFactorOrder, hiddenDefaults, hiddenEmpirical, hiddenFinalWeights, sectorICs, coinICs, finalICs)
+		state.NestedWeights = nestedWeights
+		return state
+	}
+
 	st := getAdaptiveWeightStore()
-	if st == nil || normalizedTrader == adaptiveScopeGlobal || normalizedSymbol == "" {
-		state.Factors = buildAdaptiveFactorStatesForOrder(adaptiveVisibleFactorOrder, defaults, empirical, finalWeights, sectorICs, coinICs, finalICs)
-		state.HiddenFactors = buildAdaptiveFactorStatesForOrder(adaptiveHiddenFactorOrder, hiddenDefaults, hiddenEmpirical, hiddenFinalWeights, sectorICs, coinICs, finalICs)
-		state.NestedWeights = nestedWeights
+	if st == nil || normalizedTrader == adaptiveScopeGlobal {
 		state.BlendDefault = 1
-		return state
+		return finalizeState()
 	}
 
-	sectorRows, err := st.Shadow().ListFilledForSectorAdaptive(normalizedTrader, normalizedSector, adaptiveSectorLimit)
-	if err != nil {
-		state.Factors = buildAdaptiveFactorStatesForOrder(adaptiveVisibleFactorOrder, defaults, empirical, finalWeights, sectorICs, coinICs, finalICs)
-		state.HiddenFactors = buildAdaptiveFactorStatesForOrder(adaptiveHiddenFactorOrder, hiddenDefaults, hiddenEmpirical, hiddenFinalWeights, sectorICs, coinICs, finalICs)
-		state.NestedWeights = nestedWeights
-		state.BlendDefault = 1
-		return state
-	}
-	coinRows, err := st.Shadow().ListFilledForCoinAdaptive(normalizedTrader, normalizedSymbol, adaptiveCoinLimit)
-	if err != nil {
-		state.Factors = buildAdaptiveFactorStatesForOrder(adaptiveVisibleFactorOrder, defaults, empirical, finalWeights, sectorICs, coinICs, finalICs)
-		state.HiddenFactors = buildAdaptiveFactorStatesForOrder(adaptiveHiddenFactorOrder, hiddenDefaults, hiddenEmpirical, hiddenFinalWeights, sectorICs, coinICs, finalICs)
-		state.NestedWeights = nestedWeights
-		state.BlendDefault = 1
-		return state
+	switch {
+	case normalizedSymbol != "":
+		globalRows, err := st.Shadow().ListFilledForAdaptive(normalizedTrader, adaptiveSectorLimit)
+		if err != nil {
+			state.BlendDefault = 1
+			return finalizeState()
+		}
+		sectorRows, err := st.Shadow().ListFilledForSectorAdaptive(normalizedTrader, normalizedSector, adaptiveSectorLimit)
+		if err != nil {
+			state.BlendDefault = 1
+			return finalizeState()
+		}
+		coinRows, err := st.Shadow().ListFilledForCoinAdaptive(normalizedTrader, normalizedSymbol, adaptiveCoinLimit)
+		if err != nil {
+			state.BlendDefault = 1
+			return finalizeState()
+		}
+
+		globalICs, _ = computeICsFromRows(globalRows)
+		sectorICs, state.SectorSampleCount = computeICsFromRows(sectorRows)
+		coinICs, state.CoinSampleCount = computeICsFromRows(coinRows)
+		state.SampleCount = state.SectorSampleCount
+		state.Alpha = calculateBayesianShrinkageAlpha(state.CoinSampleCount)
+		finalICs = shrinkFactorICs(globalICs, sectorICs, coinICs, state.SectorSampleCount, state.CoinSampleCount)
+		logAdaptiveShrinkage("symbol", normalizedSymbol, rawSector, globalICs, sectorICs, coinICs, finalICs, state.SectorSampleCount, state.CoinSampleCount)
+	case rawSector != "":
+		globalRows, err := st.Shadow().ListFilledForAdaptive(normalizedTrader, adaptiveSectorLimit)
+		if err != nil {
+			state.BlendDefault = 1
+			return finalizeState()
+		}
+		sectorRows, err := st.Shadow().ListFilledForSectorAdaptive(normalizedTrader, normalizedSector, adaptiveSectorLimit)
+		if err != nil {
+			state.BlendDefault = 1
+			return finalizeState()
+		}
+
+		globalICs, _ = computeICsFromRows(globalRows)
+		sectorICs, state.SectorSampleCount = computeICsFromRows(sectorRows)
+		state.SampleCount = state.SectorSampleCount
+		finalICs = smoothFactorICs(sectorICs, globalICs, state.SectorSampleCount, false)
+		logAdaptiveShrinkage("sector", normalizedSymbol, rawSector, globalICs, sectorICs, coinICs, finalICs, state.SectorSampleCount, 0)
+	default:
+		globalRows, err := st.Shadow().ListFilledForAdaptive(normalizedTrader, adaptiveSectorLimit)
+		if err != nil {
+			state.BlendDefault = 1
+			return finalizeState()
+		}
+
+		globalICs, state.SampleCount = computeICsFromRows(globalRows)
+		finalICs = copyWeightMap(globalICs)
+		logAdaptiveShrinkage("global", normalizedSymbol, rawSector, globalICs, sectorICs, coinICs, finalICs, 0, 0)
 	}
 
-	sectorICs, state.SectorSampleCount = computeICsFromRows(sectorRows)
-	coinICs, state.CoinSampleCount = computeICsFromRows(coinRows)
-	state.SampleCount = state.SectorSampleCount
-	state.Alpha = calculateBayesianShrinkageAlpha(state.CoinSampleCount)
-	finalICs = shrinkFactorICs(sectorICs, coinICs, state.Alpha)
-
-	if state.SectorSampleCount >= 2 {
+	if state.SampleCount >= 2 {
 		empirical = buildEmpiricalWeightsForOrder(adaptiveVisibleFactorOrder, defaults, finalICs)
 		blendDefault := 0.0
-		if state.SectorSampleCount < AdaptiveSampleTarget {
-			blendDefault = float64(AdaptiveSampleTarget-state.SectorSampleCount) / float64(AdaptiveSampleTarget)
+		if state.SampleCount < AdaptiveSampleTarget {
+			blendDefault = float64(AdaptiveSampleTarget-state.SampleCount) / float64(AdaptiveSampleTarget)
 		}
 		state.BlendDefault = clamp(blendDefault, 0, 1)
 		state.BlendAdaptive = 1 - state.BlendDefault
@@ -280,10 +662,7 @@ func computeAdaptiveWeightState(traderID, sector, symbol string) AdaptiveWeightS
 		state.BlendAdaptive = 0
 	}
 
-	state.Factors = buildAdaptiveFactorStatesForOrder(adaptiveVisibleFactorOrder, defaults, empirical, finalWeights, sectorICs, coinICs, finalICs)
-	state.HiddenFactors = buildAdaptiveFactorStatesForOrder(adaptiveHiddenFactorOrder, hiddenDefaults, hiddenEmpirical, hiddenFinalWeights, sectorICs, coinICs, finalICs)
-	state.NestedWeights = nestedWeights
-	return state
+	return finalizeState()
 }
 
 func computeICsFromRows(rows []*store.ShadowSnapshot) (map[string]float64, int) {
@@ -294,21 +673,28 @@ func computeICsFromRows(rows []*store.ShadowSnapshot) (map[string]float64, int) 
 	}
 
 	for _, factor := range adaptiveFactorOrder {
-		ics[factor] = EWMAPearsonCorrelation(factorSamples[factor], returns, ICHalfLife)
+		ics[factor] = EWMASpearmanCorrelation(factorSamples[factor], returns, ICHalfLife)
 	}
 	return ics, len(returns)
 }
 
 func buildAdaptiveSampleSet(rows []*store.ShadowSnapshot) (map[string][]float64, []float64) {
 	factorSamples := map[string][]float64{
-		"market":          {},
-		"trend":           {},
-		"donchian_factor": {},
-		"volume_spike":    {},
-		"mtf_resonance":   {},
-		"quant":           {},
-		"social":          {},
-		"onchain":         {},
+		"market":            {},
+		"trend":             {},
+		"donchian_factor":   {},
+		"volume_spike":      {},
+		"mtf_resonance":     {},
+		"quant":             {},
+		"quant_oi":          {},
+		"quant_imbalance":   {},
+		"quant_netflow":     {},
+		"social":            {},
+		"social_rank":       {},
+		"social_upvote":     {},
+		"onchain":           {},
+		"onchain_ratio":     {},
+		"onchain_buy_ratio": {},
 	}
 	returns := make([]float64, 0, len(rows))
 	for _, row := range rows {
@@ -327,14 +713,21 @@ func buildAdaptiveSampleSet(rows []*store.ShadowSnapshot) (map[string][]float64,
 		}
 
 		values := map[string]float64{
-			"market":          row.MarketFactor,
-			"trend":           row.TrendFactor,
-			"donchian_factor": row.DonchianFactor,
-			"volume_spike":    row.VolumeSpikeFactor,
-			"mtf_resonance":   row.MTFResonanceFactor,
-			"quant":           row.QuantFactor,
-			"social":          row.SocialFactor,
-			"onchain":         row.OnChainFactor,
+			"market":            row.MarketFactor,
+			"trend":             row.TrendFactor,
+			"donchian_factor":   row.DonchianFactor,
+			"volume_spike":      row.VolumeSpikeFactor,
+			"mtf_resonance":     row.MTFResonanceFactor,
+			"quant":             row.QuantFactor,
+			"quant_oi":          row.QuantOIRaw,
+			"quant_imbalance":   row.QuantImbalanceRaw,
+			"quant_netflow":     row.QuantNetflowRaw,
+			"social":            row.SocialFactor,
+			"social_rank":       row.SocialRankRaw,
+			"social_upvote":     row.SocialUpvoteRaw,
+			"onchain":           row.OnChainFactor,
+			"onchain_ratio":     row.OnChainRatioRaw,
+			"onchain_buy_ratio": row.OnChainBuyRaw,
 		}
 		valid := true
 		for _, factor := range adaptiveFactorOrder {
@@ -368,50 +761,94 @@ func reverseFloat64s(values []float64) {
 }
 
 // calculateBayesianShrinkageAlpha stretches the coin-level shrinkage curve so
-// alpha only reaches the 0.4 cap after 2000 coin samples.
+// alpha only reaches the 0.4 cap after 500 coin samples.
 func calculateBayesianShrinkageAlpha(coinSampleCount int) float64 {
-	return math.Min(float64(coinSampleCount)/5000.0, 0.4)
+	return math.Min(float64(coinSampleCount)/1250.0, 0.4)
 }
 
-func shrinkFactorICs(sectorICs, coinICs map[string]float64, alpha float64) map[string]float64 {
-	finalICs := make(map[string]float64, len(adaptiveFactorOrder))
-	for _, factor := range adaptiveFactorOrder {
-		finalICs[factor] = sectorICs[factor]*(1-alpha) + coinICs[factor]*alpha
+func calculateConfidenceFactor(sampleCount int) float64 {
+	if sampleCount <= 0 {
+		return 0
 	}
-	return finalICs
+	return float64(sampleCount) / (float64(sampleCount) + ConfidenceThreshold)
+}
+
+func smoothFactorICs(primaryICs, fallbackICs map[string]float64, sampleCount int, alwaysSmooth bool) map[string]float64 {
+	if !alwaysSmooth && float64(sampleCount) >= ConfidenceThreshold {
+		return copyWeightMap(primaryICs)
+	}
+
+	confidenceFactor := calculateConfidenceFactor(sampleCount)
+	smoothed := make(map[string]float64, len(adaptiveFactorOrder))
+	for _, factor := range adaptiveFactorOrder {
+		smoothed[factor] = primaryICs[factor]*confidenceFactor + fallbackICs[factor]*(1-confidenceFactor)
+	}
+	return smoothed
+}
+
+func shrinkFactorICs(globalICs, sectorICs, coinICs map[string]float64, sectorSampleCount, coinSampleCount int) map[string]float64 {
+	smoothedSectorICs := smoothFactorICs(sectorICs, globalICs, sectorSampleCount, false)
+	return smoothFactorICs(coinICs, smoothedSectorICs, coinSampleCount, true)
+}
+
+func logAdaptiveShrinkage(scope, symbol, sector string, globalICs, sectorICs, coinICs, finalICs map[string]float64, sectorSampleCount, coinSampleCount int) {
+	sectorConfidence := calculateConfidenceFactor(sectorSampleCount)
+	symbolConfidence := calculateConfidenceFactor(coinSampleCount)
+	if float64(sectorSampleCount) >= ConfidenceThreshold {
+		sectorConfidence = 1
+	}
+	if scope != "symbol" {
+		symbolConfidence = 0
+	}
+
+	for _, factor := range adaptiveVisibleFactorOrder {
+		logger.Infof("V3_AUDIT_ADAPTIVE: Scope=%s, Symbol=%s, Sector=%s, Factor=%s, Global_IC=%.2f, Sector_IC=%.2f, Coin_IC=%.2f, Final_IC=%.2f, SectorCF=%.2f, SymbolCF=%.2f",
+			scope,
+			symbol,
+			sector,
+			factor,
+			globalICs[factor],
+			sectorICs[factor],
+			coinICs[factor],
+			finalICs[factor],
+			sectorConfidence,
+			symbolConfidence,
+		)
+	}
 }
 
 func buildEmpiricalWeightsForOrder(order []string, defaults map[string]float64, ics map[string]float64) map[string]float64 {
 	empirical := make(map[string]float64, len(defaults))
-	positiveICSum := 0.0
-	negativeCount := 0
+	absoluteICSum := 0.0
+	zeroCount := 0
 
 	for _, factor := range order {
-		if ics[factor] > 0 {
-			positiveICSum += ics[factor]
+		magnitude := math.Abs(ics[factor])
+		if magnitude > 0 {
+			absoluteICSum += magnitude
 			continue
 		}
 		empirical[factor] = empiricalWeightFloor
-		negativeCount++
+		zeroCount++
 	}
 
-	if positiveICSum <= 0 {
+	if absoluteICSum <= 0 {
 		return copyWeightMap(defaults)
 	}
 
-	remainingBudget := 1 - float64(negativeCount)*empiricalWeightFloor
+	remainingBudget := 1 - float64(zeroCount)*empiricalWeightFloor
 	if remainingBudget <= 0 {
 		return copyWeightMap(defaults)
 	}
 
 	active := make([]string, 0, len(order))
 	for _, factor := range order {
-		if ics[factor] > 0 {
+		if math.Abs(ics[factor]) > 0 {
 			active = append(active, factor)
 		}
 	}
 
-	remainingIC := positiveICSum
+	remainingIC := absoluteICSum
 	for len(active) > 0 && remainingBudget > 0 {
 		next := make([]string, 0, len(active))
 		capped := false
@@ -419,11 +856,12 @@ func buildEmpiricalWeightsForOrder(order []string, defaults map[string]float64, 
 			if remainingIC <= 0 {
 				break
 			}
-			tentative := remainingBudget * (ics[factor] / remainingIC)
+			magnitude := math.Abs(ics[factor])
+			tentative := remainingBudget * (magnitude / remainingIC)
 			if tentative > empiricalWeightCeiling {
 				empirical[factor] = empiricalWeightCeiling
 				remainingBudget -= empiricalWeightCeiling
-				remainingIC -= ics[factor]
+				remainingIC -= magnitude
 				capped = true
 				continue
 			}
@@ -432,11 +870,12 @@ func buildEmpiricalWeightsForOrder(order []string, defaults map[string]float64, 
 
 		if !capped {
 			for _, factor := range active {
+				magnitude := math.Abs(ics[factor])
 				if remainingIC <= 0 {
 					empirical[factor] = remainingBudget / float64(len(active))
 					continue
 				}
-				empirical[factor] = remainingBudget * (ics[factor] / remainingIC)
+				empirical[factor] = remainingBudget * (magnitude / remainingIC)
 			}
 			break
 		}
@@ -491,31 +930,48 @@ func defaultAdaptiveWeights() map[string]float64 {
 }
 
 func defaultHiddenAdaptiveWeights() map[string]float64 {
-	return map[string]float64{
+	weights := map[string]float64{
 		"donchian_factor": DefaultNestedWeightSub,
 		"mtf_resonance":   DefaultNestedWeightSub,
 	}
+	for group, priors := range adaptiveNestedPriors {
+		for factor, weight := range priors {
+			if factor == group {
+				continue
+			}
+			weights[factor] = weight
+		}
+	}
+	return weights
 }
 
 func defaultNestedAdaptiveWeights() map[string]float64 {
-	return map[string]float64{
-		"trend":           DefaultNestedWeightCore,
-		"donchian_factor": DefaultNestedWeightSub,
-		"volume_spike":    DefaultNestedWeightCore,
-		"mtf_resonance":   DefaultNestedWeightSub,
+	weights := make(map[string]float64, len(adaptiveFactorOrder))
+	for _, priors := range adaptiveNestedPriors {
+		for factor, weight := range priors {
+			weights[factor] = weight
+		}
 	}
+	return weights
 }
 
 func zeroAdaptiveValues() map[string]float64 {
 	return map[string]float64{
-		"market":          0,
-		"trend":           0,
-		"donchian_factor": 0,
-		"volume_spike":    0,
-		"mtf_resonance":   0,
-		"quant":           0,
-		"social":          0,
-		"onchain":         0,
+		"market":            0,
+		"trend":             0,
+		"donchian_factor":   0,
+		"volume_spike":      0,
+		"mtf_resonance":     0,
+		"quant":             0,
+		"quant_oi":          0,
+		"quant_imbalance":   0,
+		"quant_netflow":     0,
+		"social":            0,
+		"social_rank":       0,
+		"social_upvote":     0,
+		"onchain":           0,
+		"onchain_ratio":     0,
+		"onchain_buy_ratio": 0,
 	}
 }
 
@@ -589,6 +1045,7 @@ func buildNestedWeightState(finalICs map[string]float64, blendDefault, blendAdap
 		groupEmpirical := buildEmpiricalWeightsForOrder(order, groupDefaults, finalICs)
 		groupFinal := blendWeightMapsForOrder(order, groupDefaults, groupEmpirical, blendDefault, blendAdaptive)
 		groupFinal = normalizeWeightMapForOrder(order, groupFinal, groupDefaults)
+		groupFinal = clampNestedGroupWeights(order, groupFinal, groupDefaults)
 
 		for _, factor := range order {
 			nestedWeights[factor] = groupFinal[factor]
@@ -604,16 +1061,87 @@ func buildNestedWeightState(finalICs map[string]float64, blendDefault, blendAdap
 }
 
 func defaultNestedGroupWeights(parent string) map[string]float64 {
-	group := map[string]float64{
-		parent: DefaultNestedWeightCore,
-	}
-	for _, factor := range adaptiveNestedFactorGroups[parent] {
-		if factor == parent {
-			continue
+	priors, ok := adaptiveNestedPriors[parent]
+	if !ok {
+		return map[string]float64{
+			parent: 1,
 		}
-		group[factor] = DefaultNestedWeightSub
+	}
+
+	group := make(map[string]float64, len(priors))
+	for factor, weight := range priors {
+		group[factor] = weight
 	}
 	return group
+}
+
+func clampNestedGroupWeights(order []string, weights, priors map[string]float64) map[string]float64 {
+	minBounds := make(map[string]float64, len(order))
+	maxBounds := make(map[string]float64, len(order))
+	for _, factor := range order {
+		minBounds[factor] = empiricalWeightFloor
+		maxBounds[factor] = 0.99
+	}
+
+	return projectWeightsIntoBounds(order, weights, priors, minBounds, maxBounds)
+}
+
+func projectWeightsIntoBounds(order []string, weights, fallback, minBounds, maxBounds map[string]float64) map[string]float64 {
+	projected := normalizeWeightMapForOrder(order, weights, fallback)
+	const maxIterations = 8
+	for i := 0; i < maxIterations; i++ {
+		sum := 0.0
+		for _, factor := range order {
+			projected[factor] = clamp(projected[factor], minBounds[factor], maxBounds[factor])
+			sum += projected[factor]
+		}
+
+		diff := 1 - sum
+		if math.Abs(diff) <= 1e-9 {
+			break
+		}
+
+		if diff > 0 {
+			slackSum := 0.0
+			for _, factor := range order {
+				slack := maxBounds[factor] - projected[factor]
+				if slack > 0 {
+					slackSum += slack
+				}
+			}
+			if slackSum <= 0 {
+				break
+			}
+			for _, factor := range order {
+				slack := maxBounds[factor] - projected[factor]
+				if slack <= 0 {
+					continue
+				}
+				projected[factor] += diff * (slack / slackSum)
+			}
+			continue
+		}
+
+		slackSum := 0.0
+		for _, factor := range order {
+			slack := projected[factor] - minBounds[factor]
+			if slack > 0 {
+				slackSum += slack
+			}
+		}
+		if slackSum <= 0 {
+			break
+		}
+		for _, factor := range order {
+			slack := projected[factor] - minBounds[factor]
+			if slack <= 0 {
+				continue
+			}
+			projected[factor] += diff * (slack / slackSum)
+		}
+	}
+
+	return stabilizeUnitSumForOrder(order, projected, fallback)
 }
 
 func copyWeightMap(src map[string]float64) map[string]float64 {
@@ -628,7 +1156,7 @@ func buildAdaptiveCacheKey(traderID, sector, symbol string) string {
 	return strings.Join([]string{
 		normalizedAdaptiveTrader(traderID),
 		normalizeAdaptiveSector(sector),
-		Normalize(symbol),
+		normalizeAdaptiveSymbol(symbol),
 	}, "|")
 }
 
@@ -647,6 +1175,14 @@ func normalizeAdaptiveSector(sector string) string {
 	return sector
 }
 
+func normalizeAdaptiveSymbol(symbol string) string {
+	symbol = strings.TrimSpace(symbol)
+	if symbol == "" {
+		return ""
+	}
+	return Normalize(symbol)
+}
+
 func getAdaptiveWeightStore() *store.Store {
 	adaptiveStoreMu.RLock()
 	defer adaptiveStoreMu.RUnlock()
@@ -658,4 +1194,137 @@ func clearAdaptiveWeightCache() {
 		adaptiveCache.Delete(key)
 		return true
 	})
+}
+
+// RunFullRegression executes the repository's full Go regression suite using the
+// repo toolchain wrapper so the command is safe for repeated CI/CD invocation.
+func RunFullRegression() error {
+	projectRoot := resolveProjectRoot()
+	cmd := exec.Command(filepath.Join(projectRoot, "scripts", "with_go_env.sh"), "go", "test", "./...")
+	cmd.Dir = projectRoot
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// FullStackHealthCheck ensures backend (8080) and frontend (3000) are online,
+// performs HTTP 200 validation, refreshes caches, and notifies DB migration completion.
+func FullStackHealthCheck() (err error) {
+	logger.Info("FullStackHealthCheck invoked")
+	defer func() {
+		if refreshErr := store.RefreshCache(); refreshErr != nil {
+			if err == nil {
+				err = fmt.Errorf("refresh cache: %w", refreshErr)
+			} else {
+				err = fmt.Errorf("%w; cache refresh failed: %v", err, refreshErr)
+			}
+		}
+		store.NotifyMigration()
+		if err != nil {
+			logger.Warnf("FullStackHealthCheck completed with error: %v", err)
+			return
+		}
+		logger.Info("FullStackHealthCheck completed successfully")
+	}()
+
+	out, cmdErr := exec.Command("ss", "-tlnp").Output()
+	if cmdErr != nil {
+		err = fmt.Errorf("inspect listening ports: %w", cmdErr)
+		return err
+	}
+	listeners := string(out)
+	if !strings.Contains(listeners, ":8080") {
+		err = errors.New("backend port 8080 not listening")
+		return err
+	}
+	if !strings.Contains(listeners, ":3000") {
+		err = errors.New("frontend port 3000 not listening")
+		return err
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, httpErr := client.Head("http://localhost:3000")
+	if httpErr != nil {
+		err = fmt.Errorf("frontend HTTP check failed: %w", httpErr)
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		err = fmt.Errorf("frontend HTTP check failed: status=%d", resp.StatusCode)
+		return err
+	}
+
+	return nil
+}
+
+// MonitorSpearmanOutlierDrift evaluates ranked EWMA IC drift over multiple factor
+// series and logs both normal samples and threshold breaches for repeated CI/CD runs.
+func MonitorSpearmanOutlierDrift(factorData [][]float64, threshold float64) {
+	for index, data := range factorData {
+		returns := computeReturns(data)
+		ic := EWMASpearmanCorrelation(data, returns, ICHalfLife)
+		if math.Abs(ic) > threshold {
+			logger.Warnf("Spearman IC outlier drift detected: series=%d ic=%.4f threshold=%.4f", index, ic, threshold)
+			continue
+		}
+		logger.Infof("Spearman IC outlier drift monitored: series=%d ic=%.4f threshold=%.4f status=ok", index, ic, threshold)
+	}
+}
+
+func computeReturns(data []float64) []float64 {
+	returns := make([]float64, len(data))
+	if len(data) == 0 {
+		return returns
+	}
+
+	for i := 1; i < len(data); i++ {
+		prev := data[i-1]
+		current := data[i]
+		if !isFinite(prev) || !isFinite(current) {
+			continue
+		}
+		if prev == 0 {
+			returns[i] = current
+			continue
+		}
+		returns[i] = (current - prev) / math.Abs(prev)
+	}
+
+	return returns
+}
+
+// DefaultSpearmanMonitorFactorData returns deterministic stable and outlier-perturbed
+// factor series so monitor_spearman can run without external market dependencies.
+func DefaultSpearmanMonitorFactorData() [][]float64 {
+	stable := make([]float64, 0, 24)
+	for i := 0; i < 24; i++ {
+		stable = append(stable, 100+math.Sin(float64(i)/3.0)*2+float64(i%3))
+	}
+
+	outlier := append([]float64{}, stable...)
+	outlier = append(outlier, 180, 181, 182, 400, 183, 184)
+
+	return [][]float64{stable, outlier}
+}
+
+func resolveProjectRoot() string {
+	if executable, err := os.Executable(); err == nil {
+		dir := filepath.Dir(executable)
+		if fileExists(filepath.Join(dir, "go.mod")) {
+			return dir
+		}
+	}
+
+	if wd, err := os.Getwd(); err == nil {
+		if fileExists(filepath.Join(wd, "go.mod")) {
+			return wd
+		}
+	}
+
+	return "."
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }

@@ -3,11 +3,31 @@ package kernel
 import (
 	"fmt"
 	"nofx/logger"
+	"regexp"
+	"strings"
 )
 
 // ============================================================================
 // Decision Validation
 // ============================================================================
+
+var (
+	// Simple RE2 patterns only: fixed tokens plus optional whitespace and digits.
+	// No nested repetition, so there is no backtracking blow-up risk here.
+	reasoningBinPattern     = regexp.MustCompile(`(?i)(bin|ban|区间)\s*\d+`)
+	reasoningEVLongPattern  = regexp.MustCompile(`(?i)\bEV_L\b`)
+	reasoningEVShortPattern = regexp.MustCompile(`(?i)\bEV_S\b`)
+	reasoningPFLongPattern  = regexp.MustCompile(`(?i)\bPF_L\b`)
+	reasoningPFShortPattern = regexp.MustCompile(`(?i)\bPF_S\b`)
+)
+
+type reasoningCitationEvidence struct {
+	binRef     string
+	hasEVLong  bool
+	hasEVShort bool
+	hasPFLong  bool
+	hasPFShort bool
+}
 
 func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64) error {
 	for i := range decisions {
@@ -30,6 +50,14 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 
 	if !validActions[d.Action] {
 		return fmt.Errorf("invalid action: %s", d.Action)
+	}
+
+	reasoning := strings.TrimSpace(d.Reasoning)
+	if reasoning == "" {
+		return fmt.Errorf("reasoning cannot be empty")
+	}
+	if err := validateReasoningCitation(d, reasoning); err != nil {
+		return err
 	}
 
 	if d.Action == "open_long" || d.Action == "open_short" {
@@ -118,4 +146,88 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 	}
 
 	return nil
+}
+
+func isSystemFallbackReasoning(reasoning string) bool {
+	return strings.HasPrefix(reasoning, "Model didn't output structured JSON decision")
+}
+
+func validateReasoningCitation(d *Decision, reasoning string) error {
+	if isSystemFallbackReasoning(reasoning) {
+		return nil
+	}
+
+	evidence := extractReasoningCitationEvidence(reasoning)
+	if evidence.binRef == "" {
+		return fmt.Errorf("reasoning must cite the referenced Bin/Ban/区间 score")
+	}
+
+	switch d.Action {
+	case "open_long":
+		if evidence.hasLongSideEvidence() {
+			return nil
+		}
+		if evidence.hasShortSideEvidence() && !evidence.hasAnyLongMetric() {
+			return fmt.Errorf("open_long reasoning must cite current-side EV_L and PF_L for %s", evidence.binRef)
+		}
+		logReasoningPending(d, evidence, reasoning, "open_long expects EV_L and PF_L; allowing pending-zone pass")
+	case "open_short":
+		if evidence.hasShortSideEvidence() {
+			return nil
+		}
+		if evidence.hasLongSideEvidence() && !evidence.hasAnyShortMetric() {
+			return fmt.Errorf("open_short reasoning must cite current-side EV_S and PF_S for %s", evidence.binRef)
+		}
+		logReasoningPending(d, evidence, reasoning, "open_short expects EV_S and PF_S; allowing pending-zone pass")
+	default:
+		if !evidence.hasAnyMetric() {
+			logReasoningPending(d, evidence, reasoning, "score bin cited without EV/PF tokens; allowing pending-zone pass")
+		}
+	}
+
+	return nil
+}
+
+func extractReasoningCitationEvidence(reasoning string) reasoningCitationEvidence {
+	return reasoningCitationEvidence{
+		binRef:     reasoningBinPattern.FindString(reasoning),
+		hasEVLong:  reasoningEVLongPattern.MatchString(reasoning),
+		hasEVShort: reasoningEVShortPattern.MatchString(reasoning),
+		hasPFLong:  reasoningPFLongPattern.MatchString(reasoning),
+		hasPFShort: reasoningPFShortPattern.MatchString(reasoning),
+	}
+}
+
+func (e reasoningCitationEvidence) hasLongSideEvidence() bool {
+	return e.hasEVLong && e.hasPFLong
+}
+
+func (e reasoningCitationEvidence) hasShortSideEvidence() bool {
+	return e.hasEVShort && e.hasPFShort
+}
+
+func (e reasoningCitationEvidence) hasAnyLongMetric() bool {
+	return e.hasEVLong || e.hasPFLong
+}
+
+func (e reasoningCitationEvidence) hasAnyShortMetric() bool {
+	return e.hasEVShort || e.hasPFShort
+}
+
+func (e reasoningCitationEvidence) hasAnyMetric() bool {
+	return e.hasAnyLongMetric() || e.hasAnyShortMetric()
+}
+
+func logReasoningPending(d *Decision, evidence reasoningCitationEvidence, reasoning, detail string) {
+	logger.Warnf("⚠️  [Reasoning Pending] symbol=%s action=%s bin=%s detail=%s reasoning=%q",
+		d.Symbol, d.Action, evidence.binRef, detail, compactReasoningForLog(reasoning))
+}
+
+func compactReasoningForLog(reasoning string) string {
+	const maxLen = 220
+	reasoning = strings.TrimSpace(reasoning)
+	if len(reasoning) <= maxLen {
+		return reasoning
+	}
+	return reasoning[:maxLen] + "..."
 }

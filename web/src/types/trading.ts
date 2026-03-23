@@ -88,6 +88,8 @@ export interface AdaptiveWeightState {
   blend_default: number
   blend_adaptive: number
   factors: AdaptiveFactorState[]
+  hidden_factors: AdaptiveFactorState[]
+  nested_weights: Record<string, number>
   updated_at: number
 }
 
@@ -313,90 +315,26 @@ export interface GridRiskInfo {
   breakout_direction: string
 }
 
-export interface CandidateDonchianBox {
-  period: number
-  upper: number
-  lower: number
-  mid: number
-  state: string
-}
-
-export interface CandidateEmaSignals {
-  state:
-    | 'bullish_stack'
-    | 'bearish_stack'
-    | 'mixed'
-    | 'single_ema'
-    | 'unavailable'
-  values?: Record<number, number>
-  periods?: number[]
-}
-
-export interface CandidateTrendContext {
-  timeframe: string
-  rsi?: number
-  macd?: number
-  macd_state?: string
-  ema_state?: CandidateEmaSignals['state'] | string
-  donchian_state?: string
-  donchian_period?: number
-}
-
 export interface CandidateMarketItem {
   symbol: string
   current_price: number
-  timeframes: string[]
-  donchian_boxes?: Record<string, CandidateDonchianBox>
-  trend_contexts?: Record<string, CandidateTrendContext>
-  ema_signals: CandidateEmaSignals
-  open_interest?: {
-    Latest: number
-    Average: number
-    sample_count?: number
-    period?: string
+  logic_score: number
+  bias: 'LONG' | 'SHORT' | 'WAIT' | string
+  expected_ev: number
+  _debug_bin_stats?: {
+    bin_start: number
+    trade_count: number
+    ev_long: number
+    profit_factor_long: number
+    ev_short: number
+    profit_factor_short: number
   }
-  orderbook?: {
-    bid_total: number
-    ask_total: number
-    imbalance: number
-  }
-  dex_screener?: {
-    chain_id?: string
-    pair_address?: string
-    pair_url?: string
-    liquidity_usd: number
-    volume_h1: number
-    buy_txns_h1: number
-    sell_txns_h1: number
-    buy_ratio: number
-    buy_sell_ratio: number
-    cex_volume_h1: number
-    onchain_to_cex_ratio: number
-  }
-  gecko_sentiment?: {
-    coin_id?: string
-    public_interest_score: number
-    sentiment_votes_up_percentage: number
-    using_private_key?: boolean
-    cached_at?: string
-  }
-  heat_score?: {
-    composite_score: number
-    trading_score: number
-    quant_score: number
-    source_weights?: Record<string, number>
-  }
-  vol_utilization?: number
-  vol_util_basis?: string
-  funding_rate?: number
-  ai500_score?: number | null
-  sources?: string[]
-  updated_at: string
 }
 
 export interface CandidateSnapshotResponse {
   trader_id: string
   trader_name: string
   updated_at: string
+  score_engine: string
   candidates: CandidateMarketItem[]
 }

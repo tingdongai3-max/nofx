@@ -38,6 +38,29 @@ func main() {
 	cfg := config.Get()
 	logger.Info("✅ Configuration loaded")
 
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "healthcheck":
+			if err := market.FullStackHealthCheck(); err != nil {
+				logger.Errorf("❌ Full stack health check failed: %v", err)
+				os.Exit(1)
+			}
+			logger.Info("✅ Full stack health check passed")
+			return
+		case "full_regression":
+			if err := market.RunFullRegression(); err != nil {
+				logger.Errorf("❌ Full regression failed: %v", err)
+				os.Exit(1)
+			}
+			logger.Info("✅ Full regression passed")
+			return
+		case "monitor_spearman":
+			market.MonitorSpearmanOutlierDrift(market.DefaultSpearmanMonitorFactorData(), 0.40)
+			logger.Info("✅ Spearman outlier monitoring completed")
+			return
+		}
+	}
+
 	// Initialize encryption service BEFORE database (so EncryptedString can decrypt on read)
 	logger.Info("🔐 Initializing encryption service...")
 	cryptoService, err := crypto.NewCryptoService()
