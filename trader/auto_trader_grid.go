@@ -590,6 +590,12 @@ func (at *AutoTrader) saveGridDecisionRecord(decision *kernel.FullDecision) {
 		InputPrompt:         decision.UserPrompt,
 		CoTTrace:            decision.CoTTrace,
 		RawResponse:         decision.RawResponse,
+		AIFinishReason:      decision.AIFinishReason,
+		AIPromptTokens:      decision.AIPromptTokens,
+		AICompletionTokens:  decision.AICompletionTokens,
+		AITotalTokens:       decision.AITotalTokens,
+		AIRawBodyTail:       decision.AIRawBodyTail,
+		AIMaxTokens:         decision.AIMaxTokens,
 		AIRequestDurationMs: decision.AIRequestDurationMs,
 		Success:             true,
 	}

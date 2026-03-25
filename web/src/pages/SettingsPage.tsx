@@ -7,6 +7,7 @@ import { api } from '../lib/api'
 import { ExchangeConfigModal } from '../components/trader/ExchangeConfigModal'
 import { TelegramConfigModal } from '../components/trader/TelegramConfigModal'
 import { ModelConfigModal } from '../components/trader/ModelConfigModal'
+import { GlobalTradingSettingsPanel } from '../components/trader/GlobalTradingSettingsPanel'
 import type { Exchange, AIModel } from '../types'
 
 type Tab = 'account' | 'models' | 'exchanges' | 'telegram'
@@ -35,7 +36,6 @@ export function SettingsPage() {
   // Telegram state
   const [showTelegramModal, setShowTelegramModal] = useState(false)
 
-  // Fetch data when tabs are visited
   useEffect(() => {
     if (activeTab === 'models') {
       Promise.all([api.getModelConfigs(), api.getSupportedModels()])
@@ -251,6 +251,7 @@ export function SettingsPage() {
     <div className="min-h-screen pt-20 pb-12 px-4" style={{ background: '#0B0E11' }}>
       <div className="max-w-2xl mx-auto">
         <h1 className="text-xl font-bold text-white mb-6">Settings</h1>
+        <GlobalTradingSettingsPanel className="mb-6" />
 
         {/* Tabs */}
         <div className="flex gap-1 mb-6 bg-zinc-900/60 border border-zinc-800 rounded-xl p-1">

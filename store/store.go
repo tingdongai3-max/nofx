@@ -29,6 +29,7 @@ type Store struct {
 	equity         *EquityStore
 	order          *OrderStore
 	grid           *GridStore
+	realTradeStats *RealTradeStatsStore
 	aiCharge       *AIChargeStore
 	telegramConfig TelegramConfigStore
 
@@ -161,6 +162,9 @@ func (s *Store) initTables() error {
 	}
 	if err := s.Grid().InitTables(); err != nil {
 		return fmt.Errorf("failed to initialize grid tables: %w", err)
+	}
+	if err := s.RealTradeStats().InitTables(); err != nil {
+		return fmt.Errorf("failed to initialize real trade stats tables: %w", err)
 	}
 	if err := s.TelegramConfig().(*telegramConfigStore).initTables(); err != nil {
 		return fmt.Errorf("failed to initialize telegram config tables: %w", err)
@@ -299,6 +303,16 @@ func (s *Store) Grid() *GridStore {
 		s.grid = NewGridStore(s.gdb)
 	}
 	return s.grid
+}
+
+// RealTradeStats gets real trade resonance attribution storage.
+func (s *Store) RealTradeStats() *RealTradeStatsStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.realTradeStats == nil {
+		s.realTradeStats = NewRealTradeStatsStore(s.gdb)
+	}
+	return s.realTradeStats
 }
 
 // AICharge gets AI charge storage

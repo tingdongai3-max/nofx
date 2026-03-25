@@ -34,9 +34,10 @@ const (
 
 // BitgetTrader Bitget futures trader
 type BitgetTrader struct {
-	apiKey     string
-	secretKey  string
-	passphrase string
+	apiKey        string
+	secretKey     string
+	passphrase    string
+	isCrossMargin bool
 
 	// HTTP client
 	httpClient *http.Client
@@ -91,6 +92,7 @@ func NewBitgetTrader(apiKey, secretKey, passphrase string) *BitgetTrader {
 		apiKey:         apiKey,
 		secretKey:      secretKey,
 		passphrase:     passphrase,
+		isCrossMargin:  true,
 		httpClient:     httpClient,
 		cacheDuration:  15 * time.Second,
 		contractsCache: make(map[string]*BitgetContract),

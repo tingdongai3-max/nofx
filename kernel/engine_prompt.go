@@ -127,29 +127,36 @@ func (e *StrategyEngine) BuildSystemPrompt(accountEquity float64, variant string
 		sb.WriteString("3. Write chain of thought first, then output structured JSON\n\n")
 	}
 
-	sb.WriteString("## 核心决策逻辑：数据驱动方向 (Data-Driven Directional Bias)\n")
-	sb.WriteString("1. 废弃固定分数方向：重算后的 LogicScore 不再硬性代表做多或做空，它仅作为【历史表现索引】。\n")
-	sb.WriteString("2. 方向判定规则：\n")
+	sb.WriteString("## 核心决策逻辑：权重加总而非硬性共振 (Weighted Sum, Not AND Gate)\n")
+	sb.WriteString("1. Recalced LogicScore 只作为【历史表现索引】。它不再强制要求 Global / Sector / Symbol 三维同时为正。\n")
+	sb.WriteString("2. 实时归因权重：\n")
+	sb.WriteString("   - 每个 Market Tick 都会读取最新的实盘归因权重。\n")
+	sb.WriteString("   - Macro = Global, Sector = Meso, Symbol = Micro。\n")
+	sb.WriteString("   - 最终入场 EV 按 `EV_macro * W_macro + EV_sector * W_sector + EV_symbol * W_symbol` 计算。\n")
+	sb.WriteString("   - 只要加权后的 Final Entry EV 高于阈值，就允许开仓，即使某一维度为负也不应被硬性否决。\n")
+	sb.WriteString("   - 权重之和必须接近 1.0；若没有有效样本，使用 33.3% / 33.3% / 33.3% 的平权回退。\n")
+	sb.WriteString("3. 分箱阅读规则：\n")
 	sb.WriteString("   - 查找当前 Recalced LogicScore 对应的 Bin（例如 32 分对应 Bin 30）。\n")
-	sb.WriteString("   - 现在的 EV 曲线来自滑动窗口平滑趋势；例如当前逻辑分数在 42 分时，也要参考 40-44 一带的表现，而不是只盯单个离散桶。\n")
-	sb.WriteString("   - 阅读矩阵时，同时检查 EV_L / EV_S（平均对数回报率）与 PF_L / PF_S（盈利因子）。\n")
-	sb.WriteString("   - EV_L / EV_S > 0 表示该方向在统计上是增长的；EV <= 0 说明该方向没有正期望。\n")
-	sb.WriteString("   - 【绝对原则】：仅在 EV > 0 且 PF > 1.2 的分段执行对应方向的开仓。\n")
-	sb.WriteString("   - 【相对优势原则】：若一侧 PF 显著高于另一侧，则该方向为主攻方向。\n")
-	sb.WriteString("   - 【风险对冲原则】：若两边 EV 均 <= 0，或两边 PF 均 <= 1.2，视为噪音区，禁止开仓。\n")
-	sb.WriteString("   - 【极端反转识别】：若低分段（Bin < 40）的 PF_L 显著占优，应识别为超卖反弹；若高分段（Bin > 70）的 PF_S 显著占优，应识别为末尾派发或假突破。\n")
-	sb.WriteString("3. 统计置信度：\n")
+	sb.WriteString("   - 阅读矩阵时同时检查 EV_L / EV_S 与 PF_L / PF_S，但不再要求三维同时为正。\n")
+	sb.WriteString("   - 方向由加权后的最终入场 EV 决定；更高的加权期望值获胜。\n")
+	sb.WriteString("   - 若两侧加权期望都低于阈值，则视为噪音区，禁止开仓。\n")
+	sb.WriteString("   - 若低分段或高分段存在极端峰值，可直接触发对应方向，无需被邻域低分拉低。\n")
+	sb.WriteString("4. 统计置信度：\n")
 	sb.WriteString("   - 样本量 N > 30 时，严格遵守该矩阵的 EV / PF 指标。\n")
 	sb.WriteString("   - 若当前 Symbol 的 N < 10，请忽略 Symbol 矩阵，优先参考 Sector 矩阵。\n")
 	sb.WriteString("   - 若 Sector 的 N < 20，请优先参考 Global 矩阵。\n")
 	sb.WriteString("   - 记住：背景环境（大盘/赛道）的稳定性在高波动新币上具有更高的决策权重。\n\n")
-	sb.WriteString("4. 推理表述要求：\n")
+	if liveWeightsBlock := e.formatLiveAttributionWeights(e.currentLiveAttributionWeights()); liveWeightsBlock != "" {
+		sb.WriteString(liveWeightsBlock)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("5. 推理表述要求：\n")
 	sb.WriteString("   - 禁止使用“因为胜率高”作为开仓理由。\n")
-	sb.WriteString("   - 开仓 reasoning 必须引用 Bin 编号及当前侧的 EV/PF 数据。\n")
-	sb.WriteString("   - 你可以简写指标，但必须保留数字证据，例如 `Bin 55: EV_L +0.5% > 0 且 PF_L 1.52 具有优势，技术面共振支持开多。`\n\n")
+	sb.WriteString("   - 开仓 reasoning 必须引用 Bin 编号、加权后的 Final Entry EV，以及至少一个当前侧的 EV/PF 数据。\n")
+	sb.WriteString("   - 你可以简写指标，但必须保留数字证据，例如 `Bin 55: Final EV +0.12% 已越过阈值，Sector 贡献 90% 承担主导，支持开多。`\n\n")
 	sb.WriteString("   - 在描述 EV 表现时，请尽量引用当前中心分数的具体数值。虽然允许描述区间，但精确的数字证据能获得更高的执行置信度。\n\n")
 	sb.WriteString("   - 对于 `wait` 决策，你可以引用分箱数据证明 EV/PF 不足，也可以直接引用持仓量、资金流或价格动量，说明当前不适合入场。\n\n")
-	sb.WriteString("5. Personality DNA 因子权重识别准则：\n")
+	sb.WriteString("6. Personality DNA 因子权重识别准则：\n")
 	sb.WriteString("   - 先读取每个币种的 `## Personality DNA`，逐项检查 Spearman Rank IC，再决定哪些技术面/情绪面证据可以相信。\n")
 	sb.WriteString("   - 若 IC > +0.05：该因子属于【强正向逻辑】，其对应 Matrix 与因子信号具有较高参考价值。\n")
 	sb.WriteString("   - 若 IC < -0.05：该因子属于【强反向指标】，你必须进行反向推理，例如情绪越热反而越偏空。\n")
@@ -503,6 +510,39 @@ func (e *StrategyEngine) formatCandidatePersonalityDNA(traderID string, data *ma
 	return strings.TrimRight(sb.String(), "\n")
 }
 
+func (e *StrategyEngine) formatLiveAttributionWeights(weights map[string]float64) string {
+	normalized := NormalizeLiveAttributionWeights(weights)
+	if len(normalized) == 0 {
+		return ""
+	}
+
+	macro := normalized[RealFireDimensionGlobal]
+	sector := normalized[RealFireDimensionSector]
+	symbol := normalized[RealFireDimensionSymbol]
+	if macro == 0 && sector == 0 && symbol == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("## Live Attribution Weights\n")
+	sb.WriteString(fmt.Sprintf("- Macro / Global: %.1f%%\n", macro*100))
+	sb.WriteString(fmt.Sprintf("- Sector / Meso: %.1f%%\n", sector*100))
+	sb.WriteString(fmt.Sprintf("- Symbol / Micro: %.1f%%\n", symbol*100))
+	sb.WriteString("- Use these real-time contributions as the entry EV weights; they override fixed AND-gate style gating.\n")
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+func (e *StrategyEngine) currentLiveAttributionWeights() map[string]float64 {
+	if e != nil && len(e.liveAttributionWeights) > 0 {
+		return e.liveAttributionWeights
+	}
+	weights, err := GetLiveAttributionWeights()
+	if err != nil {
+		return nil
+	}
+	return weights
+}
+
 func buildPersonalityDimensions(state market.AdaptiveWeightState) []personalityDimension {
 	factors := mapAdaptiveFactorStatesByName(state.Factors)
 	momentumWeight, momentumIC, hasMomentum := aggregateAdaptiveFactorSignals(
@@ -660,7 +700,7 @@ func formatPerformanceMatrix(title string, bins []*store.ScoreBinPerformance) st
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("=== Smoothed Bin Matrix (%s) ===\n", title))
+	sb.WriteString(fmt.Sprintf("=== Directional Bin Matrix (%s) ===\n", title))
 	sb.WriteString("Bin  N    EV_L%  PF_L  EV_S%  PF_S\n")
 	written := 0
 	for _, bin := range bins {

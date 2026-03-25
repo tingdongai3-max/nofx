@@ -42,9 +42,10 @@ const (
 
 // KuCoinTrader implements types.Trader interface for KuCoin Futures
 type KuCoinTrader struct {
-	apiKey     string
-	secretKey  string
-	passphrase string
+	apiKey        string
+	secretKey     string
+	passphrase    string
+	isCrossMargin bool
 
 	// HTTP client
 	httpClient *http.Client
@@ -105,6 +106,7 @@ func NewKuCoinTrader(apiKey, secretKey, passphrase string) *KuCoinTrader {
 		apiKey:         apiKey,
 		secretKey:      secretKey,
 		passphrase:     passphrase,
+		isCrossMargin:  true,
 		httpClient:     httpClient,
 		cacheDuration:  15 * time.Second,
 		contractsCache: make(map[string]*KuCoinContract),

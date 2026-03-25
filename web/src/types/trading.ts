@@ -121,6 +121,47 @@ export interface DecisionAction {
   timestamp: string
   success: boolean
   error?: string
+  execution_mode?: string
+  real_backtest?: RealBacktestDecisionMeta
+}
+
+export interface RealBacktestDimension {
+  bin_start: number
+  bin_label?: string
+  trade_count: number
+  expected_value: number
+  median_expected_value: number
+  profit_factor: number
+  expected_value_long: number
+  expected_value_short: number
+  median_expected_value_long: number
+  median_expected_value_short: number
+  profit_factor_long: number
+  profit_factor_short: number
+  smoothed?: boolean
+  smoothed_by?: string
+}
+
+export interface RealBacktestDecisionMeta {
+  signal: string
+  logic_score: number
+  sector?: string
+  position_size_usd?: number
+  bin_center: number
+  smoothing_half_width?: number
+  hold_duration_seconds?: number
+  final_entry_ev?: number
+  attribution_weights?: Record<string, number>
+  mahalanobis_distance?: number
+  mahalanobis_threshold?: number
+  mahalanobis_resonant?: boolean
+  feature_vector_focus?: string
+  feature_vector_deviation?: number
+  entry_allowed?: boolean
+  entry_block_reason?: string
+  global?: RealBacktestDimension
+  sector_bin?: RealBacktestDimension
+  symbol?: RealBacktestDimension
 }
 
 export interface AccountSnapshot {
@@ -338,4 +379,105 @@ export interface CandidateSnapshotResponse {
   updated_at: string
   score_engine: string
   candidates: CandidateMarketItem[]
+}
+
+export interface RealBacktestMonitorPosition {
+  trader_id: string
+  trader_name: string
+  symbol: string
+  side: string
+  sector?: string
+  signal?: string
+  entry_price: number
+  mark_price: number
+  quantity: number
+  leverage: number
+  margin_used: number
+  unrealized_pnl: number
+  unrealized_pnl_pct: number
+  logic_score: number
+  bin_center: number
+  smoothing_half_width: number
+  entry_time: number
+  close_at: number
+  countdown_seconds: number
+  global_ev: number
+  sector_ev: number
+  symbol_ev: number
+  global_median_ev: number
+  sector_median_ev: number
+  symbol_median_ev: number
+  resonance_strength: number
+  mahalanobis_distance?: number
+  mahalanobis_threshold?: number
+  mahalanobis_resonant?: boolean
+  feature_vector_focus?: string
+  feature_vector_deviation?: number
+  entry_allowed?: boolean
+  entry_block_reason?: string
+  global_bin?: RealBacktestDimension
+  sector_bin?: RealBacktestDimension
+  symbol_bin?: RealBacktestDimension
+}
+
+export interface RealBacktestLogEntry {
+  trader_id: string
+  trader_name: string
+  symbol: string
+  side: string
+  action: string
+  signal?: string
+  price: number
+  quantity: number
+  logic_score: number
+  realized_pnl?: number
+  success: boolean
+  auto_closed: boolean
+  message?: string
+  timestamp: number
+  global_ev?: number
+  sector_ev?: number
+  symbol_ev?: number
+  final_entry_ev?: number
+  attribution_weights?: Record<string, number>
+  mahalanobis_distance?: number
+  mahalanobis_threshold?: number
+  mahalanobis_resonant?: boolean
+  feature_vector_focus?: string
+  feature_vector_deviation?: number
+  entry_allowed?: boolean
+  entry_block_reason?: string
+  execution_mode?: string
+}
+
+export interface RealFireAttributionDimension {
+  name: string
+  correlation: number
+  real_weight: number
+  shadow_weight: number
+  weight_delta: number
+  entry_average_ev: number
+  hold_average_ev: number
+  average_retention: number
+  closed_trade_count: number
+}
+
+export interface RealFireAttribution {
+  sample_count: number
+  dimensions: RealFireAttributionDimension[]
+  dominant_dimension?: string
+  shadow_dominant_dimension?: string
+}
+
+export interface RealBacktestMonitorResponse {
+  armed: boolean
+  mode: string
+  daemon_running: boolean
+  total_equity: number
+  position_count: number
+  log_count: number
+  positions: RealBacktestMonitorPosition[]
+  logs: RealBacktestLogEntry[]
+  attribution?: RealFireAttribution
+  updated_at: number
 }

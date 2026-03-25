@@ -450,10 +450,18 @@ func GetGridDecisions(ctx *GridContext, mcpClient mcp.AIClient, config *store.Gr
 	logger.Infof("🤖 [Grid] Calling AI for grid decisions...")
 
 	// Call AI
-	response, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
+	req, buildErr := mcp.NewRequestBuilder().
+		WithSystemPrompt(systemPrompt).
+		WithUserPrompt(userPrompt).
+		Build()
+	if buildErr != nil {
+		return nil, fmt.Errorf("failed to build AI request: %w", buildErr)
+	}
+	llmResponse, err := mcpClient.CallWithRequestFull(req)
 	if err != nil {
 		return nil, fmt.Errorf("AI call failed: %w", err)
 	}
+	response := llmResponse.Content
 
 	// Parse decisions from response
 	decisions, err := parseGridDecisions(response, ctx.Symbol)
@@ -480,6 +488,12 @@ func GetGridDecisions(ctx *GridContext, mcpClient mcp.AIClient, config *store.Gr
 		CoTTrace:            cotTrace,
 		Decisions:           decisions,
 		RawResponse:         response,
+		AIFinishReason:      llmResponse.FinishReason,
+		AIPromptTokens:      llmResponse.PromptTokens,
+		AICompletionTokens:  llmResponse.CompletionTokens,
+		AITotalTokens:       llmResponse.TotalTokens,
+		AIRawBodyTail:       llmResponse.RawBodyTail,
+		AIMaxTokens:         currentDecisionMaxTokens(mcpClient),
 		AIRequestDurationMs: duration,
 		Timestamp:           time.Now(),
 	}, nil

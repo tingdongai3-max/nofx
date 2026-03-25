@@ -2,14 +2,16 @@ package api
 
 import (
 	"net/http"
+	"nofx/store"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
 
 func (s *Server) handleShadowSnapshots(c *gin.Context) {
 	userID := c.GetString("user_id")
-	traderID := c.Query("trader_id")
+	traderID := strings.TrimSpace(c.Query("trader_id"))
 	limit := 200
 
 	if rawLimit := c.Query("limit"); rawLimit != "" {
@@ -34,23 +36,26 @@ func (s *Server) handleShadowSnapshots(c *gin.Context) {
 		return
 	}
 
-	if traderID == "" {
-		traderID = traders[0].ID
-	}
-
-	owned := false
-	for _, trader := range traders {
-		if trader.ID == traderID {
-			owned = true
-			break
+	if traderID != "" && !strings.EqualFold(traderID, store.GlobalConsensusTraderID) {
+		owned := false
+		for _, trader := range traders {
+			if trader.ID == traderID {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			SafeForbidden(c, "Trader access denied")
+			return
 		}
 	}
-	if !owned {
-		SafeForbidden(c, "Trader access denied")
-		return
-	}
 
-	rows, err := s.store.Shadow().ListByTrader(traderID, limit)
+	var rows []*store.ShadowSnapshot
+	if traderID == "" || strings.EqualFold(traderID, store.GlobalConsensusTraderID) {
+		rows, err = s.store.Shadow().ListShared(limit)
+	} else {
+		rows, err = s.store.Shadow().ListByTrader(traderID, limit)
+	}
 	if err != nil {
 		SafeInternalError(c, "Load shadow snapshots", err)
 		return

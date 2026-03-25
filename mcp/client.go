@@ -15,7 +15,8 @@ import (
 const (
 	ProviderCustom = "custom"
 
-	MCPClientTemperature = 0.5
+	MCPClientTemperature  = 0.5
+	responseBodyTailRunes = 1024
 )
 
 var (
@@ -278,6 +279,7 @@ func (client *Client) ParseMCPResponseFull(body []byte) (*LLMResponse, error) {
 				Content   string     `json:"content"`
 				ToolCalls []ToolCall `json:"tool_calls"`
 			} `json:"message"`
+			FinishReason *string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
 			PromptTokens     int `json:"prompt_tokens"`
@@ -294,21 +296,35 @@ func (client *Client) ParseMCPResponseFull(body []byte) (*LLMResponse, error) {
 		return nil, fmt.Errorf("API returned empty response")
 	}
 
+	totalTokens := result.Usage.TotalTokens
+	if totalTokens == 0 {
+		totalTokens = result.Usage.PromptTokens + result.Usage.CompletionTokens
+	}
+
 	// Report token usage if callback is set
-	if TokenUsageCallback != nil && result.Usage.TotalTokens > 0 {
+	if TokenUsageCallback != nil && totalTokens > 0 {
 		TokenUsageCallback(TokenUsage{
 			Provider:         client.Provider,
 			Model:            client.Model,
 			PromptTokens:     result.Usage.PromptTokens,
 			CompletionTokens: result.Usage.CompletionTokens,
-			TotalTokens:      result.Usage.TotalTokens,
+			TotalTokens:      totalTokens,
 		})
 	}
 
 	msg := result.Choices[0].Message
+	finishReason := ""
+	if result.Choices[0].FinishReason != nil {
+		finishReason = strings.TrimSpace(*result.Choices[0].FinishReason)
+	}
 	return &LLMResponse{
-		Content:   msg.Content,
-		ToolCalls: msg.ToolCalls,
+		Content:          msg.Content,
+		ToolCalls:        msg.ToolCalls,
+		FinishReason:     finishReason,
+		PromptTokens:     result.Usage.PromptTokens,
+		CompletionTokens: result.Usage.CompletionTokens,
+		TotalTokens:      totalTokens,
+		RawBodyTail:      tailRunes(string(body), responseBodyTailRunes),
 	}, nil
 }
 
@@ -381,12 +397,13 @@ func (client *Client) Call(systemPrompt, userPrompt string) (string, error) {
 	}
 
 	// Step 8: Parse response (via hooks for dynamic dispatch)
-	result, err := client.Hooks.ParseMCPResponse(body)
+	result, err := client.Hooks.ParseMCPResponseFull(body)
 	if err != nil {
 		return "", fmt.Errorf("fail to parse AI server response: %w", err)
 	}
+	client.logLLMResponseMeta(result)
 
-	return result, nil
+	return result.Content, nil
 }
 
 func (client *Client) String() string {
@@ -517,7 +534,12 @@ func (client *Client) callWithRequestFull(req *Request) (*LLMResponse, error) {
 		return nil, fmt.Errorf("API returned error (status %d): %s", resp.StatusCode, string(body))
 	}
 
-	return client.Hooks.ParseMCPResponseFull(body)
+	result, err := client.Hooks.ParseMCPResponseFull(body)
+	if err != nil {
+		return nil, err
+	}
+	client.logLLMResponseMeta(result)
+	return result, nil
 }
 
 // callWithRequest single AI API call (using Request object)
@@ -556,12 +578,45 @@ func (client *Client) callWithRequest(req *Request) (string, error) {
 		return "", fmt.Errorf("API returned error (status %d): %s", resp.StatusCode, string(body))
 	}
 
-	result, err := client.Hooks.ParseMCPResponse(body)
+	result, err := client.Hooks.ParseMCPResponseFull(body)
 	if err != nil {
 		return "", fmt.Errorf("fail to parse AI server response: %w", err)
 	}
+	client.logLLMResponseMeta(result)
 
-	return result, nil
+	return result.Content, nil
+}
+
+func (client *Client) logLLMResponseMeta(resp *LLMResponse) {
+	if resp == nil {
+		return
+	}
+	if resp.FinishReason == "" && resp.TotalTokens == 0 && strings.TrimSpace(resp.RawBodyTail) == "" {
+		return
+	}
+
+	client.Log.Infof(
+		"🧾 [MCP %s] Response meta: finish_reason=%q usage(prompt=%d completion=%d total=%d)",
+		client.String(),
+		resp.FinishReason,
+		resp.PromptTokens,
+		resp.CompletionTokens,
+		resp.TotalTokens,
+	)
+	if strings.TrimSpace(resp.RawBodyTail) != "" {
+		client.Log.Infof("🧾 [MCP %s] Raw body tail: %s", client.String(), resp.RawBodyTail)
+	}
+}
+
+func tailRunes(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s
+	}
+	return string(runes[len(runes)-limit:])
 }
 
 // BuildRequestBodyFromRequest builds request body from Request object

@@ -24,6 +24,12 @@ type DecisionRecordDB struct {
 	CoTTrace            string    `gorm:"column:cot_trace;default:''"`
 	DecisionJSON        string    `gorm:"column:decision_json;default:''"`
 	RawResponse         string    `gorm:"column:raw_response;default:''"`
+	AIFinishReason      string    `gorm:"column:ai_finish_reason;default:''"`
+	AIPromptTokens      int       `gorm:"column:ai_prompt_tokens;default:0"`
+	AICompletionTokens  int       `gorm:"column:ai_completion_tokens;default:0"`
+	AITotalTokens       int       `gorm:"column:ai_total_tokens;default:0"`
+	AIRawBodyTail       string    `gorm:"column:ai_raw_body_tail;default:''"`
+	AIMaxTokens         int       `gorm:"column:ai_max_tokens;default:0"`
 	PriceSnapshotAt     time.Time `gorm:"column:price_snapshot_at"`
 	PriceSnapshots      string    `gorm:"column:price_snapshots;default:'{}'"`
 	CandidateCoins      string    `gorm:"column:candidate_coins;default:''"`
@@ -48,6 +54,12 @@ type DecisionRecord struct {
 	CoTTrace            string             `json:"cot_trace"`
 	DecisionJSON        string             `json:"decision_json"`
 	RawResponse         string             `json:"raw_response"` // Raw AI response for debugging
+	AIFinishReason      string             `json:"ai_finish_reason,omitempty"`
+	AIPromptTokens      int                `json:"ai_prompt_tokens,omitempty"`
+	AICompletionTokens  int                `json:"ai_completion_tokens,omitempty"`
+	AITotalTokens       int                `json:"ai_total_tokens,omitempty"`
+	AIRawBodyTail       string             `json:"ai_raw_body_tail,omitempty"`
+	AIMaxTokens         int                `json:"ai_max_tokens,omitempty"`
 	PriceSnapshotAt     time.Time          `json:"price_snapshot_at"`
 	PriceSnapshots      map[string]float64 `json:"price_snapshots,omitempty"`
 	CandidateCoins      []string           `json:"candidate_coins"`
@@ -82,21 +94,68 @@ type PositionSnapshot struct {
 	LiquidationPrice float64 `json:"liquidation_price"`
 }
 
+type RealBacktestDimension struct {
+	BinStart                 int     `json:"bin_start"`
+	BinLabel                 string  `json:"bin_label,omitempty"`
+	TradeCount               int     `json:"trade_count"`
+	ExpectedValue            float64 `json:"expected_value"`
+	MedianExpectedValue      float64 `json:"median_expected_value"`
+	ProfitFactor             float64 `json:"profit_factor"`
+	ExpectedValueLong        float64 `json:"expected_value_long"`
+	ExpectedValueShort       float64 `json:"expected_value_short"`
+	MedianExpectedValueLong  float64 `json:"median_expected_value_long"`
+	MedianExpectedValueShort float64 `json:"median_expected_value_short"`
+	ProfitFactorLong         float64 `json:"profit_factor_long"`
+	ProfitFactorShort        float64 `json:"profit_factor_short"`
+	Smoothed                 bool    `json:"smoothed,omitempty"`
+	SmoothedBy               string  `json:"smoothed_by,omitempty"`
+}
+
+type RealBacktestDecisionMeta struct {
+	Signal                  string                 `json:"signal"`
+	LogicScore              float64                `json:"logic_score"`
+	Sector                  string                 `json:"sector,omitempty"`
+	PositionSizeUSD         float64                `json:"position_size_usd,omitempty"`
+	BinCenter               int                    `json:"bin_center"`
+	SmoothingHalfWidth      float64                `json:"smoothing_half_width,omitempty"`
+	HoldDurationSeconds     int                    `json:"hold_duration_seconds,omitempty"`
+	RawEntryEV              float64                `json:"raw_entry_ev,omitempty"`
+	FinalEntryEV            float64                `json:"final_entry_ev,omitempty"`
+	RiskDiscountFactor      float64                `json:"risk_discount_factor,omitempty"`
+	NeighborhoodLabel       string                 `json:"neighborhood_label,omitempty"`
+	NeighborhoodSampleCount int                    `json:"neighborhood_sample_count,omitempty"`
+	NeighborhoodRadius      float64                `json:"neighborhood_radius,omitempty"`
+	ShadowMonitorRequired   bool                   `json:"shadow_monitor_required,omitempty"`
+	AttributionWeights      map[string]float64     `json:"attribution_weights,omitempty"`
+	MahalanobisDistance     float64                `json:"mahalanobis_distance,omitempty"`
+	MahalanobisThreshold    float64                `json:"mahalanobis_threshold,omitempty"`
+	MahalanobisResonant     bool                   `json:"mahalanobis_resonant,omitempty"`
+	FeatureVectorFocus      string                 `json:"feature_vector_focus,omitempty"`
+	FeatureVectorDeviation  float64                `json:"feature_vector_deviation,omitempty"`
+	EntryAllowed            *bool                  `json:"entry_allowed,omitempty"`
+	EntryBlockReason        string                 `json:"entry_block_reason,omitempty"`
+	Global                  *RealBacktestDimension `json:"global,omitempty"`
+	SectorBin               *RealBacktestDimension `json:"sector_bin,omitempty"`
+	Symbol                  *RealBacktestDimension `json:"symbol,omitempty"`
+}
+
 // DecisionAction decision action
 type DecisionAction struct {
-	Action     string    `json:"action"`
-	Symbol     string    `json:"symbol"`
-	Quantity   float64   `json:"quantity"`
-	Leverage   int       `json:"leverage"`
-	Price      float64   `json:"price"`
-	StopLoss   float64   `json:"stop_loss,omitempty"`   // Stop loss price
-	TakeProfit float64   `json:"take_profit,omitempty"` // Take profit price
-	Confidence int       `json:"confidence,omitempty"`  // AI confidence (0-100)
-	Reasoning  string    `json:"reasoning,omitempty"`   // Brief reasoning
-	OrderID    int64     `json:"order_id"`
-	Timestamp  time.Time `json:"timestamp"`
-	Success    bool      `json:"success"`
-	Error      string    `json:"error"`
+	Action        string                    `json:"action"`
+	Symbol        string                    `json:"symbol"`
+	Quantity      float64                   `json:"quantity"`
+	Leverage      int                       `json:"leverage"`
+	Price         float64                   `json:"price"`
+	StopLoss      float64                   `json:"stop_loss,omitempty"`   // Stop loss price
+	TakeProfit    float64                   `json:"take_profit,omitempty"` // Take profit price
+	Confidence    int                       `json:"confidence,omitempty"`  // AI confidence (0-100)
+	Reasoning     string                    `json:"reasoning,omitempty"`   // Brief reasoning
+	OrderID       int64                     `json:"order_id"`
+	Timestamp     time.Time                 `json:"timestamp"`
+	Success       bool                      `json:"success"`
+	Error         string                    `json:"error"`
+	ExecutionMode string                    `json:"execution_mode,omitempty"`
+	RealBacktest  *RealBacktestDecisionMeta `json:"real_backtest,omitempty"`
 }
 
 // Statistics statistics information
@@ -120,10 +179,33 @@ func (s *DecisionStore) initTables() error {
 		var tableExists int64
 		s.db.Raw(`SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'decision_records'`).Scan(&tableExists)
 		if tableExists > 0 {
-			return nil
+			return s.ensureColumns()
 		}
 	}
-	return s.db.AutoMigrate(&DecisionRecordDB{})
+	if err := s.db.AutoMigrate(&DecisionRecordDB{}); err != nil {
+		return err
+	}
+	return s.ensureColumns()
+}
+
+func (s *DecisionStore) ensureColumns() error {
+	cols := []string{
+		"AIFinishReason",
+		"AIPromptTokens",
+		"AICompletionTokens",
+		"AITotalTokens",
+		"AIRawBodyTail",
+		"AIMaxTokens",
+	}
+	for _, col := range cols {
+		if s.db.Migrator().HasColumn(&DecisionRecordDB{}, col) {
+			continue
+		}
+		if err := s.db.Migrator().AddColumn(&DecisionRecordDB{}, col); err != nil {
+			return fmt.Errorf("failed to add decision_records column %s: %w", col, err)
+		}
+	}
+	return nil
 }
 
 // toRecord converts DB model to API struct
@@ -138,6 +220,12 @@ func (db *DecisionRecordDB) toRecord() *DecisionRecord {
 		CoTTrace:            db.CoTTrace,
 		DecisionJSON:        db.DecisionJSON,
 		RawResponse:         db.RawResponse,
+		AIFinishReason:      db.AIFinishReason,
+		AIPromptTokens:      db.AIPromptTokens,
+		AICompletionTokens:  db.AICompletionTokens,
+		AITotalTokens:       db.AITotalTokens,
+		AIRawBodyTail:       db.AIRawBodyTail,
+		AIMaxTokens:         db.AIMaxTokens,
 		PriceSnapshotAt:     db.PriceSnapshotAt,
 		Success:             db.Success,
 		ErrorMessage:        db.ErrorMessage,
@@ -179,6 +267,12 @@ func (s *DecisionStore) LogDecision(record *DecisionRecord) error {
 		CoTTrace:            record.CoTTrace,
 		DecisionJSON:        record.DecisionJSON,
 		RawResponse:         record.RawResponse,
+		AIFinishReason:      record.AIFinishReason,
+		AIPromptTokens:      record.AIPromptTokens,
+		AICompletionTokens:  record.AICompletionTokens,
+		AITotalTokens:       record.AITotalTokens,
+		AIRawBodyTail:       record.AIRawBodyTail,
+		AIMaxTokens:         record.AIMaxTokens,
 		PriceSnapshotAt:     record.PriceSnapshotAt,
 		PriceSnapshots:      string(priceSnapshotsJSON),
 		CandidateCoins:      string(candidateCoinsJSON),

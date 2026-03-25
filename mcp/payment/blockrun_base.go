@@ -19,12 +19,12 @@ import (
 )
 
 const (
-	DefaultBlockRunBaseURL = "https://blockrun.ai"
-	DefaultBlockRunModel   = "gpt-5.4"
-	BlockRunChatEndpoint   = "/api/v1/chat/completions"
-	BaseUSDCContract       = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-	BaseChainID      int64 = 8453
-	BaseNetwork            = "eip155:8453"
+	DefaultBlockRunBaseURL       = "https://blockrun.ai"
+	DefaultBlockRunModel         = "gpt-5.4"
+	BlockRunChatEndpoint         = "/api/v1/chat/completions"
+	BaseUSDCContract             = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+	BaseChainID            int64 = 8453
+	BaseNetwork                  = "eip155:8453"
 )
 
 // EIP-712 type hashes for USDC TransferWithAuthorization (ERC-3009)

@@ -9,6 +9,13 @@ import (
 	"strings"
 )
 
+func (t *OKXTrader) currentTdMode() string {
+	if t != nil && !t.isCrossMargin {
+		return "isolated"
+	}
+	return "cross"
+}
+
 // OpenLong opens long position
 func (t *OKXTrader) OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
 	// Cancel old orders
@@ -43,7 +50,7 @@ func (t *OKXTrader) OpenLong(symbol string, quantity float64, leverage int) (map
 
 	body := map[string]interface{}{
 		"instId":  instId,
-		"tdMode":  "cross",
+		"tdMode":  t.currentTdMode(),
 		"side":    "buy",
 		"posSide": "long",
 		"ordType": "market",
@@ -120,7 +127,7 @@ func (t *OKXTrader) OpenShort(symbol string, quantity float64, leverage int) (ma
 
 	body := map[string]interface{}{
 		"instId":  instId,
-		"tdMode":  "cross",
+		"tdMode":  t.currentTdMode(),
 		"side":    "sell",
 		"posSide": "short",
 		"ordType": "market",
@@ -817,7 +824,7 @@ func (t *OKXTrader) PlaceLimitOrder(req *types.LimitOrderRequest) (*types.LimitO
 
 	body := map[string]interface{}{
 		"instId":  instId,
-		"tdMode":  "cross",
+		"tdMode":  t.currentTdMode(),
 		"side":    side,
 		"posSide": posSide,
 		"ordType": "limit",

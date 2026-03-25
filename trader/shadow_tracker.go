@@ -7,35 +7,71 @@ import (
 	"nofx/logger"
 	"nofx/market"
 	"nofx/store"
+	"sort"
 	"strings"
 	"time"
 )
 
 const (
-	defaultShadowTargetWindow = 15 * time.Minute
-	defaultShadowPollInterval = 1 * time.Minute
-	defaultShadowFillBatch    = 200
+	defaultShadowTargetWindow          = 15 * time.Minute
+	defaultShadowExitObservationWindow = 60 * time.Minute
+	defaultShadowPollInterval          = 3 * time.Minute
+	defaultShadowIncubatorScanInterval = 1 * time.Hour
+	defaultShadowFillBatch             = 200
+	shadowIncubationSimilarityEpsilon  = 1.25
+	shadowIncubationPromotionMinCount  = 5
+	shadowIncubationPromotionMinReturn = 0.005
+	ShadowRoundTripFeeRate             = store.ShadowRoundTripFeeRate
 )
 
+type shadowIncubationSample struct {
+	row    *store.ShadowSnapshot
+	vector []float64
+}
+
 func (at *AutoTrader) startShadowTrackerDaemon() {
-	if at.store == nil {
+	if at == nil || at.store == nil {
 		return
 	}
 
+	at.shadowTrackerMu.Lock()
+	if at.shadowTrackerRunning {
+		at.shadowTrackerMu.Unlock()
+		return
+	}
+	at.shadowTrackerRunning = true
+	if at.stopMonitorCh == nil {
+		at.stopMonitorCh = make(chan struct{})
+	}
 	at.monitorWg.Add(1)
+	at.shadowTrackerMu.Unlock()
+
 	go func() {
 		defer at.monitorWg.Done()
+		defer func() {
+			at.shadowTrackerMu.Lock()
+			at.shadowTrackerRunning = false
+			at.shadowTrackerMu.Unlock()
+		}()
 
 		ticker := time.NewTicker(at.getShadowPollInterval())
 		defer ticker.Stop()
+		lastIncubatorSweep := time.Time{}
 
 		logger.Infof("🕶 Started shadow tracker daemon (window=%s, poll=%s)", at.getShadowTargetWindow(), at.getShadowPollInterval())
 
 		for {
 			select {
 			case <-ticker.C:
-				if err := at.processShadowFillCycle(time.Now().UTC()); err != nil {
+				now := time.Now().UTC()
+				if err := at.processShadowFillCycle(now); err != nil {
 					logger.Warnf("⚠️ Shadow tracker cycle failed: %v", err)
+				}
+				if lastIncubatorSweep.IsZero() || now.Sub(lastIncubatorSweep) >= defaultShadowIncubatorScanInterval {
+					if err := at.processShadowIncubatorCycle(now); err != nil {
+						logger.Warnf("⚠️ Shadow incubator cycle failed: %v", err)
+					}
+					lastIncubatorSweep = now
 				}
 			case <-at.stopMonitorCh:
 				logger.Info("⏹ Stopped shadow tracker daemon")
@@ -46,10 +82,25 @@ func (at *AutoTrader) startShadowTrackerDaemon() {
 }
 
 func (at *AutoTrader) persistShadowSnapshots(decisionTime time.Time, ctx *kernel.Context) error {
+	return at.persistShadowSnapshotsWithMode(decisionTime, ctx, false)
+}
+
+func (at *AutoTrader) persistShadowSnapshotsForRealBacktest(decisionTime time.Time, ctx *kernel.Context) error {
+	return at.persistShadowSnapshotsWithMode(decisionTime, ctx, true)
+}
+
+func (at *AutoTrader) persistShadowSnapshotsWithMode(decisionTime time.Time, ctx *kernel.Context, realBacktestMode bool) error {
 	if at.store == nil || ctx == nil {
 		return nil
 	}
 	if len(ctx.CandidateCoins) == 0 {
+		return nil
+	}
+	enabled, err := at.isRealBacktestEnabled()
+	if err != nil {
+		return err
+	}
+	if realBacktestMode != enabled {
 		return nil
 	}
 
@@ -63,7 +114,7 @@ func (at *AutoTrader) persistShadowSnapshots(decisionTime time.Time, ctx *kernel
 		}
 
 		heatSlice := extractShadowHeatScores(data.HeatScore)
-		rawFactors := extractShadowRawFactors(data.HeatScore)
+		rawFactors := extractShadowRawFactors(data)
 		socialRankRaw, socialUpvoteRaw := market.SocialSubfactorRawValues(data.GeckoSentiment)
 		row := &store.ShadowSnapshot{
 			TraderID:           at.id,
@@ -116,7 +167,29 @@ func (at *AutoTrader) persistShadowSnapshots(decisionTime time.Time, ctx *kernel
 }
 
 func (at *AutoTrader) markShadowActions(decisionTime time.Time, decisions []kernel.Decision) error {
+	return at.markShadowActionsWithMode(decisionTime, decisions, false)
+}
+
+func (at *AutoTrader) markShadowActionsForRealBacktest(decisionTime time.Time, symbols []string) error {
+	decisions := make([]kernel.Decision, 0, len(symbols))
+	for _, symbol := range symbols {
+		decisions = append(decisions, kernel.Decision{
+			Symbol: symbol,
+			Action: "open_long",
+		})
+	}
+	return at.markShadowActionsWithMode(decisionTime, decisions, true)
+}
+
+func (at *AutoTrader) markShadowActionsWithMode(decisionTime time.Time, decisions []kernel.Decision, realBacktestMode bool) error {
 	if at.store == nil || len(decisions) == 0 {
+		return nil
+	}
+	enabled, err := at.isRealBacktestEnabled()
+	if err != nil {
+		return err
+	}
+	if realBacktestMode != enabled {
 		return nil
 	}
 
@@ -141,13 +214,93 @@ func (at *AutoTrader) markShadowActions(decisionTime time.Time, decisions []kern
 }
 
 func (at *AutoTrader) processShadowFillCycle(now time.Time) error {
+	return at.processShadowFillCycleWithMode(now, false)
+}
+
+func (at *AutoTrader) processShadowFillCycleForRealBacktest(now time.Time) error {
+	return at.processShadowFillCycleWithMode(now, true)
+}
+
+func (at *AutoTrader) processShadowFillCycleWithMode(now time.Time, realBacktestMode bool) error {
 	if at.store == nil {
 		return nil
 	}
+	enabled, err := at.isRealBacktestEnabled()
+	if err != nil {
+		return err
+	}
+	if realBacktestMode != enabled {
+		return nil
+	}
+	return processShadowFillCycleWithStore(at.store, now, at.getShadowTargetWindow(), at.fetchShadowPriceAt)
+}
 
-	window := at.getShadowTargetWindow()
+func (at *AutoTrader) getRecentTrajectoryPositions(traderIDs []string, cutoffEntryTime int64) ([]*store.TraderPosition, error) {
+	if at == nil || at.store == nil || len(traderIDs) == 0 {
+		return nil, nil
+	}
+
+	positionsByID := make(map[int64]*store.TraderPosition)
+	for _, traderID := range traderIDs {
+		traderID = strings.TrimSpace(traderID)
+		if traderID == "" {
+			continue
+		}
+		rows, err := at.store.Position().GetRecentTrajectoryPositions(traderID, cutoffEntryTime)
+		if err != nil {
+			return nil, err
+		}
+		for _, pos := range rows {
+			if pos == nil || pos.ID <= 0 {
+				continue
+			}
+			positionsByID[pos.ID] = pos
+		}
+	}
+
+	positions := make([]*store.TraderPosition, 0, len(positionsByID))
+	for _, pos := range positionsByID {
+		positions = append(positions, pos)
+	}
+	sort.SliceStable(positions, func(i, j int) bool {
+		if positions[i].EntryTime == positions[j].EntryTime {
+			return positions[i].ID > positions[j].ID
+		}
+		return positions[i].EntryTime > positions[j].EntryTime
+	})
+	return positions, nil
+}
+
+func shadowNetReturnPct(side string, entryPrice, exitPrice float64) float64 {
+	if entryPrice <= 0 || exitPrice <= 0 {
+		return 0
+	}
+
+	gross := (exitPrice - entryPrice) / entryPrice
+	if strings.ToUpper(strings.TrimSpace(side)) == "SHORT" {
+		gross = (entryPrice - exitPrice) / entryPrice
+	}
+	return gross - ShadowRoundTripFeeRate
+}
+
+func processShadowFillCycleWithStore(
+	st *store.Store,
+	now time.Time,
+	window time.Duration,
+	fetchPrice func(symbol string, target time.Time) (float64, error),
+) error {
+	if st == nil {
+		return nil
+	}
+	if window <= 0 {
+		window = defaultShadowTargetWindow
+	}
+	if fetchPrice == nil {
+		fetchPrice = lookupShadowClosePrice
+	}
+
 	cutoff := now.UTC().Add(-window).UnixMilli()
-	pending, err := at.store.Shadow().GetPendingFill(cutoff, defaultShadowFillBatch)
+	pending, err := st.Shadow().GetPendingFill(cutoff, defaultShadowFillBatch)
 	if err != nil {
 		return err
 	}
@@ -155,31 +308,43 @@ func (at *AutoTrader) processShadowFillCycle(now time.Time) error {
 		return nil
 	}
 
+	filledCount := 0
 	for _, snapshot := range pending {
 		targetTime := time.UnixMilli(snapshot.DecisionTime).UTC().Add(window)
-		priceT1, err := at.fetchShadowPriceAt(snapshot.Symbol, targetTime)
+		priceT1, err := fetchPrice(snapshot.Symbol, targetTime)
 		if err != nil {
 			logger.Warnf("⚠️ Shadow fill lookup failed: symbol=%s decision_time=%d target=%s err=%v",
 				snapshot.Symbol, snapshot.DecisionTime, targetTime.Format(time.RFC3339), err)
 			continue
 		}
 
-		returnPct := 0.0
+		grossReturnPct := 0.0
 		if snapshot.PriceT0 > 0 {
-			returnPct = (priceT1 - snapshot.PriceT0) / snapshot.PriceT0
+			grossReturnPct = (priceT1 - snapshot.PriceT0) / snapshot.PriceT0
+		}
+		returnPct := grossReturnPct
+		if snapshot.PriceT0 > 0 {
+			returnPct = grossReturnPct - ShadowRoundTripFeeRate
 		}
 
 		filledAt := now.UTC().UnixMilli()
-		if err := at.store.Shadow().MarkFilled(snapshot.ID, priceT1, returnPct, filledAt); err != nil {
+		if err := st.Shadow().MarkFilled(snapshot.ID, priceT1, returnPct, filledAt); err != nil {
 			logger.Warnf("⚠️ Failed to persist shadow fill: id=%d symbol=%s err=%v", snapshot.ID, snapshot.Symbol, err)
 			continue
 		}
 		market.InvalidateAdaptiveWeightScope(snapshot.TraderID)
+		filledCount++
 
-		logger.Debugf("V3_AUDIT_SHADOW_FILL: Symbol=%s, T0_Price=%.4f, T1_Price=%.4f, Return=%+.1f%%",
-			snapshot.Symbol, snapshot.PriceT0, priceT1, returnPct*100)
-		logger.Infof("V3_AUDIT_SHADOW_FILL: Symbol=%s, T0_Price=%.4f, T1_Price=%.4f, Return=%+.1f%%",
-			snapshot.Symbol, snapshot.PriceT0, priceT1, returnPct*100)
+		logger.Debugf("V3_AUDIT_SHADOW_FILL: Symbol=%s, T0_Price=%.4f, T1_Price=%.4f, GrossReturn=%+.1f%%, NetReturn=%+.1f%%",
+			snapshot.Symbol, snapshot.PriceT0, priceT1, grossReturnPct*100, returnPct*100)
+		logger.Infof("V3_AUDIT_SHADOW_FILL: Symbol=%s, T0_Price=%.4f, T1_Price=%.4f, GrossReturn=%+.1f%%, NetReturn=%+.1f%%",
+			snapshot.Symbol, snapshot.PriceT0, priceT1, grossReturnPct*100, returnPct*100)
+	}
+
+	if filledCount > 0 {
+		if err := store.RefreshCache(); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -249,19 +414,33 @@ func extractShadowHeatScores(heat *market.HeatScoreData) shadowHeatSlice {
 	}
 }
 
-func extractShadowRawFactors(heat *market.HeatScoreData) store.ShadowRawFactors {
-	if heat == nil {
-		return store.ShadowRawFactors{}
+func extractShadowRawFactors(data *market.Data) store.ShadowRawFactors {
+	scores := make(map[string]float64)
+	available := make(map[string]bool)
+
+	if data != nil && data.HeatScore != nil {
+		scores = make(map[string]float64, len(data.HeatScore.RawFactorScores)+3)
+		for key, value := range data.HeatScore.RawFactorScores {
+			scores[key] = sanitizeShadowRawFactor(value)
+		}
+
+		available = make(map[string]bool, len(data.HeatScore.RawFactorAvailable)+3)
+		for key, value := range data.HeatScore.RawFactorAvailable {
+			available[key] = value
+		}
 	}
 
-	scores := make(map[string]float64, len(heat.RawFactorScores))
-	for key, value := range heat.RawFactorScores {
-		scores[key] = sanitizeShadowRawFactor(value)
+	if data != nil && !math.IsNaN(data.VolatilityUtilization) && !math.IsInf(data.VolatilityUtilization, 0) && data.VolatilityUtilization > 0 {
+		scores["vol_utilization"] = sanitizeShadowRawFactor(data.VolatilityUtilization * 100)
+		available["vol_utilization"] = true
 	}
-
-	available := make(map[string]bool, len(heat.RawFactorAvailable))
-	for key, value := range heat.RawFactorAvailable {
-		available[key] = value
+	if data != nil && !math.IsNaN(data.FundingRate) && !math.IsInf(data.FundingRate, 0) && data.FundingRate != 0 {
+		scores["funding_rate"] = sanitizeShadowRawFactor(data.FundingRate * 10000)
+		available["funding_rate"] = true
+	}
+	if data != nil && data.Orderbook != nil && !math.IsNaN(data.Orderbook.Imbalance) && !math.IsInf(data.Orderbook.Imbalance, 0) {
+		scores["orderbook_imbalance"] = sanitizeShadowRawFactor(data.Orderbook.Imbalance * 100)
+		available["orderbook_imbalance"] = true
 	}
 
 	return store.ShadowRawFactors{
@@ -277,6 +456,169 @@ func sanitizeShadowRawFactor(v float64) float64 {
 	default:
 		return v
 	}
+}
+
+func (at *AutoTrader) preserveOutlierForIncubation(symbol string, distance, threshold float64) error {
+	if at == nil || at.store == nil {
+		return nil
+	}
+
+	normalizedSymbol := market.Normalize(symbol)
+	if normalizedSymbol == "" {
+		return nil
+	}
+	nowMs := time.Now().UTC().UnixMilli()
+	if err := at.store.Shadow().MarkLatestIncubating(at.id, normalizedSymbol, "OUTLIER", distance, threshold, nowMs); err != nil {
+		return err
+	}
+	logger.Infof("🧬 Outlier preserved for incubation: trader=%s symbol=%s distance=%.2f threshold=%.2f", at.id, normalizedSymbol, distance, threshold)
+	return nil
+}
+
+func (at *AutoTrader) processShadowIncubatorCycle(now time.Time) error {
+	if at == nil || at.store == nil {
+		return nil
+	}
+
+	rows, err := at.store.Shadow().ListIncubatingFilledForPromotion(at.id, 2000)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	samples := make([]shadowIncubationSample, 0, len(rows))
+	for _, row := range rows {
+		vector, ok := kernel.BuildResonanceFeatureVectorFromSnapshot(row)
+		if !ok {
+			continue
+		}
+		samples = append(samples, shadowIncubationSample{
+			row:    row,
+			vector: vector,
+		})
+	}
+	if len(samples) < shadowIncubationPromotionMinCount {
+		return nil
+	}
+
+	sort.SliceStable(samples, func(i, j int) bool {
+		if samples[i].row == nil || samples[j].row == nil {
+			return false
+		}
+		if samples[i].row.DecisionTime != samples[j].row.DecisionTime {
+			return samples[i].row.DecisionTime > samples[j].row.DecisionTime
+		}
+		return samples[i].row.ID > samples[j].row.ID
+	})
+
+	used := make(map[uint]struct{}, len(samples))
+	promotionIndex := 0
+	for i := range samples {
+		if samples[i].row == nil {
+			continue
+		}
+		if _, exists := used[samples[i].row.ID]; exists {
+			continue
+		}
+
+		memberIndexes := []int{i}
+		centroid := append([]float64(nil), samples[i].vector...)
+		for j := i + 1; j < len(samples); j++ {
+			if samples[j].row == nil {
+				continue
+			}
+			if _, exists := used[samples[j].row.ID]; exists {
+				continue
+			}
+			distance, ok := shadowIncubationDistance(samples[j].vector, centroid)
+			if !ok || distance >= shadowIncubationSimilarityEpsilon {
+				continue
+			}
+			memberIndexes = append(memberIndexes, j)
+			centroid = shadowIncubationCentroid(samples, memberIndexes)
+		}
+
+		if len(memberIndexes) < shadowIncubationPromotionMinCount {
+			continue
+		}
+
+		totalReturn := 0.0
+		ids := make([]uint, 0, len(memberIndexes))
+		for _, memberIndex := range memberIndexes {
+			member := samples[memberIndex]
+			if member.row == nil {
+				continue
+			}
+			totalReturn += member.row.ReturnPct
+			ids = append(ids, member.row.ID)
+		}
+		if len(ids) < shadowIncubationPromotionMinCount {
+			continue
+		}
+
+		avgReturn := totalReturn / float64(len(ids))
+		if avgReturn <= shadowIncubationPromotionMinReturn {
+			continue
+		}
+
+		promotionIndex++
+		archetypeLabel := fmt.Sprintf("Type_N_%s_%02d", now.UTC().Format("2006010215"), promotionIndex)
+		if err := at.store.Shadow().PromoteIncubationCohort(archetypeLabel, ids, now.UTC().UnixMilli()); err != nil {
+			return err
+		}
+		for _, id := range ids {
+			used[id] = struct{}{}
+		}
+		logger.Infof(
+			"🧬 Shadow incubator auto-promoted: trader=%s archetype=%s samples=%d avg_return=%.2f%% epsilon=%.2f",
+			at.id,
+			archetypeLabel,
+			len(ids),
+			avgReturn*100,
+			shadowIncubationSimilarityEpsilon,
+		)
+	}
+
+	return nil
+}
+
+func shadowIncubationCentroid(samples []shadowIncubationSample, indexes []int) []float64 {
+	if len(indexes) == 0 {
+		return nil
+	}
+	dim := len(samples[indexes[0]].vector)
+	centroid := make([]float64, dim)
+	for _, index := range indexes {
+		vector := samples[index].vector
+		for dimIndex, value := range vector {
+			centroid[dimIndex] += value
+		}
+	}
+	for dimIndex := range centroid {
+		centroid[dimIndex] /= float64(len(indexes))
+	}
+	return centroid
+}
+
+func shadowIncubationDistance(a, b []float64) (float64, bool) {
+	if len(a) == 0 || len(a) != len(b) {
+		return 0, false
+	}
+
+	sum := 0.0
+	for i := range a {
+		if math.IsNaN(a[i]) || math.IsInf(a[i], 0) || math.IsNaN(b[i]) || math.IsInf(b[i], 0) {
+			return 0, false
+		}
+		diff := a[i] - b[i]
+		sum += diff * diff
+	}
+	if sum < 0 {
+		sum = 0
+	}
+	return math.Sqrt(sum), true
 }
 
 func lookupShadowClosePrice(symbol string, target time.Time) (float64, error) {

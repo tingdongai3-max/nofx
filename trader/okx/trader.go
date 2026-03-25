@@ -121,6 +121,7 @@ func NewOKXTrader(apiKey, secretKey, passphrase string) *OKXTrader {
 		apiKey:           apiKey,
 		secretKey:        secretKey,
 		passphrase:       passphrase,
+		isCrossMargin:    true,
 		httpClient:       httpClient,
 		cacheDuration:    15 * time.Second,
 		instrumentsCache: make(map[string]*OKXInstrument),

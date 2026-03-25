@@ -9,6 +9,13 @@ import (
 	"strings"
 )
 
+func (t *BitgetTrader) currentMarginMode() string {
+	if t != nil && !t.isCrossMargin {
+		return "isolated"
+	}
+	return "crossed"
+}
+
 // OpenLong opens long position
 func (t *BitgetTrader) OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
 	symbol = t.convertSymbol(symbol)
@@ -27,7 +34,7 @@ func (t *BitgetTrader) OpenLong(symbol string, quantity float64, leverage int) (
 	body := map[string]interface{}{
 		"symbol":      symbol,
 		"productType": "USDT-FUTURES",
-		"marginMode":  "crossed",
+		"marginMode":  t.currentMarginMode(),
 		"marginCoin":  "USDT",
 		"side":        "buy",
 		"orderType":   "market",
@@ -81,7 +88,7 @@ func (t *BitgetTrader) OpenShort(symbol string, quantity float64, leverage int) 
 	body := map[string]interface{}{
 		"symbol":      symbol,
 		"productType": "USDT-FUTURES",
-		"marginMode":  "crossed",
+		"marginMode":  t.currentMarginMode(),
 		"marginCoin":  "USDT",
 		"side":        "sell",
 		"orderType":   "market",
@@ -144,7 +151,7 @@ func (t *BitgetTrader) CloseLong(symbol string, quantity float64) (map[string]in
 	body := map[string]interface{}{
 		"symbol":      symbol,
 		"productType": "USDT-FUTURES",
-		"marginMode":  "crossed",
+		"marginMode":  t.currentMarginMode(),
 		"marginCoin":  "USDT",
 		"side":        "sell",
 		"orderType":   "market",
@@ -212,7 +219,7 @@ func (t *BitgetTrader) CloseShort(symbol string, quantity float64) (map[string]i
 	body := map[string]interface{}{
 		"symbol":      symbol,
 		"productType": "USDT-FUTURES",
-		"marginMode":  "crossed",
+		"marginMode":  t.currentMarginMode(),
 		"marginCoin":  "USDT",
 		"side":        "buy",
 		"orderType":   "market",
@@ -266,7 +273,7 @@ func (t *BitgetTrader) SetStopLoss(symbol string, positionSide string, quantity,
 		"planType":     "loss_plan",
 		"symbol":       symbol,
 		"productType":  "USDT-FUTURES",
-		"marginMode":   "crossed",
+		"marginMode":   t.currentMarginMode(),
 		"marginCoin":   "USDT",
 		"triggerPrice": fmt.Sprintf("%.8f", stopPrice),
 		"triggerType":  "mark_price",
@@ -305,7 +312,7 @@ func (t *BitgetTrader) SetTakeProfit(symbol string, positionSide string, quantit
 		"planType":     "profit_plan",
 		"symbol":       symbol,
 		"productType":  "USDT-FUTURES",
-		"marginMode":   "crossed",
+		"marginMode":   t.currentMarginMode(),
 		"marginCoin":   "USDT",
 		"triggerPrice": fmt.Sprintf("%.8f", takeProfitPrice),
 		"triggerType":  "mark_price",
@@ -442,15 +449,15 @@ func (t *BitgetTrader) GetOrderStatus(symbol string, orderID string) (map[string
 	}
 
 	var order struct {
-		OrderId      string `json:"orderId"`
-		State        string `json:"state"`        // filled, canceled, partially_filled, new
-		PriceAvg     string `json:"priceAvg"`     // Average fill price
-		BaseVolume   string `json:"baseVolume"`   // Filled quantity
-		Fee          string `json:"fee"`          // Fee
-		Side         string `json:"side"`
-		OrderType    string `json:"orderType"`
-		CTime        string `json:"cTime"`
-		UTime        string `json:"uTime"`
+		OrderId    string `json:"orderId"`
+		State      string `json:"state"`      // filled, canceled, partially_filled, new
+		PriceAvg   string `json:"priceAvg"`   // Average fill price
+		BaseVolume string `json:"baseVolume"` // Filled quantity
+		Fee        string `json:"fee"`        // Fee
+		Side       string `json:"side"`
+		OrderType  string `json:"orderType"`
+		CTime      string `json:"cTime"`
+		UTime      string `json:"uTime"`
 	}
 
 	if err := json.Unmarshal(data, &order); err != nil {
@@ -508,15 +515,15 @@ func (t *BitgetTrader) GetOpenOrders(symbol string) ([]types.OpenOrder, error) {
 	if err == nil && data != nil {
 		var orders struct {
 			EntrustedList []struct {
-				OrderId      string `json:"orderId"`
-				Symbol       string `json:"symbol"`
-				Side         string `json:"side"`         // buy/sell
-				TradeSide    string `json:"tradeSide"`    // open/close
-				PosSide      string `json:"posSide"`      // long/short
-				OrderType    string `json:"orderType"`    // limit/market
-				Price        string `json:"price"`
-				Size         string `json:"size"`
-				State        string `json:"state"`
+				OrderId   string `json:"orderId"`
+				Symbol    string `json:"symbol"`
+				Side      string `json:"side"`      // buy/sell
+				TradeSide string `json:"tradeSide"` // open/close
+				PosSide   string `json:"posSide"`   // long/short
+				OrderType string `json:"orderType"` // limit/market
+				Price     string `json:"price"`
+				Size      string `json:"size"`
+				State     string `json:"state"`
 			} `json:"entrustedList"`
 		}
 		if err := json.Unmarshal(data, &orders); err == nil {
@@ -644,7 +651,7 @@ func (t *BitgetTrader) PlaceLimitOrder(req *types.LimitOrderRequest) (*types.Lim
 	body := map[string]interface{}{
 		"symbol":      symbol,
 		"productType": "USDT-FUTURES",
-		"marginMode":  "crossed",
+		"marginMode":  t.currentMarginMode(),
 		"marginCoin":  "USDT",
 		"side":        side,
 		"orderType":   "limit",

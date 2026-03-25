@@ -181,6 +181,14 @@ type PriceTicker struct {
 	Price  string `json:"price"`
 }
 
+type BookTicker struct {
+	Symbol   string  `json:"symbol"`
+	BidPrice float64 `json:"bidPrice"`
+	BidQty   float64 `json:"bidQty"`
+	AskPrice float64 `json:"askPrice"`
+	AskQty   float64 `json:"askQty"`
+}
+
 type Ticker24hr struct {
 	Symbol             string `json:"symbol"`
 	PriceChange        string `json:"priceChange"`

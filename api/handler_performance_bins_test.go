@@ -113,7 +113,119 @@ func TestLoadPerformanceBinsBackcastFallbacksToGlobalRawFactors(t *testing.T) {
 	}
 }
 
-func TestHandlePerformanceBinsBackcastHTTPUsesTraderSpecificWeightSignatureOnGlobalFallback(t *testing.T) {
+func TestLoadPerformanceBinsBackcastResonanceFilterToggle(t *testing.T) {
+	dbPath := filepath.Join("/tmp", "nofx_api_performance_bins_backcast_filter_toggle_test.db")
+	_ = os.Remove(dbPath)
+	t.Cleanup(func() { _ = os.Remove(dbPath) })
+
+	st, err := store.New(dbPath)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+
+	market.SetAdaptiveWeightStore(st)
+	defer market.SetAdaptiveWeightStore(nil)
+	market.InvalidateAdaptiveWeightScope("")
+
+	baseTime := time.Now().UTC().Add(-3 * time.Hour).UnixMilli()
+	makeRawFactors := func(progress float64) string {
+		return store.ShadowRawFactors{
+			Scores: map[string]float64{
+				"market":            20 + progress*60,
+				"trend":             80 - progress*60,
+				"volume_spike":      45,
+				"quant_oi":          45,
+				"quant_imbalance":   45,
+				"quant_netflow":     45,
+				"social_rank":       45,
+				"social_upvote":     45,
+				"onchain_ratio":     45,
+				"onchain_buy_ratio": 45,
+			},
+			Available: map[string]bool{
+				"market":            true,
+				"trend":             true,
+				"volume_spike":      true,
+				"quant_oi":          true,
+				"quant_imbalance":   true,
+				"quant_netflow":     true,
+				"social_rank":       true,
+				"social_upvote":     true,
+				"onchain_ratio":     true,
+				"onchain_buy_ratio": true,
+			},
+		}.MarshalText()
+	}
+
+	rows := make([]*store.ShadowSnapshot, 0, 21)
+	for i := 0; i < 20; i++ {
+		progress := float64(i) / 19.0
+		returnPct := 0.02 + progress*0.06
+		rows = append(rows, &store.ShadowSnapshot{
+			TraderID:          "resonance-trader",
+			DecisionTime:      baseTime + int64(i)*60000,
+			Symbol:            "RESUSDT",
+			Sector:            "AI",
+			HeatScore:         50 + progress*20,
+			PriceT0:           100,
+			PriceT1:           100 * (1 + returnPct),
+			ReturnPct:         returnPct,
+			Filled:            true,
+			FilledAt:          baseTime + int64(i)*60000 + 900000,
+			CreatedAt:         baseTime + int64(i)*60000,
+			UpdatedAt:         baseTime + int64(i)*60000 + 900000,
+			RawFactors:        makeRawFactors(progress),
+			VolUtilization:    0.12,
+			FundingRate:       0.0004,
+			QuantImbalanceRaw: 0.09,
+		})
+	}
+	outlierProgress := 0.5
+	outlierReturnPct := 0.02 + outlierProgress*0.06
+	rows = append(rows, &store.ShadowSnapshot{
+		TraderID:          "resonance-trader",
+		DecisionTime:      baseTime + 20*60000,
+		Symbol:            "RESUSDT",
+		Sector:            "AI",
+		HeatScore:         50 + outlierProgress*20,
+		PriceT0:           100,
+		PriceT1:           100 * (1 + outlierReturnPct),
+		ReturnPct:         outlierReturnPct,
+		Filled:            true,
+		FilledAt:          baseTime + 20*60000 + 900000,
+		CreatedAt:         baseTime + 20*60000,
+		UpdatedAt:         baseTime + 20*60000 + 900000,
+		RawFactors:        makeRawFactors(outlierProgress),
+		VolUtilization:    2.5,
+		FundingRate:       0.012,
+		QuantImbalanceRaw: 0.92,
+	})
+
+	if err := st.Shadow().CreateBatch(rows); err != nil {
+		t.Fatalf("create resonance filter rows: %v", err)
+	}
+
+	srv := &Server{store: st}
+	filteredRows, err := srv.loadPerformanceBins("resonance-trader", "global", "", "", store.PERFORMANCE_WINDOW_SIZE_DEFAULT, true, true)
+	if err != nil {
+		t.Fatalf("load filtered backcast bins: %v", err)
+	}
+	rawRows, err := srv.loadPerformanceBins("resonance-trader", "global", "", "", store.PERFORMANCE_WINDOW_SIZE_DEFAULT, true, false)
+	if err != nil {
+		t.Fatalf("load raw backcast bins: %v", err)
+	}
+
+	filteredTradeCount := sumPerformanceTradeCount(filteredRows)
+	rawTradeCount := sumPerformanceTradeCount(rawRows)
+	if filteredTradeCount >= rawTradeCount {
+		t.Fatalf("expected resonance filter to remove at least one sample, filtered=%d raw=%d", filteredTradeCount, rawTradeCount)
+	}
+	if rawTradeCount-filteredTradeCount != 1 {
+		t.Fatalf("expected exactly one anomalous sample to be removed, filtered=%d raw=%d", filteredTradeCount, rawTradeCount)
+	}
+}
+
+func TestHandlePerformanceBinsBackcastHTTPSharesGlobalWeightSignature(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	dbPath := filepath.Join("/tmp", "nofx_api_performance_bins_backcast_http_signature_test.db")
@@ -162,8 +274,8 @@ func TestHandlePerformanceBinsBackcastHTTPUsesTraderSpecificWeightSignatureOnGlo
 	if !hasPerformanceBins(rowsB) {
 		t.Fatalf("expected non-empty HTTP backcast rows for trader B, got %+v", rowsB)
 	}
-	if reflect.DeepEqual(rowsA, rowsB) {
-		t.Fatalf("expected different HTTP backcast payloads for distinct trader weight signatures, got A=%+v B=%+v", rowsA, rowsB)
+	if !reflect.DeepEqual(rowsA, rowsB) {
+		t.Fatalf("expected identical HTTP backcast payloads from shared global weights, got A=%+v B=%+v", rowsA, rowsB)
 	}
 }
 
@@ -300,4 +412,15 @@ func seedHTTPGlobalBackcastRawRows(t *testing.T, st *store.Store) {
 	if err := st.Shadow().CreateBatch(rows); err != nil {
 		t.Fatalf("create HTTP pooled raw-factor rows: %v", err)
 	}
+}
+
+func sumPerformanceTradeCount(rows []*store.ScoreBinPerformance) int {
+	total := 0
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		total += row.TradeCount
+	}
+	return total
 }

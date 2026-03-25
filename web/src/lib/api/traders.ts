@@ -3,6 +3,7 @@ import type {
   TraderConfigData,
   CreateTraderRequest,
   CandidateSnapshotResponse,
+  RealBacktestMonitorResponse,
 } from '../../types'
 import { API_BASE, httpClient } from './helpers'
 
@@ -98,6 +99,14 @@ export const traderApi = {
       `${API_BASE}/trader/candidates?trader_id=${encodeURIComponent(traderId)}`
     )
     if (!result.success) throw new Error('Failed to fetch trader candidates')
+    return result.data!
+  },
+
+  async getRealBacktestMonitor(): Promise<RealBacktestMonitorResponse> {
+    const result = await httpClient.get<RealBacktestMonitorResponse>(
+      `${API_BASE}/real-backtest/positions`
+    )
+    if (!result.success) throw new Error('Failed to fetch real backtest monitor')
     return result.data!
   },
 }

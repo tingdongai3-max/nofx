@@ -11,7 +11,7 @@ import (
 
 func (s *Server) handleAdaptiveWeights(c *gin.Context) {
 	userID := c.GetString("user_id")
-	traderID := c.Query("trader_id")
+	requestedTraderID := strings.TrimSpace(c.Query("trader_id"))
 	scope := strings.ToLower(strings.TrimSpace(c.Query("scope")))
 	target := strings.TrimSpace(c.Query("target"))
 	symbol := c.Query("symbol")
@@ -27,20 +27,18 @@ func (s *Server) handleAdaptiveWeights(c *gin.Context) {
 		return
 	}
 
-	if traderID == "" {
-		traderID = traders[0].ID
-	}
-
-	owned := false
-	for _, trader := range traders {
-		if trader.ID == traderID {
-			owned = true
-			break
+	if requestedTraderID != "" {
+		owned := false
+		for _, trader := range traders {
+			if trader.ID == requestedTraderID {
+				owned = true
+				break
+			}
 		}
-	}
-	if !owned {
-		SafeForbidden(c, "Trader access denied")
-		return
+		if !owned {
+			SafeForbidden(c, "Trader access denied")
+			return
+		}
 	}
 
 	if scope != "" {
@@ -50,7 +48,7 @@ func (s *Server) handleAdaptiveWeights(c *gin.Context) {
 			sector = ""
 		case "sector":
 			if target == "" {
-				latest, err := s.store.Shadow().GetLatestByTrader(traderID)
+				latest, err := s.store.Shadow().GetLatestShared()
 				if err != nil {
 					SafeInternalError(c, "Load latest shadow snapshot", err)
 					return
@@ -67,7 +65,7 @@ func (s *Server) handleAdaptiveWeights(c *gin.Context) {
 			sector = target
 		case "symbol":
 			if target == "" {
-				latest, err := s.store.Shadow().GetLatestByTrader(traderID)
+				latest, err := s.store.Shadow().GetLatestShared()
 				if err != nil {
 					SafeInternalError(c, "Load latest shadow snapshot", err)
 					return
@@ -82,7 +80,7 @@ func (s *Server) handleAdaptiveWeights(c *gin.Context) {
 			}
 			symbol = target
 			if sector == "" {
-				latest, err := s.store.Shadow().GetLatestBySymbol(traderID, symbol, false)
+				latest, err := s.store.Shadow().GetLatestSharedBySymbol(symbol)
 				if err != nil {
 					SafeInternalError(c, "Load latest symbol shadow snapshot", err)
 					return
@@ -96,7 +94,7 @@ func (s *Server) handleAdaptiveWeights(c *gin.Context) {
 			return
 		}
 	} else if symbol == "" {
-		latest, err := s.store.Shadow().GetLatestByTrader(traderID)
+		latest, err := s.store.Shadow().GetLatestShared()
 		if err != nil {
 			SafeInternalError(c, "Load latest shadow snapshot", err)
 			return
@@ -106,7 +104,7 @@ func (s *Server) handleAdaptiveWeights(c *gin.Context) {
 			sector = latest.Sector
 		}
 	} else if sector == "" {
-		latest, err := s.store.Shadow().GetLatestBySymbol(traderID, symbol, false)
+		latest, err := s.store.Shadow().GetLatestSharedBySymbol(symbol)
 		if err != nil {
 			SafeInternalError(c, "Load latest symbol shadow snapshot", err)
 			return
@@ -116,5 +114,5 @@ func (s *Server) handleAdaptiveWeights(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, market.GetAdaptiveWeightState(traderID, sector, symbol))
+	c.JSON(http.StatusOK, market.GetAdaptiveWeightState("", sector, symbol))
 }

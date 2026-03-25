@@ -227,9 +227,9 @@ func TestBuildUserPromptInjectsDensePerformanceMatrices(t *testing.T) {
 	text := engine.BuildUserPrompt(ctx)
 	mustContain := []string{
 		"[TESTUSDT | 123.4500 | Recalced_Score: 72.4]",
-		"=== Smoothed Bin Matrix (Global - 7D) ===",
-		"=== Smoothed Bin Matrix (Sector: AI - 7D) ===",
-		"=== Smoothed Bin Matrix (Symbol: TESTUSDT - 5000 Samples) ===",
+		"=== Directional Bin Matrix (Global - 7D) ===",
+		"=== Directional Bin Matrix (Sector: AI - 7D) ===",
+		"=== Directional Bin Matrix (Symbol: TESTUSDT - 5000 Samples) ===",
 		"Bin  N    EV_L%  PF_L  EV_S%  PF_S",
 		"30   27    -0.8 0.24   +1.7 4.20",
 		"70   50    +1.2 2.15   -0.6 0.47",
@@ -312,13 +312,13 @@ func TestBuildUserPromptOmitsThinSymbolPerformanceMatrix(t *testing.T) {
 	}
 
 	text := engine.BuildUserPrompt(ctx)
-	if !strings.Contains(text, "=== Smoothed Bin Matrix (Global - 7D) ===") {
+	if !strings.Contains(text, "=== Directional Bin Matrix (Global - 7D) ===") {
 		t.Fatalf("expected user prompt to contain global matrix, got:\n%s", text)
 	}
-	if !strings.Contains(text, "=== Smoothed Bin Matrix (Sector: AI - 7D) ===") {
+	if !strings.Contains(text, "=== Directional Bin Matrix (Sector: AI - 7D) ===") {
 		t.Fatalf("expected user prompt to contain sector matrix, got:\n%s", text)
 	}
-	if strings.Contains(text, "=== Smoothed Bin Matrix (Symbol: TESTUSDT - 5000 Samples) ===") {
+	if strings.Contains(text, "=== Directional Bin Matrix (Symbol: TESTUSDT - 5000 Samples) ===") {
 		t.Fatalf("expected thin symbol matrix to be omitted when N < 10, got:\n%s", text)
 	}
 }
@@ -450,7 +450,7 @@ func TestBuildUserPromptInjectsPersonalityDNABeforeMatrix(t *testing.T) {
 		"- Quant Flow: Weight 16.9%, IC +0.10 (Strong Logic)",
 		"- Sentiment: Weight 14.5%, IC +0.00 (Noise - IGNORE)",
 		"- On-chain: Weight 23.8%, IC -0.08 (Reverse Signal)",
-		"=== Smoothed Bin Matrix (Global - 7D) ===",
+		"=== Directional Bin Matrix (Global - 7D) ===",
 	}
 	for _, expected := range mustContain {
 		if !strings.Contains(text, expected) {
@@ -459,7 +459,7 @@ func TestBuildUserPromptInjectsPersonalityDNABeforeMatrix(t *testing.T) {
 	}
 
 	dnaIndex := strings.Index(text, "## Personality DNA:")
-	matrixIndex := strings.Index(text, "=== Smoothed Bin Matrix (Global - 7D) ===")
+	matrixIndex := strings.Index(text, "=== Directional Bin Matrix (Global - 7D) ===")
 	if dnaIndex == -1 || matrixIndex == -1 || dnaIndex > matrixIndex {
 		t.Fatalf("expected Personality DNA block before matrix, got:\n%s", text)
 	}

@@ -40,7 +40,7 @@ type dexPair struct {
 		Buys  int `json:"buys"`
 		Sells int `json:"sells"`
 	} `json:"txns"`
-	Volume map[string]float64 `json:"volume"`
+	Volume    map[string]float64 `json:"volume"`
 	Liquidity struct {
 		USD float64 `json:"usd"`
 	} `json:"liquidity"`

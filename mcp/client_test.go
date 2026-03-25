@@ -3,6 +3,7 @@ package mcp
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -111,6 +112,43 @@ func TestClient_CallWithMessages_Success(t *testing.T) {
 		if req.Header.Get("Content-Type") != "application/json" {
 			t.Error("Content-Type should be application/json")
 		}
+	}
+}
+
+func TestClient_ParseMCPResponseFullCapturesFinishReasonUsageAndBodyTail(t *testing.T) {
+	client := NewClient(
+		WithProvider(ProviderGemini),
+		WithModel("gemini-3-flash-preview"),
+	).(*Client)
+
+	body := []byte(`{
+		"choices": [
+			{
+				"message": {
+					"content": "<reasoning>partial</reasoning>"
+				},
+				"finish_reason": "length"
+			}
+		],
+		"usage": {
+			"prompt_tokens": 19759,
+			"completion_tokens": 1996,
+			"total_tokens": 21755
+		}
+	}`)
+
+	resp, err := client.ParseMCPResponseFull(body)
+	if err != nil {
+		t.Fatalf("ParseMCPResponseFull returned error: %v", err)
+	}
+	if resp.FinishReason != "length" {
+		t.Fatalf("expected finish_reason length, got %q", resp.FinishReason)
+	}
+	if resp.PromptTokens != 19759 || resp.CompletionTokens != 1996 || resp.TotalTokens != 21755 {
+		t.Fatalf("unexpected usage: %+v", resp)
+	}
+	if !strings.Contains(resp.RawBodyTail, `"finish_reason": "length"`) {
+		t.Fatalf("expected raw body tail to preserve response tail, got %q", resp.RawBodyTail)
 	}
 }
 

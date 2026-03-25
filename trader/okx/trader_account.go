@@ -98,17 +98,20 @@ func (t *OKXTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 	if err != nil {
 		// Ignore error if already in target mode
 		if strings.Contains(err.Error(), "already") {
+			t.isCrossMargin = isCrossMargin
 			logger.Infof("  ✓ %s margin mode is already %s", symbol, mgnMode)
 			return nil
 		}
 		// Cannot change when there are positions
 		if strings.Contains(err.Error(), "position") {
+			t.isCrossMargin = isCrossMargin
 			logger.Infof("  ⚠️ %s has positions, cannot change margin mode", symbol)
 			return nil
 		}
 		return err
 	}
 
+	t.isCrossMargin = isCrossMargin
 	logger.Infof("  ✓ %s margin mode set to %s", symbol, mgnMode)
 	return nil
 }

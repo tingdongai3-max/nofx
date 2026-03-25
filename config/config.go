@@ -1,8 +1,8 @@
 package config
 
 import (
-	"nofx/telemetry"
 	"nofx/mcp"
+	"nofx/telemetry"
 	"os"
 	"strconv"
 	"strings"

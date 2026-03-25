@@ -19,7 +19,8 @@ interface ScoreBinPerformanceChartProps {
   data: ScoreBinPerformance[]
   language: Language
   realtimeBackcast?: boolean
-  windowSize?: number
+  positiveSampleCount?: number
+  lastUpdatedAt?: number | string
 }
 
 function finiteNumber(value: number | undefined, fallback = 0): number {
@@ -50,8 +51,9 @@ interface ChartRow extends ScoreBinPerformance {
   trade_count_label: string
   bar_opacity: number
   weighted_rank: number
-  window_label: string
 }
+
+const SHADOW_ROUND_TRIP_FEE_RATE = 0.0015
 
 const curveTierStyles: CurveTierStyle[] = [
   { key: 'thin', strokeWidth: 1, strokeOpacity: 0.2 },
@@ -156,13 +158,66 @@ function computeSeparationScore(rows: ChartRow[]): number | null {
 }
 
 function formatExpectedValueAxis(value: number) {
+  if (!Number.isFinite(value)) {
+    return '--'
+  }
   const percent = value * 100
   return `${percent > 0 ? '+' : ''}${percent.toFixed(1)}%`
 }
 
 function formatExpectedValueTooltip(value: number) {
+  if (!Number.isFinite(value)) {
+    return '--'
+  }
   const percent = value * 100
   return `${percent > 0 ? '+' : ''}${percent.toFixed(2)}%`
+}
+
+function formatExpectedValueGrossNet(value: number) {
+  if (!Number.isFinite(value)) {
+    return {
+      gross: '--',
+      net: '--',
+    }
+  }
+
+  return {
+    gross: formatExpectedValueTooltip(value + SHADOW_ROUND_TRIP_FEE_RATE),
+    net: formatExpectedValueTooltip(value),
+  }
+}
+
+interface ExpectedValueMetricProps {
+  label: string
+  value: number
+  language: Language
+  accentClassName: string
+}
+
+function ExpectedValueMetric({
+  label,
+  value,
+  language,
+  accentClassName,
+}: ExpectedValueMetricProps) {
+  const { gross, net } = formatExpectedValueGrossNet(value)
+  return (
+    <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+      <div className={`text-[11px] font-semibold tracking-[0.08em] ${accentClassName}`}>
+        {label}
+      </div>
+      <div className="mt-1 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-[11px] leading-5">
+        <span className="text-[#FDE68A]">
+          {language === 'zh' ? 'Gross EV (毛预测)' : 'Gross EV (Gross Alpha)'}
+        </span>
+        <span className="text-right font-medium text-white">{gross}</span>
+        <span className="text-[#93C5FD]">
+          {language === 'zh' ? 'Net EV (净实盘)' : 'Net EV (Net Alpha)'}
+        </span>
+        <span className="text-right font-medium text-white">{net}</span>
+      </div>
+    </div>
+  )
 }
 
 function formatProfitFactor(value: number) {
@@ -174,26 +229,33 @@ function formatWeightedRank(value: number) {
   return `P${value.toFixed(1)}`
 }
 
-function formatScorePoint(center: number, language: Language) {
-  return language === 'zh' ? `分数 ${center}` : `Score ${center}`
+function formatBinPointLabel(center: number, language: Language) {
+  return language === 'zh' ? `分箱点: ${center}` : `Bin point: ${center}`
 }
 
-function formatWindowNumber(value: number) {
-  if (!Number.isFinite(value)) {
-    return '--'
+function formatStatusTimestamp(value: number | string | undefined, language: Language) {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return new Date(value).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US', {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    })
   }
-  const rounded = Math.round(value * 10) / 10
-  return Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)
-}
-
-function formatSlidingWindowLabel(center: number, windowSize: number, language: Language) {
-  const halfWindow = windowSize / 2
-  const lower = center - halfWindow
-  const upper = center + halfWindow
-  if (language === 'zh') {
-    return `窗口 ${formatWindowNumber(lower)} - ${formatWindowNumber(upper)}`
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = new Date(value)
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US', {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      })
+    }
   }
-  return `Window ${formatWindowNumber(lower)} - ${formatWindowNumber(upper)}`
+  return language === 'zh' ? '待刷新' : 'Pending'
 }
 
 function resolveTickEvery(rowCount: number) {
@@ -214,25 +276,12 @@ function shouldRenderSparseLabel(index: number, rowCount: number) {
   return index === 0 || index === rowCount - 1 || index%tickEvery === 0
 }
 
-function smoothingHint(row: ScoreBinPerformance | undefined, language: Language) {
-  if (!row?.smoothed) {
-    return null
-  }
-  if (row.smoothed_by === 'global') {
-    return language === 'zh'
-      ? '[数据稀疏] 已由全局均值进行贝叶斯平滑'
-      : '[Sparse Data] Bayesian-smoothed by the global mean'
-  }
-  return language === 'zh'
-    ? '[数据稀疏] 已由赛道均值进行贝叶斯平滑'
-    : '[Sparse Data] Bayesian-smoothed by the sector mean'
-}
-
 export function ScoreBinPerformanceChart({
   data,
   language,
   realtimeBackcast = false,
-  windowSize = 5,
+  positiveSampleCount,
+  lastUpdatedAt,
 }: ScoreBinPerformanceChartProps) {
   const sanitizedRows = [...data]
     .sort((left, right) => left.bin_start - right.bin_start)
@@ -278,7 +327,6 @@ export function ScoreBinPerformanceChart({
       trade_count_label:
         shouldRenderSparseLabel(index, sanitizedRows.length) ? `N=${row.trade_count}` : '',
       bar_opacity: row.trade_count < 10 ? 0.3 : 1,
-      window_label: formatSlidingWindowLabel(row.bin_start, windowSize, language),
     }
   })
 
@@ -305,9 +353,28 @@ export function ScoreBinPerformanceChart({
   }
 
   return (
-    <div className="relative h-[340px]">
+    <div className="relative flex h-[390px] flex-col gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-black/25 px-4 py-3">
+        <div>
+          <div className="text-[11px] uppercase tracking-[0.24em] text-[#848E9C]">
+            {language === 'zh' ? '盈利 DNA 库' : 'Profit DNA Library'}
+          </div>
+          <div className="mt-1 text-sm font-semibold text-white">
+            {language === 'zh' ? '正样本数' : 'Positive Sample Count'}{' '}
+            <span className="text-[#FDE68A]">{Number.isFinite(positiveSampleCount ?? 0) ? positiveSampleCount : 0}</span>
+          </div>
+        </div>
+        <div className="text-right">
+          <div className="text-[11px] uppercase tracking-[0.24em] text-[#848E9C]">
+            {language === 'zh' ? '最后更新时间' : 'Last Updated'}
+          </div>
+          <div className="mt-1 text-sm font-semibold text-white">
+            {formatStatusTimestamp(lastUpdatedAt, language)}
+          </div>
+        </div>
+      </div>
       {realtimeBackcast && separationScore !== null ? (
-        <div className="absolute right-2 top-0 z-10 rounded-2xl border border-[#22D3EE]/20 bg-[#08131D]/90 px-3 py-2 text-right shadow-[0_12px_32px_rgba(0,0,0,0.25)]">
+        <div className="absolute right-2 top-16 z-10 rounded-2xl border border-[#22D3EE]/20 bg-[#08131D]/90 px-3 py-2 text-right shadow-[0_12px_32px_rgba(0,0,0,0.25)]">
           <div className="text-[10px] uppercase tracking-[0.2em] text-[#7DD3FC]">
             {language === 'zh' ? '权重区分度' : 'Separation Score'}
           </div>
@@ -316,8 +383,9 @@ export function ScoreBinPerformanceChart({
           </div>
         </div>
       ) : null}
-      <ResponsiveContainer width="100%" height="100%">
-        <ComposedChart data={chartData} margin={{ top: 20, right: 18, left: 4, bottom: 18 }}>
+      <div className="relative min-h-0 flex-1">
+        <ResponsiveContainer width="100%" height="100%">
+          <ComposedChart data={chartData} margin={{ top: 20, right: 18, left: 4, bottom: 18 }}>
           <defs>
             <linearGradient id="scoreBinLongBarFill" x1="0" y1="0" x2="0" y2="1">
               <stop offset="5%" stopColor="#F59E0B" stopOpacity={0.72} />
@@ -392,44 +460,59 @@ export function ScoreBinPerformanceChart({
                 return null
               }
 
-              const hint = smoothingHint(row, language)
               return (
                 <div className="rounded-xl border border-white/10 bg-[rgba(10,15,24,0.96)] px-3 py-2 text-xs text-[#E5E7EB] shadow-[0_14px_40px_rgba(0,0,0,0.35)]">
                   <div className="font-semibold text-white">
-                    {formatScorePoint(row.bin_start, language)}
+                    {formatBinPointLabel(row.bin_start, language)}
                   </div>
-                  <div className="text-[#CBD5E1]">{row.window_label}</div>
                   <div className="mt-1 text-[#CBD5E1]">{`N=${row.trade_count}`}</div>
                   <div className="text-[#CBD5E1]">
                     Weighted_Rank {formatWeightedRank(row.weighted_rank)}
                   </div>
-                  <div className="mt-1 text-[#FCD34D]">
-                    {language === 'zh' ? '做多平均期望回报' : 'Long Mean EV'}{' '}
-                    {formatExpectedValueTooltip(row.ev_long)}
+                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                    <ExpectedValueMetric
+                      label={language === 'zh' ? '做多平均期望回报' : 'Long Mean EV'}
+                      value={row.ev_long}
+                      language={language}
+                      accentClassName="text-[#FCD34D]"
+                    />
+                    <ExpectedValueMetric
+                      label={language === 'zh' ? '做多中位期望回报' : 'Long Median EV'}
+                      value={row.median_ev_long}
+                      language={language}
+                      accentClassName="text-[#E7C76B]"
+                    />
+                    <ExpectedValueMetric
+                      label={language === 'zh' ? '做空平均期望回报' : 'Short Mean EV'}
+                      value={row.ev_short}
+                      language={language}
+                      accentClassName="text-[#93C5FD]"
+                    />
+                    <ExpectedValueMetric
+                      label={language === 'zh' ? '做空中位期望回报' : 'Short Median EV'}
+                      value={row.median_ev_short}
+                      language={language}
+                      accentClassName="text-[#A9CBF8]"
+                    />
                   </div>
-                  <div className="text-[#E7C76B]">
-                    {language === 'zh' ? '做多中位期望回报' : 'Long Median EV'}{' '}
-                    {formatExpectedValueTooltip(row.median_ev_long)}
-                  </div>
-                  <div className="text-[#FCD34D]">
-                    {language === 'zh' ? '做多盈利因子' : 'Long PF'} {formatProfitFactor(row.profit_factor_long)}
-                  </div>
-                  <div className="mt-1 text-[#93C5FD]">
-                    {language === 'zh' ? '做空平均期望回报' : 'Short Mean EV'}{' '}
-                    {formatExpectedValueTooltip(row.ev_short)}
-                  </div>
-                  <div className="text-[#A9CBF8]">
-                    {language === 'zh' ? '做空中位期望回报' : 'Short Median EV'}{' '}
-                    {formatExpectedValueTooltip(row.median_ev_short)}
-                  </div>
-                  <div className="text-[#93C5FD]">
-                    {language === 'zh' ? '做空盈利因子' : 'Short PF'} {formatProfitFactor(row.profit_factor_short)}
-                  </div>
-                  {hint ? (
-                    <div className="mt-2 max-w-[16rem] text-[11px] leading-5 text-[#FDE68A]">
-                      {hint}
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+                      <div className="text-[11px] font-semibold tracking-[0.08em] text-[#FCD34D]">
+                        {language === 'zh' ? '做多盈利因子' : 'Long PF'}
+                      </div>
+                      <div className="mt-1 text-sm font-medium text-white">
+                        {formatProfitFactor(row.profit_factor_long)}
+                      </div>
                     </div>
-                  ) : null}
+                    <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+                      <div className="text-[11px] font-semibold tracking-[0.08em] text-[#93C5FD]">
+                        {language === 'zh' ? '做空盈利因子' : 'Short PF'}
+                      </div>
+                      <div className="mt-1 text-sm font-medium text-white">
+                        {formatProfitFactor(row.profit_factor_short)}
+                      </div>
+                    </div>
+                  </div>
                 </div>
               )
             }}
@@ -485,7 +568,7 @@ export function ScoreBinPerformanceChart({
           </Bar>
           <Line
             yAxisId="expected_value"
-            type="monotone"
+            type="linear"
             dataKey="ev_long_visual"
             name={language === 'zh' ? 'EV Long' : 'EV Long'}
             stroke="#F59E0B"
@@ -498,7 +581,7 @@ export function ScoreBinPerformanceChart({
             <Line
               key={`long-${tier.key}`}
               yAxisId="expected_value"
-              type="monotone"
+              type="linear"
               dataKey={`ev_long_${tier.key}`}
               stroke="#F59E0B"
               strokeWidth={tier.strokeWidth}
@@ -511,7 +594,7 @@ export function ScoreBinPerformanceChart({
           ))}
           <Line
             yAxisId="expected_value"
-            type="monotone"
+            type="linear"
             dataKey="ev_short_visual"
             name={language === 'zh' ? 'EV Short' : 'EV Short'}
             stroke="#60A5FA"
@@ -524,7 +607,7 @@ export function ScoreBinPerformanceChart({
             <Line
               key={`short-${tier.key}`}
               yAxisId="expected_value"
-              type="monotone"
+              type="linear"
               dataKey={`ev_short_${tier.key}`}
               stroke="#60A5FA"
               strokeWidth={tier.strokeWidth}
@@ -535,8 +618,9 @@ export function ScoreBinPerformanceChart({
               activeDot={false}
             />
           ))}
-        </ComposedChart>
-      </ResponsiveContainer>
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
     </div>
   )
 }

@@ -19,17 +19,17 @@ const (
 
 // CoinInfo represents basic coin information
 type CoinInfo struct {
-	Symbol   string  `json:"symbol"`
+	Symbol    string  `json:"symbol"`
 	Volume24h float64 `json:"volume_24h"` // 24h volume in USD
 }
 
 // CoinProvider provides Hyperliquid coin lists
 type CoinProvider struct {
-	mu            sync.RWMutex
-	allCoins      []CoinInfo
-	mainCoins     []CoinInfo
-	lastUpdated   time.Time
-	httpClient    *http.Client
+	mu          sync.RWMutex
+	allCoins    []CoinInfo
+	mainCoins   []CoinInfo
+	lastUpdated time.Time
+	httpClient  *http.Client
 }
 
 var (
@@ -63,8 +63,8 @@ type assetCtx struct {
 func (p *CoinProvider) fetchCoins(ctx context.Context) error {
 	// Request metaAndAssetCtxs to get both coin names and volume data
 	reqBody := []byte(`{"type": "metaAndAssetCtxs"}`)
-	
-	req, err := http.NewRequestWithContext(ctx, "POST", hyperliquidInfoURL, 
+
+	req, err := http.NewRequestWithContext(ctx, "POST", hyperliquidInfoURL,
 		bytes.NewReader(reqBody))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
@@ -134,7 +134,7 @@ func (p *CoinProvider) fetchCoins(ctx context.Context) error {
 	p.lastUpdated = time.Now()
 
 	logger.Infof("✅ Hyperliquid coin list updated: %d total coins, top 20 by volume cached", len(coins))
-	
+
 	return nil
 }
 
@@ -195,7 +195,7 @@ func GetAllCoinSymbols(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	symbols := make([]string, len(coins))
 	for i, c := range coins {
 		symbols[i] = c.Symbol
@@ -209,7 +209,7 @@ func GetMainCoinSymbols(ctx context.Context, limit int) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	symbols := make([]string, len(coins))
 	for i, c := range coins {
 		symbols[i] = c.Symbol

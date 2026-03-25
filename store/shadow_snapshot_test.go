@@ -100,6 +100,32 @@ func TestShadowSnapshotStoreCreateAndFill(t *testing.T) {
 	if len(listed) != 2 {
 		t.Fatalf("expected 2 rows, got %d", len(listed))
 	}
+	consensusRows, err := ss.ListByTrader(GlobalConsensusTraderID, 10)
+	if err != nil {
+		t.Fatalf("list consensus rows: %v", err)
+	}
+	if len(consensusRows) != 2 {
+		t.Fatalf("expected 2 consensus rows, got %d", len(consensusRows))
+	}
+	foundConsensusAction := false
+	foundConsensusFilled := false
+	for _, row := range consensusRows {
+		if row == nil {
+			continue
+		}
+		if row.Symbol == "ETHUSDT" && row.ActionTaken == 1 {
+			foundConsensusAction = true
+		}
+		if row.Symbol == pending[0].Symbol && row.Filled {
+			foundConsensusFilled = true
+		}
+	}
+	if !foundConsensusAction {
+		t.Fatalf("expected consensus pool action sync for ETHUSDT, got %+v", consensusRows)
+	}
+	if !foundConsensusFilled {
+		t.Fatalf("expected consensus pool fill sync for %s, got %+v", pending[0].Symbol, consensusRows)
+	}
 	if listed[0].Symbol != "ETHUSDT" && listed[1].Symbol != "ETHUSDT" {
 		t.Fatalf("expected ETHUSDT row in result set")
 	}
@@ -132,6 +158,54 @@ func TestShadowSnapshotStoreCreateAndFill(t *testing.T) {
 	}
 	if listed[0].OnChainBuyRaw <= 0 && listed[1].OnChainBuyRaw <= 0 {
 		t.Fatalf("expected persisted onchain buy raw, got rows=%+v", listed)
+	}
+}
+
+func TestShadowSnapshotStoreMarksRebelSonOnLargeLoss(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "shadow_rebel.db")
+	db := openTelemetryTestDB(t, dbPath)
+	ss := NewShadowSnapshotStore(db)
+	if err := ss.initTables(); err != nil {
+		t.Fatalf("init tables: %v", err)
+	}
+
+	decisionTime := time.Now().UTC().Add(-18 * time.Minute).UnixMilli()
+	if err := ss.CreateBatch([]*ShadowSnapshot{
+		{
+			TraderID:     "shadow-rebel",
+			DecisionTime: decisionTime,
+			Symbol:       "LUNAUSDT",
+			Sector:       "Alt",
+			PriceT0:      100,
+			HeatScore:    88.0,
+			CreatedAt:    decisionTime,
+			UpdatedAt:    decisionTime,
+		},
+	}); err != nil {
+		t.Fatalf("create batch: %v", err)
+	}
+
+	pending, err := ss.GetPendingFill(time.Now().UTC().Add(-15*time.Minute).UnixMilli(), 10)
+	if err != nil {
+		t.Fatalf("get pending fill: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending row, got %d", len(pending))
+	}
+
+	if err := ss.MarkFilled(pending[0].ID, 96.0, -0.04, time.Now().UTC().UnixMilli()); err != nil {
+		t.Fatalf("mark filled: %v", err)
+	}
+
+	listed, err := ss.ListByTrader("shadow-rebel", 10)
+	if err != nil {
+		t.Fatalf("list by trader: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(listed))
+	}
+	if listed[0].KnnAuditTag != "[REBEL_SON]" {
+		t.Fatalf("expected rebel son tag, got %q", listed[0].KnnAuditTag)
 	}
 }
 
@@ -1114,7 +1188,7 @@ func TestShadowSnapshotStoreListPerformanceBinsBySymbolUses5000SampleLimit(t *te
 	}
 }
 
-func TestShadowSnapshotStoreListSmoothedPerformanceBinsBridgesAdjacentScores(t *testing.T) {
+func TestShadowSnapshotStoreListSmoothedPerformanceBinsKeepsSharpBuckets(t *testing.T) {
 	db := openTelemetryTestDB(t, "file::memory:?cache=shared")
 	ss := NewShadowSnapshotStore(db)
 	if err := ss.initTables(); err != nil {
@@ -1160,24 +1234,33 @@ func TestShadowSnapshotStoreListSmoothedPerformanceBinsBridgesAdjacentScores(t *
 	if err != nil {
 		t.Fatalf("list smoothed performance bins: %v", err)
 	}
-	if len(bins) != 3 {
-		t.Fatalf("expected three overlapping smoothed points, got %+v", bins)
+	if len(bins) != 2 {
+		t.Fatalf("expected two raw buckets without neighbor drag, got %+v", bins)
 	}
 
-	expectedLong := expectedValueLong(0.04, -0.02)
-	expectedShort := expectedValueShort(0.04, -0.02)
-	for index, expectedStart := range []int{39, 40, 41} {
-		if bins[index].BinStart != expectedStart {
-			t.Fatalf("expected smoothed point %d, got %+v", expectedStart, bins[index])
+	expected := map[int]struct {
+		long  float64
+		short float64
+	}{
+		39: {long: expectedValueLong(0.04), short: expectedValueShort(0.04)},
+		41: {long: expectedValueLong(-0.02), short: expectedValueShort(-0.02)},
+	}
+	for _, bin := range bins {
+		want, ok := expected[bin.BinStart]
+		if !ok {
+			t.Fatalf("unexpected raw bucket %+v", bin)
 		}
-		if bins[index].TradeCount != 2 {
-			t.Fatalf("expected overlapping window at %d to include both samples, got %+v", expectedStart, bins[index])
+		if bin.TradeCount != 1 {
+			t.Fatalf("expected raw bucket at %d to contain exactly one sample, got %+v", bin.BinStart, bin)
 		}
-		if diff := absFloat64(bins[index].ExpectedValueLong - expectedLong); diff > 1e-9 {
-			t.Fatalf("expected smoothed long EV %.10f at %d, got %.10f", expectedLong, expectedStart, bins[index].ExpectedValueLong)
+		if bin.Smoothed {
+			t.Fatalf("expected raw bucket at %d to remain unsmoothed, got %+v", bin.BinStart, bin)
 		}
-		if diff := absFloat64(bins[index].ExpectedValueShort - expectedShort); diff > 1e-9 {
-			t.Fatalf("expected smoothed short EV %.10f at %d, got %.10f", expectedShort, expectedStart, bins[index].ExpectedValueShort)
+		if diff := absFloat64(bin.ExpectedValueLong - want.long); diff > 1e-9 {
+			t.Fatalf("expected raw long EV %.10f at %d, got %.10f", want.long, bin.BinStart, bin.ExpectedValueLong)
+		}
+		if diff := absFloat64(bin.ExpectedValueShort - want.short); diff > 1e-9 {
+			t.Fatalf("expected raw short EV %.10f at %d, got %.10f", want.short, bin.BinStart, bin.ExpectedValueShort)
 		}
 	}
 }

@@ -62,10 +62,10 @@ func TestPerformanceMatrixCacheRespectsTTL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get matrices first: %v", err)
 	}
-	if len(first.Global) != 3 {
-		t.Fatalf("expected 3 smoothed global points, got %+v", first.Global)
+	if len(first.Global) != 2 {
+		t.Fatalf("expected 2 raw global buckets, got %+v", first.Global)
 	}
-	if first.Global[0].BinStart != 72 || first.Global[2].BinStart != 74 {
+	if first.Global[0].BinStart != 72 || first.Global[1].BinStart != 74 {
 		t.Fatalf("unexpected first global bins: %+v", first.Global)
 	}
 
@@ -92,7 +92,7 @@ func TestPerformanceMatrixCacheRespectsTTL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get matrices cached: %v", err)
 	}
-	if len(cached.Global) != 3 {
+	if len(cached.Global) != 2 {
 		t.Fatalf("expected cached global bins to remain unchanged, got %+v", cached.Global)
 	}
 	for _, bin := range cached.Global {
@@ -107,8 +107,8 @@ func TestPerformanceMatrixCacheRespectsTTL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get matrices refreshed: %v", err)
 	}
-	if len(refreshed.Global) <= len(first.Global) {
-		t.Fatalf("expected refreshed global bins to expand after inserting the new 90-score sample, got %+v", refreshed.Global)
+	if len(refreshed.Global) != 3 {
+		t.Fatalf("expected refreshed global bins to include the new 90-score bucket, got %+v", refreshed.Global)
 	}
 	foundNinety := false
 	for _, bin := range refreshed.Global {
@@ -118,7 +118,7 @@ func TestPerformanceMatrixCacheRespectsTTL(t *testing.T) {
 		}
 	}
 	if !foundNinety {
-		t.Fatalf("expected refreshed smoothed bins to include score 90, got %+v", refreshed.Global)
+		t.Fatalf("expected refreshed raw bins to include score 90, got %+v", refreshed.Global)
 	}
 }
 
@@ -310,7 +310,7 @@ func TestPerformanceMatrixCacheBackcastGlobalPoolUsesRawFactorsAcrossTraders(t *
 	}
 }
 
-func TestPerformanceMatrixCacheBackcastGlobalPoolKeyedByWeightSignature(t *testing.T) {
+func TestPerformanceMatrixCacheBackcastGlobalPoolReusesSharedWeightSignature(t *testing.T) {
 	dbPath := filepath.Join("/tmp", "nofx_performance_backcast_signature_pool_test.db")
 	_ = os.Remove(dbPath)
 	t.Cleanup(func() { _ = os.Remove(dbPath) })
@@ -343,8 +343,8 @@ func TestPerformanceMatrixCacheBackcastGlobalPoolKeyedByWeightSignature(t *testi
 	if b == nil || len(b.Global) == 0 {
 		t.Fatalf("expected non-empty trader B global backcast matrices, got %+v", b)
 	}
-	if reflect.DeepEqual(a.Global, b.Global) {
-		t.Fatalf("expected different backcast matrices for distinct weight signatures, got A=%+v B=%+v", a.Global, b.Global)
+	if !reflect.DeepEqual(a.Global, b.Global) {
+		t.Fatalf("expected identical backcast matrices for shared global weight signature, got A=%+v B=%+v", a.Global, b.Global)
 	}
 
 	cache.mu.RLock()
@@ -352,12 +352,12 @@ func TestPerformanceMatrixCacheBackcastGlobalPoolKeyedByWeightSignature(t *testi
 
 	signatureKeys := make(map[string]struct{})
 	for key := range cache.backcastGlobal {
-		if strings.HasPrefix(key, performanceMatrixGlobalPoolKey+"::backcast::sig_") {
+		if strings.HasPrefix(key, performanceMatrixGlobalPoolKey+"::backcast::rf_true::sig_") {
 			signatureKeys[key] = struct{}{}
 		}
 	}
-	if len(signatureKeys) != 2 {
-		t.Fatalf("expected 2 signature-keyed global backcast cache entries, got %d keys: %+v", len(signatureKeys), signatureKeys)
+	if len(signatureKeys) != 1 {
+		t.Fatalf("expected 1 signature-keyed global backcast cache entry, got %d keys: %+v", len(signatureKeys), signatureKeys)
 	}
 }
 

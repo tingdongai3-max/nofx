@@ -118,7 +118,8 @@ func (c *MiniMaxClient) ParseMCPResponseFull(body []byte) (*mcp.LLMResponse, err
 			InputTokens  int `json:"input_tokens"`
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
-		Error *struct {
+		StopReason string `json:"stop_reason"`
+		Error      *struct {
 			Type    string `json:"type"`
 			Message string `json:"message"`
 		} `json:"error"`
@@ -168,6 +169,11 @@ func (c *MiniMaxClient) ParseMCPResponseFull(body []byte) (*mcp.LLMResponse, err
 		}
 	}
 	result.Content = strings.Join(contentParts, "\n\n")
+	result.FinishReason = strings.TrimSpace(raw.StopReason)
+	result.PromptTokens = raw.Usage.InputTokens
+	result.CompletionTokens = raw.Usage.OutputTokens
+	result.TotalTokens = total
+	result.RawBodyTail = providerBodyTail(body)
 	return result, nil
 }
 

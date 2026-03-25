@@ -3,170 +3,184 @@ package trader
 import (
 	"fmt"
 	"nofx/logger"
+	"nofx/store"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// startDrawdownMonitor starts drawdown monitoring
-func (at *AutoTrader) startDrawdownMonitor() {
+const fixedAutoCloseCheckInterval = 15 * time.Second
+
+// startFixedAutoCloseMonitor enforces the new hard rule:
+// live positions are closed by fixed timer only, never by dynamic exit logic.
+func (at *AutoTrader) startFixedAutoCloseMonitor() {
+	if at == nil || at.store == nil || at.trader == nil {
+		return
+	}
+
 	at.monitorWg.Add(1)
 	go func() {
 		defer at.monitorWg.Done()
 
-		ticker := time.NewTicker(1 * time.Minute) // Check every minute
+		ticker := time.NewTicker(fixedAutoCloseCheckInterval)
 		defer ticker.Stop()
 
-		logger.Info("📊 Started position drawdown monitoring (check every minute)")
+		hold := at.getFixedAutoCloseHoldDuration()
+		logger.Infof("⏱ Started fixed auto-close monitor (hold=%s, check=%s)", hold, fixedAutoCloseCheckInterval)
+
+		at.processFixedAutoCloseCycle(time.Now().UTC())
 
 		for {
 			select {
-			case <-ticker.C:
-				at.checkPositionDrawdown()
+			case now := <-ticker.C:
+				at.processFixedAutoCloseCycle(now.UTC())
 			case <-at.stopMonitorCh:
-				logger.Info("⏹ Stopped position drawdown monitoring")
+				logger.Info("⏹ Stopped fixed auto-close monitor")
 				return
 			}
 		}
 	}()
 }
 
-// checkPositionDrawdown checks position drawdown situation
-func (at *AutoTrader) checkPositionDrawdown() {
-	// Get current positions
-	positions, err := at.trader.GetPositions()
-	if err != nil {
-		logger.Infof("❌ Drawdown monitoring: failed to get positions: %v", err)
+func (at *AutoTrader) processFixedAutoCloseCycle(now time.Time) {
+	if at == nil || at.store == nil || at.trader == nil {
 		return
 	}
 
-	for _, pos := range positions {
-		symbol := pos["symbol"].(string)
-		side := pos["side"].(string)
-		entryPrice := pos["entryPrice"].(float64)
-		markPrice := pos["markPrice"].(float64)
-		quantity := pos["positionAmt"].(float64)
-		if quantity < 0 {
-			quantity = -quantity // Short position quantity is negative, convert to positive
+	hold := at.getFixedAutoCloseHoldDuration()
+	expired, err := at.store.Position().GetExpiredAutoClosePositions(
+		at.id,
+		now.UTC().UnixMilli(),
+		int64(hold/time.Millisecond),
+	)
+	if err != nil {
+		logger.Infof("⚠️ Fixed auto-close monitor failed to load positions: %v", err)
+		return
+	}
+
+	for _, pos := range expired {
+		if pos == nil || pos.ID <= 0 || !strings.EqualFold(pos.Status, "OPEN") {
+			continue
 		}
-
-		// Calculate current P&L percentage
-		leverage := 10 // Default value
-		if lev, ok := pos["leverage"].(float64); ok {
-			leverage = int(lev)
+		if !at.claimFixedAutoClose(pos.ID) {
+			continue
 		}
-
-		at.recordPositionTelemetry(symbol, side, markPrice)
-
-		var currentPnLPct float64
-		if side == "long" {
-			currentPnLPct = ((markPrice - entryPrice) / entryPrice) * float64(leverage) * 100
-		} else {
-			currentPnLPct = ((entryPrice - markPrice) / entryPrice) * float64(leverage) * 100
-		}
-
-		// Construct unique position identifier (distinguish long/short)
-		posKey := symbol + "_" + side
-
-		// Get historical peak profit for this position
-		at.peakPnLCacheMutex.RLock()
-		peakPnLPct, exists := at.peakPnLCache[posKey]
-		at.peakPnLCacheMutex.RUnlock()
-
-		if !exists {
-			// If no historical peak record, use current P&L as initial value
-			peakPnLPct = currentPnLPct
-			at.UpdatePeakPnL(symbol, side, currentPnLPct)
-		} else {
-			// Update peak cache
-			at.UpdatePeakPnL(symbol, side, currentPnLPct)
-		}
-
-		// Calculate drawdown (magnitude of decline from peak)
-		var drawdownPct float64
-		if peakPnLPct > 0 && currentPnLPct < peakPnLPct {
-			drawdownPct = ((peakPnLPct - currentPnLPct) / peakPnLPct) * 100
-		}
-
-		// Check close position condition: profit > 5% and drawdown >= 40%
-		if currentPnLPct > 5.0 && drawdownPct >= 40.0 {
-			logger.Infof("🚨 Drawdown close position condition triggered: %s %s | Current profit: %.2f%% | Peak profit: %.2f%% | Drawdown: %.2f%%",
-				symbol, side, currentPnLPct, peakPnLPct, drawdownPct)
-
-			// Execute close position
-			if err := at.emergencyClosePosition(symbol, side); err != nil {
-				logger.Infof("❌ Drawdown close position failed (%s %s): %v", symbol, side, err)
-			} else {
-				logger.Infof("✅ Drawdown close position succeeded: %s %s", symbol, side)
-				// Clear cache for this position after closing
-				at.ClearPeakPnLCache(symbol, side)
-			}
-		} else if currentPnLPct > 5.0 {
-			// Record situations close to close position condition (for debugging)
-			logger.Infof("📊 Drawdown monitoring: %s %s | Profit: %.2f%% | Peak: %.2f%% | Drawdown: %.2f%%",
-				symbol, side, currentPnLPct, peakPnLPct, drawdownPct)
+		if err := at.executeFixedAutoClose(pos, now.UTC(), hold); err != nil {
+			at.releaseFixedAutoClose(pos.ID)
+			logger.Infof("⚠️ Fixed timed exit failed for %s %s: %v", pos.Symbol, pos.Side, err)
 		}
 	}
 }
 
-// emergencyClosePosition emergency close position function
-func (at *AutoTrader) emergencyClosePosition(symbol, side string) error {
-	switch side {
-	case "long":
-		order, err := at.trader.CloseLong(symbol, 0) // 0 = close all
-		if err != nil {
-			return err
-		}
-		logger.Infof("✅ Emergency close long position succeeded, order ID: %v", order["orderId"])
-	case "short":
-		order, err := at.trader.CloseShort(symbol, 0) // 0 = close all
-		if err != nil {
-			return err
-		}
-		logger.Infof("✅ Emergency close short position succeeded, order ID: %v", order["orderId"])
-	default:
-		return fmt.Errorf("unknown position direction: %s", side)
+func (at *AutoTrader) claimFixedAutoClose(positionID int64) bool {
+	if at == nil || positionID <= 0 {
+		return false
 	}
 
+	at.fixedAutoCloseMu.Lock()
+	defer at.fixedAutoCloseMu.Unlock()
+
+	if at.fixedAutoClosingIDs == nil {
+		at.fixedAutoClosingIDs = make(map[int64]struct{})
+	}
+	if _, exists := at.fixedAutoClosingIDs[positionID]; exists {
+		return false
+	}
+	at.fixedAutoClosingIDs[positionID] = struct{}{}
+	return true
+}
+
+func (at *AutoTrader) releaseFixedAutoClose(positionID int64) {
+	if at == nil || positionID <= 0 {
+		return
+	}
+
+	at.fixedAutoCloseMu.Lock()
+	defer at.fixedAutoCloseMu.Unlock()
+
+	delete(at.fixedAutoClosingIDs, positionID)
+}
+
+func (at *AutoTrader) executeFixedAutoClose(pos *store.TraderPosition, now time.Time, hold time.Duration) error {
+	if at == nil || pos == nil {
+		return nil
+	}
+
+	action := "close_long"
+	closeFn := at.trader.CloseLong
+	if strings.EqualFold(pos.Side, "SHORT") {
+		action = "close_short"
+		closeFn = at.trader.CloseShort
+	}
+
+	reasoning := buildFixedTimedExitReason(hold)
+	actionRecord := store.DecisionAction{
+		Action:        action,
+		Symbol:        pos.Symbol,
+		Quantity:      pos.Quantity,
+		Leverage:      pos.Leverage,
+		Reasoning:     reasoning,
+		Timestamp:     now,
+		Success:       false,
+		ExecutionMode: "fixed_timed_exit",
+	}
+
+	if marketPrice, err := at.trader.GetMarketPrice(pos.Symbol); err == nil && marketPrice > 0 {
+		actionRecord.Price = marketPrice
+	} else {
+		actionRecord.Price = pos.EntryPrice
+	}
+
+	order, err := closeFn(pos.Symbol, 0)
+	if err != nil {
+		return err
+	}
+	if orderID := extractOrderID(order); orderID != "" && orderID != "0" {
+		if parsed, parseErr := strconv.ParseInt(orderID, 10, 64); parseErr == nil {
+			actionRecord.OrderID = parsed
+		}
+	}
+
+	actionRecord.Success = true
+	record := &store.DecisionRecord{
+		Timestamp:    now,
+		Decisions:    []store.DecisionAction{actionRecord},
+		ExecutionLog: []string{fmt.Sprintf("✓ %s %s executed by fixed timed exit", pos.Symbol, action)},
+		Success:      true,
+	}
+	if err := at.saveDecision(record); err != nil {
+		logger.Infof("⚠️ Failed to persist fixed timed exit record: %v", err)
+	}
+
+	logger.Infof(
+		"⏱ Fixed timed exit executed: trader=%s symbol=%s side=%s auto_close_at=%d",
+		at.id,
+		pos.Symbol,
+		pos.Side,
+		pos.AutoCloseAt,
+	)
 	return nil
 }
 
-// GetPeakPnLCache gets peak profit cache
-func (at *AutoTrader) GetPeakPnLCache() map[string]float64 {
-	at.peakPnLCacheMutex.RLock()
-	defer at.peakPnLCacheMutex.RUnlock()
-
-	// Return a copy of the cache
-	cache := make(map[string]float64)
-	for k, v := range at.peakPnLCache {
-		cache[k] = v
+func buildFixedTimedExitReason(hold time.Duration) string {
+	minutes := int(hold.Round(time.Minute) / time.Minute)
+	if minutes <= 0 {
+		minutes = 15
 	}
-	return cache
+	return fmt.Sprintf("固定 %d 分钟平仓", minutes)
 }
 
-// UpdatePeakPnL updates peak profit cache
-func (at *AutoTrader) UpdatePeakPnL(symbol, side string, currentPnLPct float64) {
-	at.peakPnLCacheMutex.Lock()
-	defer at.peakPnLCacheMutex.Unlock()
-
-	posKey := symbol + "_" + side
-	if peak, exists := at.peakPnLCache[posKey]; exists {
-		// Update peak (if long, take larger value; if short, currentPnLPct is negative, also compare)
-		if currentPnLPct > peak {
-			at.peakPnLCache[posKey] = currentPnLPct
-		}
-	} else {
-		// First time recording
-		at.peakPnLCache[posKey] = currentPnLPct
-	}
+func (at *AutoTrader) getFixedAutoCloseHoldDuration() time.Duration {
+	return defaultRealBacktestHoldDuration
 }
 
-// ClearPeakPnLCache clears peak cache for specified position
-func (at *AutoTrader) ClearPeakPnLCache(symbol, side string) {
-	at.peakPnLCacheMutex.Lock()
-	defer at.peakPnLCacheMutex.Unlock()
-
-	posKey := symbol + "_" + side
-	delete(at.peakPnLCache, posKey)
+func (at *AutoTrader) shouldSuppressDynamicCloseAction(action string) bool {
+	switch action {
+	case "close_long", "close_short":
+		return true
+	default:
+		return false
+	}
 }
 
 // ============================================================================
@@ -191,24 +205,21 @@ func (at *AutoTrader) enforcePositionValueRatio(positionSizeUSD float64, equity 
 
 	riskControl := at.config.StrategyConfig.RiskControl
 
-	// Get the appropriate position value ratio limit
 	var maxPositionValueRatio float64
 	if isBTCETH(symbol) {
 		maxPositionValueRatio = riskControl.BTCETHMaxPositionValueRatio
 		if maxPositionValueRatio <= 0 {
-			maxPositionValueRatio = 5.0 // Default: 5x for BTC/ETH
+			maxPositionValueRatio = 5.0
 		}
 	} else {
 		maxPositionValueRatio = riskControl.AltcoinMaxPositionValueRatio
 		if maxPositionValueRatio <= 0 {
-			maxPositionValueRatio = 1.0 // Default: 1x for altcoins
+			maxPositionValueRatio = 1.0
 		}
 	}
 
-	// Calculate max allowed position value = equity × ratio
 	maxPositionValue := equity * maxPositionValueRatio
 
-	// Check if position size exceeds limit
 	if positionSizeUSD > maxPositionValue {
 		logger.Infof("  ⚠️ [RISK CONTROL] Position %.2f USDT exceeds limit (equity %.2f × %.1fx = %.2f USDT max for %s), capping",
 			positionSizeUSD, equity, maxPositionValueRatio, maxPositionValue, symbol)
@@ -226,7 +237,7 @@ func (at *AutoTrader) enforceMinPositionSize(positionSizeUSD float64) error {
 
 	minSize := at.config.StrategyConfig.RiskControl.MinPositionSize
 	if minSize <= 0 {
-		minSize = 12 // Default: 12 USDT
+		minSize = 12
 	}
 
 	if positionSizeUSD < minSize {
@@ -243,7 +254,7 @@ func (at *AutoTrader) enforceMaxPositions(currentPositionCount int) error {
 
 	maxPositions := at.config.StrategyConfig.RiskControl.MaxPositions
 	if maxPositions <= 0 {
-		maxPositions = 3 // Default: 3 positions
+		maxPositions = 3
 	}
 
 	if currentPositionCount >= maxPositions {

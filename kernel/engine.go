@@ -90,28 +90,29 @@ type RecentOrder struct {
 
 // Context trading context (complete information passed to AI)
 type Context struct {
-	TraderID           string                             `json:"trader_id,omitempty"`
-	CurrentTime        string                             `json:"current_time"`
-	RuntimeMinutes     int                                `json:"runtime_minutes"`
-	CallCount          int                                `json:"call_count"`
-	DecisionTime       time.Time                          `json:"-"`
-	PriceSnapshotAt    time.Time                          `json:"-"`
-	Account            AccountInfo                        `json:"account"`
-	Positions          []PositionInfo                     `json:"positions"`
-	CandidateCoins     []CandidateCoin                    `json:"candidate_coins"`
-	PromptVariant      string                             `json:"prompt_variant,omitempty"`
-	TradingStats       *TradingStats                      `json:"trading_stats,omitempty"`
-	RecentOrders       []RecentOrder                      `json:"recent_orders,omitempty"`
-	MarketDataMap      map[string]*market.Data            `json:"-"`
-	MultiTFMarket      map[string]map[string]*market.Data `json:"-"`
-	OITopDataMap       map[string]*OITopData              `json:"-"`
-	QuantDataMap       map[string]*QuantData              `json:"-"`
-	OIRankingData      *nofxos.OIRankingData              `json:"-"` // Market-wide OI ranking data
-	NetFlowRankingData *nofxos.NetFlowRankingData         `json:"-"` // Market-wide fund flow ranking data
-	PriceRankingData   *nofxos.PriceRankingData           `json:"-"` // Market-wide price gainers/losers
-	BTCETHLeverage     int                                `json:"-"`
-	AltcoinLeverage    int                                `json:"-"`
-	Timeframes         []string                           `json:"-"`
+	TraderID               string                             `json:"trader_id,omitempty"`
+	CurrentTime            string                             `json:"current_time"`
+	RuntimeMinutes         int                                `json:"runtime_minutes"`
+	CallCount              int                                `json:"call_count"`
+	DecisionTime           time.Time                          `json:"-"`
+	PriceSnapshotAt        time.Time                          `json:"-"`
+	Account                AccountInfo                        `json:"account"`
+	Positions              []PositionInfo                     `json:"positions"`
+	CandidateCoins         []CandidateCoin                    `json:"candidate_coins"`
+	PromptVariant          string                             `json:"prompt_variant,omitempty"`
+	TradingStats           *TradingStats                      `json:"trading_stats,omitempty"`
+	RecentOrders           []RecentOrder                      `json:"recent_orders,omitempty"`
+	LiveAttributionWeights map[string]float64                 `json:"-"`
+	MarketDataMap          map[string]*market.Data            `json:"-"`
+	MultiTFMarket          map[string]map[string]*market.Data `json:"-"`
+	OITopDataMap           map[string]*OITopData              `json:"-"`
+	QuantDataMap           map[string]*QuantData              `json:"-"`
+	OIRankingData          *nofxos.OIRankingData              `json:"-"` // Market-wide OI ranking data
+	NetFlowRankingData     *nofxos.NetFlowRankingData         `json:"-"` // Market-wide fund flow ranking data
+	PriceRankingData       *nofxos.PriceRankingData           `json:"-"` // Market-wide price gainers/losers
+	BTCETHLeverage         int                                `json:"-"`
+	AltcoinLeverage        int                                `json:"-"`
+	Timeframes             []string                           `json:"-"`
 }
 
 type PerformanceBinMatrices struct {
@@ -154,6 +155,12 @@ type FullDecision struct {
 	CoTTrace            string     `json:"cot_trace"`
 	Decisions           []Decision `json:"decisions"`
 	RawResponse         string     `json:"raw_response"`
+	AIFinishReason      string     `json:"ai_finish_reason,omitempty"`
+	AIPromptTokens      int        `json:"ai_prompt_tokens,omitempty"`
+	AICompletionTokens  int        `json:"ai_completion_tokens,omitempty"`
+	AITotalTokens       int        `json:"ai_total_tokens,omitempty"`
+	AIRawBodyTail       string     `json:"ai_raw_body_tail,omitempty"`
+	AIMaxTokens         int        `json:"ai_max_tokens,omitempty"`
 	Timestamp           time.Time  `json:"timestamp"`
 	AIRequestDurationMs int64      `json:"ai_request_duration_ms,omitempty"`
 }
@@ -198,6 +205,7 @@ type StrategyEngine struct {
 	nofxosClient           *nofxos.Client
 	performanceBinProvider PerformanceBinProvider
 	adaptiveWeightProvider AdaptiveWeightStateProvider
+	liveAttributionWeights map[string]float64
 }
 
 // NewStrategyEngine creates strategy execution engine
@@ -244,6 +252,17 @@ func (e *StrategyEngine) SetPerformanceBinProvider(provider PerformanceBinProvid
 
 func (e *StrategyEngine) SetAdaptiveWeightStateProvider(provider AdaptiveWeightStateProvider) {
 	e.adaptiveWeightProvider = provider
+}
+
+func (e *StrategyEngine) SetLiveAttributionWeights(weights map[string]float64) {
+	if e == nil {
+		return
+	}
+	if len(weights) == 0 {
+		e.liveAttributionWeights = nil
+		return
+	}
+	e.liveAttributionWeights = NormalizeLiveAttributionWeights(weights)
 }
 
 // ============================================================================

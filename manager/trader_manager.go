@@ -23,6 +23,7 @@ type TraderManager struct {
 	traders          map[string]*trader.AutoTrader // key: trader ID
 	loadErrors       map[string]error              // key: trader ID, stores last load error
 	competitionCache *CompetitionCache
+	globalSniper     *trader.GlobalResonanceSniper
 	mu               sync.RWMutex
 }
 
@@ -99,12 +100,48 @@ func (tm *TraderManager) StartAll() {
 // StopAll stops all traders
 func (tm *TraderManager) StopAll() {
 	tm.mu.RLock()
-	defer tm.mu.RUnlock()
+	sniper := tm.globalSniper
+	traders := make([]*trader.AutoTrader, 0, len(tm.traders))
+	for _, t := range tm.traders {
+		traders = append(traders, t)
+	}
+	tm.mu.RUnlock()
 
 	logger.Info("⏹  Stopping all traders...")
-	for _, t := range tm.traders {
+	if sniper != nil {
+		sniper.Stop()
+	}
+	for _, t := range traders {
 		t.Stop()
 	}
+}
+
+func (tm *TraderManager) AttachGlobalResonanceSniper(sniper *trader.GlobalResonanceSniper) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.globalSniper = sniper
+}
+
+func (tm *TraderManager) SyncGlobalResonanceSniper() error {
+	tm.mu.RLock()
+	sniper := tm.globalSniper
+	tm.mu.RUnlock()
+
+	if sniper == nil {
+		return nil
+	}
+	return sniper.SyncWithConfig()
+}
+
+func (tm *TraderManager) IsGlobalResonanceSniperRunning() bool {
+	tm.mu.RLock()
+	sniper := tm.globalSniper
+	tm.mu.RUnlock()
+
+	if sniper == nil {
+		return false
+	}
+	return sniper.IsRunning()
 }
 
 // AutoStartRunningTraders automatically starts traders marked as running in the database
@@ -740,4 +777,3 @@ func (tm *TraderManager) addTraderFromStore(traderCfg *store.Trader, aiModelCfg 
 
 	return nil
 }
-

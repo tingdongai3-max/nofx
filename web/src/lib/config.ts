@@ -1,6 +1,18 @@
 export interface SystemConfig {
   initialized: boolean
   beta_mode?: boolean
+  real_backtest_enabled?: boolean
+  btc_eth_leverage?: number
+  altcoin_leverage?: number
+  rb_max_margin_per_trade?: number
+  rb_reserve_margin?: number
+  rb_min_ev_threshold?: number
+  rb_max_ev_threshold?: number
+  adaptive_entry_floor?: number
+  adaptive_entry_lambda?: number
+  adaptive_global_samples?: number
+  adaptive_sector_samples?: number
+  adaptive_symbol_samples?: number
 }
 
 export const BACKEND_SERVICE_OFFLINE = 'Backend Service Offline'

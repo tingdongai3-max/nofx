@@ -5,6 +5,7 @@ import (
 	"nofx/auth"
 	"nofx/config"
 	"nofx/crypto"
+	"nofx/kernel"
 	"nofx/logger"
 	"nofx/manager"
 	"nofx/market"
@@ -13,6 +14,7 @@ import (
 	"nofx/store"
 	"nofx/telegram"
 	"nofx/telemetry"
+	"nofx/trader"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -103,7 +105,13 @@ func main() {
 		logger.Fatalf("❌ Failed to initialize database: %v", err)
 	}
 	defer st.Close()
+
+	if _, err := store.ApplyShadowRoundTripFeeMigration(st); err != nil {
+		logger.Fatalf("❌ Failed to apply shadow round-trip fee migration: %v", err)
+	}
+
 	market.SetAdaptiveWeightStore(st)
+	kernel.SetLiveAttributionStore(st)
 
 	// Initialize installation ID for experience improvement (anonymous statistics)
 	initInstallationID(st)
@@ -122,10 +130,23 @@ func main() {
 
 	// Create TraderManager
 	traderManager := manager.NewTraderManager()
+	traderManager.AttachGlobalResonanceSniper(
+		trader.NewGlobalResonanceSniper(st, func() []*trader.AutoTrader {
+			rows := traderManager.GetAllTraders()
+			traders := make([]*trader.AutoTrader, 0, len(rows))
+			for _, at := range rows {
+				traders = append(traders, at)
+			}
+			return traders
+		}),
+	)
 
 	// Load all traders from database to memory (may auto-start traders with IsRunning=true)
 	if err := traderManager.LoadTradersFromStore(st); err != nil {
 		logger.Fatalf("❌ Failed to load traders: %v", err)
+	}
+	if err := traderManager.SyncGlobalResonanceSniper(); err != nil {
+		logger.Fatalf("❌ Failed to sync global resonance sniper: %v", err)
 	}
 
 	// Display loaded trader information

@@ -133,6 +133,18 @@ func (s *Server) setupRoutes() {
 			s.routeWithSchema(protected, "PUT", "/user/password", "Change current user password",
 				`Body: {"new_password":"<string, min 8 chars>"}`,
 				s.handleChangePassword)
+			s.routeWithSchema(protected, "PUT", "/config/real-backtest", "Toggle and tune system real backtest execution mode",
+				`Body: {"enabled":<bool>,"rb_max_margin_per_trade":<number>,"rb_reserve_margin":<number>,"rb_min_ev_threshold":<number>,"rb_max_ev_threshold":<number>}`,
+				s.handleUpdateRealBacktestConfig)
+			s.routeWithSchema(protected, "PUT", "/config/resonance-guard", "Tune adaptive entry resonance guard",
+				`Body: {"adaptive_entry_floor":<number, 0-60>,"adaptive_entry_lambda":<number, 0-1>}`,
+				s.handleUpdateResonanceGuardConfig)
+			s.routeWithSchema(protected, "PUT", "/config/adaptive-memory", "Tune adaptive memory depth for IC and performance bin recomputation",
+				`Body: {"adaptive_global_samples":<int, 500-10000>,"adaptive_sector_samples":<int, 300-5000>,"adaptive_symbol_samples":<int, 100-3000>}`,
+				s.handleUpdateAdaptiveMemoryConfig)
+			s.routeWithSchema(protected, "GET", "/real-backtest/positions", "Live real-backtest monitor payload",
+				`Returns current real-backtest mode status, summed physical equity, active resonance positions, and recent timed-exit trade logs.`,
+				s.handleRealBacktestPositions)
 
 			// Server IP query (requires authentication, for whitelist configuration)
 			s.route(protected, "GET", "/server-ip", "Get server public IP (for exchange whitelist)", s.handleGetServerIP)
@@ -386,10 +398,43 @@ func (s *Server) handleHealth(c *gin.Context) {
 // handleGetSystemConfig Get system configuration (configuration that client needs to know)
 func (s *Server) handleGetSystemConfig(c *gin.Context) {
 	userCount, _ := s.store.User().Count()
+	realBacktestConfig := store.RealBacktestSystemConfig{
+		MaxMarginPerTrade: 5.0,
+		ReserveMargin:     6.0,
+		MinEVThreshold:    0.001,
+		MaxEVThreshold:    0.0025,
+	}
+	if loadedConfig, err := s.store.GetRealBacktestConfig(); err != nil {
+		logger.Warnf("failed to load real backtest config: %v", err)
+	} else {
+		realBacktestConfig = loadedConfig
+	}
+	adaptiveMemoryConfig := store.DefaultAdaptiveMemoryConfig()
+	if loadedConfig, err := s.store.GetAdaptiveMemoryConfig(); err != nil {
+		logger.Warnf("failed to load adaptive memory config: %v", err)
+	} else {
+		adaptiveMemoryConfig = loadedConfig
+	}
+	resonanceGuardConfig := store.DefaultResonanceGuardConfig()
+	if loadedConfig, err := s.store.GetResonanceGuardConfig(); err != nil {
+		logger.Warnf("failed to load resonance guard config: %v", err)
+	} else {
+		resonanceGuardConfig = loadedConfig
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"initialized":      userCount > 0,
-		"btc_eth_leverage": 10,
-		"altcoin_leverage": 5,
+		"initialized":             userCount > 0,
+		"btc_eth_leverage":        10,
+		"altcoin_leverage":        5,
+		"real_backtest_enabled":   realBacktestConfig.Enabled,
+		"rb_max_margin_per_trade": realBacktestConfig.MaxMarginPerTrade,
+		"rb_reserve_margin":       realBacktestConfig.ReserveMargin,
+		"rb_min_ev_threshold":     realBacktestConfig.MinEVThreshold,
+		"rb_max_ev_threshold":     realBacktestConfig.MaxEVThreshold,
+		"adaptive_entry_floor":    resonanceGuardConfig.AdaptiveEntryFloor,
+		"adaptive_entry_lambda":   resonanceGuardConfig.AdaptiveEntryLambda,
+		"adaptive_global_samples": adaptiveMemoryConfig.GlobalSamples,
+		"adaptive_sector_samples": adaptiveMemoryConfig.SectorSamples,
+		"adaptive_symbol_samples": adaptiveMemoryConfig.SymbolSamples,
 	})
 }
 

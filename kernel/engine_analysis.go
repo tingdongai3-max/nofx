@@ -54,7 +54,10 @@ var (
 	reDecisionTag  = regexp.MustCompile(`(?s)<decision>(.*?)</decision>`)
 )
 
-const minimaxDecisionMaxTokens = 4096
+const (
+	minimaxDecisionMaxTokens = 4096
+	geminiDecisionMaxTokens  = 8192
+)
 
 // ============================================================================
 // Entry Functions - Main API
@@ -68,6 +71,24 @@ func GetFullDecision(ctx *Context, mcpClient mcp.AIClient) (*FullDecision, error
 	return GetFullDecisionWithStrategy(ctx, mcpClient, engine, "")
 }
 
+func PrepareContextWithStrategy(ctx *Context, engine *StrategyEngine) error {
+	if ctx == nil {
+		return fmt.Errorf("context is nil")
+	}
+	if engine == nil {
+		defaultConfig := store.GetDefaultStrategyConfig("en")
+		engine = NewStrategyEngine(&defaultConfig)
+	}
+
+	if len(ctx.MarketDataMap) == 0 {
+		if err := fetchMarketDataWithStrategy(ctx, engine); err != nil {
+			return fmt.Errorf("failed to fetch market data: %w", err)
+		}
+	}
+	recalculateCandidateLogicScores(ctx)
+	return nil
+}
+
 // GetFullDecisionWithStrategy uses StrategyEngine to get AI decision (unified prompt generation)
 func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *StrategyEngine, variant string) (*FullDecision, error) {
 	if ctx == nil {
@@ -79,12 +100,9 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 	}
 
 	// 1. Fetch market data using strategy config
-	if len(ctx.MarketDataMap) == 0 {
-		if err := fetchMarketDataWithStrategy(ctx, engine); err != nil {
-			return nil, fmt.Errorf("failed to fetch market data: %w", err)
-		}
+	if err := PrepareContextWithStrategy(ctx, engine); err != nil {
+		return nil, err
 	}
-	recalculateCandidateLogicScores(ctx)
 
 	// Ensure OITopDataMap is initialized
 	if ctx.OITopDataMap == nil {
@@ -102,6 +120,8 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 		}
 	}
 
+	engine.SetLiveAttributionWeights(ctx.LiveAttributionWeights)
+
 	// 2. Build System Prompt using strategy engine
 	riskConfig := engine.GetRiskControlConfig()
 	systemPrompt := engine.BuildSystemPrompt(ctx.Account.TotalEquity, variant)
@@ -109,14 +129,42 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 	// 3. Build User Prompt using strategy engine
 	userPrompt := engine.BuildUserPrompt(ctx)
 
-	ensureMiniMaxDecisionTokenBudget(mcpClient)
+	ensureDecisionTokenBudget(mcpClient)
+	maxTokens := currentDecisionMaxTokens(mcpClient)
 
 	// 4. Call AI API
+	req, buildErr := mcp.NewRequestBuilder().
+		WithSystemPrompt(systemPrompt).
+		WithUserPrompt(userPrompt).
+		Build()
+	if buildErr != nil {
+		return nil, fmt.Errorf("failed to build AI request: %w", buildErr)
+	}
 	aiCallStart := time.Now()
-	aiResponse, err := mcpClient.CallWithMessages(systemPrompt, userPrompt)
+	llmResponse, err := mcpClient.CallWithRequestFull(req)
 	aiCallDuration := time.Since(aiCallStart)
 	if err != nil {
 		return nil, fmt.Errorf("AI API call failed: %w", err)
+	}
+	aiResponse := llmResponse.Content
+	logger.Infof(
+		"🧾 AI response meta: finish_reason=%q usage(prompt=%d completion=%d total=%d) max_tokens=%d",
+		llmResponse.FinishReason,
+		llmResponse.PromptTokens,
+		llmResponse.CompletionTokens,
+		llmResponse.TotalTokens,
+		maxTokens,
+	)
+	if strings.TrimSpace(llmResponse.RawBodyTail) != "" {
+		logger.Infof("🧾 AI raw body tail: %s", llmResponse.RawBodyTail)
+	}
+	if isLikelyOutputTruncated(llmResponse, maxTokens) {
+		logger.Warnf(
+			"⚠️ AI response likely truncated: finish_reason=%q completion_tokens=%d max_tokens=%d",
+			llmResponse.FinishReason,
+			llmResponse.CompletionTokens,
+			maxTokens,
+		)
 	}
 
 	// 5. Parse AI response
@@ -138,6 +186,12 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 		decision.UserPrompt = userPrompt
 		decision.AIRequestDurationMs = aiCallDuration.Milliseconds()
 		decision.RawResponse = aiResponse
+		decision.AIFinishReason = llmResponse.FinishReason
+		decision.AIPromptTokens = llmResponse.PromptTokens
+		decision.AICompletionTokens = llmResponse.CompletionTokens
+		decision.AITotalTokens = llmResponse.TotalTokens
+		decision.AIRawBodyTail = llmResponse.RawBodyTail
+		decision.AIMaxTokens = maxTokens
 	}
 
 	if err != nil {
@@ -147,23 +201,59 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 	return decision, nil
 }
 
-func ensureMiniMaxDecisionTokenBudget(client mcp.AIClient) {
+func ensureDecisionTokenBudget(client mcp.AIClient) {
 	embedder, ok := client.(mcp.ClientEmbedder)
 	if !ok {
 		return
 	}
 
 	base := embedder.BaseClient()
-	if base == nil || base.Provider != mcp.ProviderMiniMax {
+	if base == nil {
 		return
 	}
 
-	if base.MaxTokens < minimaxDecisionMaxTokens {
-		base.MaxTokens = minimaxDecisionMaxTokens
+	requiredMaxTokens := 0
+	switch base.Provider {
+	case mcp.ProviderMiniMax:
+		requiredMaxTokens = minimaxDecisionMaxTokens
+	case mcp.ProviderGemini:
+		requiredMaxTokens = geminiDecisionMaxTokens
 	}
-	if base.Cfg != nil && base.Cfg.MaxTokens < minimaxDecisionMaxTokens {
-		base.Cfg.MaxTokens = minimaxDecisionMaxTokens
+	if requiredMaxTokens <= 0 {
+		return
 	}
+
+	if base.MaxTokens < requiredMaxTokens {
+		base.MaxTokens = requiredMaxTokens
+	}
+	if base.Cfg != nil && base.Cfg.MaxTokens < requiredMaxTokens {
+		base.Cfg.MaxTokens = requiredMaxTokens
+	}
+}
+
+func currentDecisionMaxTokens(client mcp.AIClient) int {
+	embedder, ok := client.(mcp.ClientEmbedder)
+	if !ok {
+		return 0
+	}
+	base := embedder.BaseClient()
+	if base == nil {
+		return 0
+	}
+	return base.MaxTokens
+}
+
+func isLikelyOutputTruncated(resp *mcp.LLMResponse, maxTokens int) bool {
+	if resp == nil {
+		return false
+	}
+	if strings.EqualFold(resp.FinishReason, "length") {
+		return true
+	}
+	if maxTokens <= 0 || resp.CompletionTokens <= 0 {
+		return false
+	}
+	return resp.CompletionTokens >= maxTokens-16
 }
 
 func recalculateCandidateLogicScores(ctx *Context) {

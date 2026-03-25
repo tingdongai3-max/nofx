@@ -85,4 +85,3 @@ func (t *apiCallTool) execute(req *apiRequest) string {
 	}
 	return string(body)
 }
-

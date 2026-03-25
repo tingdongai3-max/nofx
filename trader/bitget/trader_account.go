@@ -86,15 +86,18 @@ func (t *BitgetTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 	_, err := t.doRequest("POST", bitgetMarginModePath, body)
 	if err != nil {
 		if strings.Contains(err.Error(), "same") || strings.Contains(err.Error(), "already") {
+			t.isCrossMargin = isCrossMargin
 			return nil
 		}
 		if strings.Contains(err.Error(), "position") {
+			t.isCrossMargin = isCrossMargin
 			logger.Infof("  ⚠️ %s has positions, cannot change margin mode", symbol)
 			return nil
 		}
 		return err
 	}
 
+	t.isCrossMargin = isCrossMargin
 	logger.Infof("  ✓ %s margin mode set to %s", symbol, marginMode)
 	return nil
 }

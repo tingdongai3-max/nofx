@@ -356,7 +356,6 @@ func formatKlineDataZH(symbol string, tfData map[string]*market.TimeframeSeriesD
 	return sb.String()
 }
 
-
 // getOIInterpretationZH returns OI change interpretation (Chinese)
 func getOIInterpretationZH(oiChange, priceChange string) string {
 	if oiChange == "增加" && priceChange == "上涨" {
@@ -620,7 +619,6 @@ func formatKlineDataEN(symbol string, tfData map[string]*market.TimeframeSeriesD
 
 	return sb.String()
 }
-
 
 // getOIInterpretationEN returns OI change interpretation (English)
 func getOIInterpretationEN(oiChange, priceChange string) string {

@@ -178,9 +178,16 @@ type TraderPosition struct {
 	ExitPrice          float64               `gorm:"column:exit_price;default:0" json:"exit_price"`
 	ExitOrderID        string                `gorm:"column:exit_order_id;default:''" json:"exit_order_id"`
 	ExitTime           int64                 `gorm:"column:exit_time;index:idx_positions_exit" json:"exit_time"` // Unix milliseconds UTC, 0 means not set
+	AutoCloseAt        int64                 `gorm:"column:auto_close_at;default:0;index:idx_positions_auto_close" json:"auto_close_at"`
 	RealizedPnL        float64               `gorm:"column:realized_pnl;default:0" json:"realized_pnl"`
 	Fee                float64               `gorm:"column:fee;default:0" json:"fee"`
 	Leverage           int                   `gorm:"column:leverage;default:1" json:"leverage"`
+	EntryLogicScore    float64               `gorm:"column:entry_logic_score;default:0" json:"entry_logic_score"`
+	EntryExpectedEV    float64               `gorm:"column:entry_expected_ev;default:0" json:"entry_expected_ev"`
+	ExitSignalStatus   string                `gorm:"column:exit_signal_status;default:''" json:"exit_signal_status"`
+	ExitSignaledAt     int64                 `gorm:"column:exit_signaled_at;default:0" json:"exit_signaled_at"`
+	ExitSignalScore    float64               `gorm:"column:exit_signal_score;default:0" json:"exit_signal_score"`
+	ExitSignalVector   string                `gorm:"column:exit_signal_vector;default:''" json:"exit_signal_vector"`
 	Status             string                `gorm:"column:status;default:OPEN;index:idx_positions_status" json:"status"`
 	CloseReason        string                `gorm:"column:close_reason;default:''" json:"close_reason"`
 	Source             string                `gorm:"column:source;default:system" json:"source"`
@@ -229,9 +236,17 @@ func (s *PositionStore) InitTables() error {
 			}
 
 			s.db.Exec(`ALTER TABLE trader_positions ADD COLUMN IF NOT EXISTS telemetry JSONB NOT NULL DEFAULT '[]'::jsonb`)
+			s.db.Exec(`ALTER TABLE trader_positions ADD COLUMN IF NOT EXISTS auto_close_at BIGINT NOT NULL DEFAULT 0`)
+			s.db.Exec(`ALTER TABLE trader_positions ADD COLUMN IF NOT EXISTS entry_logic_score DOUBLE PRECISION NOT NULL DEFAULT 0`)
+			s.db.Exec(`ALTER TABLE trader_positions ADD COLUMN IF NOT EXISTS entry_expected_ev DOUBLE PRECISION NOT NULL DEFAULT 0`)
+			s.db.Exec(`ALTER TABLE trader_positions ADD COLUMN IF NOT EXISTS exit_signal_status TEXT NOT NULL DEFAULT ''`)
+			s.db.Exec(`ALTER TABLE trader_positions ADD COLUMN IF NOT EXISTS exit_signaled_at BIGINT NOT NULL DEFAULT 0`)
+			s.db.Exec(`ALTER TABLE trader_positions ADD COLUMN IF NOT EXISTS exit_signal_score DOUBLE PRECISION NOT NULL DEFAULT 0`)
+			s.db.Exec(`ALTER TABLE trader_positions ADD COLUMN IF NOT EXISTS exit_signal_vector TEXT NOT NULL DEFAULT ''`)
 
 			// Just ensure index exists
 			s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_exchange_pos_unique ON trader_positions(exchange_id, exchange_position_id) WHERE exchange_position_id != ''`)
+			s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_positions_auto_close ON trader_positions(auto_close_at)`)
 			return nil
 		}
 	}
@@ -250,6 +265,16 @@ func (s *PositionStore) InitTables() error {
 	if err := s.db.Exec(indexSQL).Error; err != nil {
 		if !strings.Contains(err.Error(), "already exists") && !strings.Contains(err.Error(), "UNIQUE constraint failed") {
 			return fmt.Errorf("failed to create unique index: %w", err)
+		}
+	}
+	if err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_positions_auto_close ON trader_positions(auto_close_at)`).Error; err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("failed to create auto_close_at index: %w", err)
+		}
+	}
+	if err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_positions_exit_signal_status ON trader_positions(exit_signal_status)`).Error; err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("failed to create exit_signal_status index: %w", err)
 		}
 	}
 
@@ -429,6 +454,26 @@ func (s *PositionStore) GetOpenPositions(traderID string) ([]*TraderPosition, er
 	return positions, nil
 }
 
+// GetRecentTrajectoryPositions returns positions that entered within the
+// trajectory window and should continue contributing dense samples.
+func (s *PositionStore) GetRecentTrajectoryPositions(traderID string, cutoffEntryTime int64) ([]*TraderPosition, error) {
+	var positions []*TraderPosition
+	query := s.db.Where("trader_id = ? AND entry_time >= ? AND status != ?", traderID, cutoffEntryTime, "CANCELED")
+	err := query.Order("entry_time DESC").
+		Find(&positions).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to query recent trajectory positions: %w", err)
+	}
+
+	for _, pos := range positions {
+		if pos.EntryQuantity == 0 {
+			pos.EntryQuantity = pos.Quantity
+		}
+		pos.Telemetry = normalizeTelemetrySeries(pos.Telemetry)
+	}
+	return positions, nil
+}
+
 // GetOpenPositionBySymbol gets open position for specified symbol and direction
 func (s *PositionStore) GetOpenPositionBySymbol(traderID, symbol, side string) (*TraderPosition, error) {
 	var pos TraderPosition
@@ -464,6 +509,112 @@ func (s *PositionStore) GetOpenPositionBySymbol(traderID, symbol, side string) (
 	return nil, err
 }
 
+// GetOpenPositionByID gets an OPEN position by primary key.
+func (s *PositionStore) GetOpenPositionByID(id int64) (*TraderPosition, error) {
+	if id <= 0 {
+		return nil, nil
+	}
+
+	var pos TraderPosition
+	err := s.db.Where("id = ? AND status = ?", id, "OPEN").First(&pos).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if pos.EntryQuantity == 0 {
+		pos.EntryQuantity = pos.Quantity
+	}
+	pos.Telemetry = normalizeTelemetrySeries(pos.Telemetry)
+	return &pos, nil
+}
+
+// GetPositionByID gets a position by primary key regardless of status.
+func (s *PositionStore) GetPositionByID(id int64) (*TraderPosition, error) {
+	if id <= 0 {
+		return nil, nil
+	}
+
+	var pos TraderPosition
+	if err := s.db.First(&pos, id).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if pos.EntryQuantity == 0 {
+		pos.EntryQuantity = pos.Quantity
+	}
+	pos.Telemetry = normalizeTelemetrySeries(pos.Telemetry)
+	return &pos, nil
+}
+
+// MarkPositionClosing transitions an OPEN position to CLOSING.
+// Returns true if the row was updated.
+func (s *PositionStore) MarkPositionClosing(id int64, closeReason string) (bool, error) {
+	if id <= 0 {
+		return false, nil
+	}
+
+	nowMs := time.Now().UTC().UnixMilli()
+	updates := map[string]interface{}{
+		"status":       "CLOSING",
+		"close_reason": closeReason,
+		"updated_at":   nowMs,
+	}
+	result := s.db.Model(&TraderPosition{}).
+		Where("id = ? AND status = ?", id, "OPEN").
+		Updates(updates)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// MarkPositionExitSignaled tags an OPEN position as having triggered an exit signal.
+// Returns true if the row was updated.
+func (s *PositionStore) MarkPositionExitSignaled(id int64, signalScore float64, signalVector string) (bool, error) {
+	if id <= 0 {
+		return false, nil
+	}
+
+	nowMs := time.Now().UTC().UnixMilli()
+	updates := map[string]interface{}{
+		"exit_signal_status": "Exit_Signaled",
+		"exit_signaled_at":   nowMs,
+		"exit_signal_score":  signalScore,
+		"exit_signal_vector": signalVector,
+		"updated_at":         nowMs,
+	}
+	result := s.db.Model(&TraderPosition{}).
+		Where("id = ? AND status = ? AND (exit_signaled_at = 0 OR exit_signal_status = '')", id, "OPEN").
+		Updates(updates)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// ReopenClosingPosition reverts a CLOSING position back to OPEN.
+// This is used when an in-flight market close request fails and the position should be retried.
+func (s *PositionStore) ReopenClosingPosition(id int64) error {
+	if id <= 0 {
+		return nil
+	}
+
+	nowMs := time.Now().UTC().UnixMilli()
+	return s.db.Model(&TraderPosition{}).
+		Where("id = ? AND status = ?", id, "CLOSING").
+		Updates(map[string]interface{}{
+			"status":       "OPEN",
+			"close_reason": "",
+			"updated_at":   nowMs,
+		}).Error
+}
+
 // GetClosedPositions gets closed positions
 func (s *PositionStore) GetClosedPositions(traderID string, limit int) ([]*TraderPosition, error) {
 	var positions []*TraderPosition
@@ -494,6 +645,35 @@ func (s *PositionStore) GetAllOpenPositions() ([]*TraderPosition, error) {
 		return nil, fmt.Errorf("failed to query all open positions: %w", err)
 	}
 
+	for _, pos := range positions {
+		if pos.EntryQuantity == 0 {
+			pos.EntryQuantity = pos.Quantity
+		}
+		pos.Telemetry = normalizeTelemetrySeries(pos.Telemetry)
+	}
+	return positions, nil
+}
+
+// GetExpiredAutoClosePositions returns still-open positions whose forced close time has passed.
+// It prefers the persisted auto_close_at value, but also falls back to entry_time-based timing
+// for legacy real-backtest positions that were opened before auto_close_at was populated.
+func (s *PositionStore) GetExpiredAutoClosePositions(traderID string, nowMs int64, holdDurationMs int64) ([]*TraderPosition, error) {
+	var positions []*TraderPosition
+	query := s.db.Where("trader_id = ? AND status = ?", traderID, "OPEN")
+	if holdDurationMs > 0 {
+		query = query.Where(
+			"(auto_close_at > 0 AND auto_close_at <= ?) OR (auto_close_at = 0 AND entry_time + ? <= ?)",
+			nowMs,
+			holdDurationMs,
+			nowMs,
+		)
+	} else {
+		query = query.Where("auto_close_at > 0 AND auto_close_at <= ?", nowMs)
+	}
+	err := query.Order("auto_close_at ASC, entry_time ASC").Find(&positions).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to query expired auto-close positions: %w", err)
+	}
 	for _, pos := range positions {
 		if pos.EntryQuantity == 0 {
 			pos.EntryQuantity = pos.Quantity

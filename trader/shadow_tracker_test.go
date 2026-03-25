@@ -1,6 +1,7 @@
 package trader
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -314,6 +315,11 @@ func TestAutoTraderShadowFillAuditDecoupledFromCurrentCandidates(t *testing.T) {
 	}
 	if rows[0].PriceT1 <= 0 {
 		t.Fatalf("expected filled price, got %.4f", rows[0].PriceT1)
+	}
+	expectedGross := (0.1921 - 0.1862) / 0.1862
+	expectedNet := expectedGross - ShadowRoundTripFeeRate
+	if math.Abs(rows[0].ReturnPct-expectedNet) > 1e-9 {
+		t.Fatalf("expected net return_pct %.6f, got %.6f", expectedNet, rows[0].ReturnPct)
 	}
 
 	t.Logf("Decoupled fill verified with empty current candidate snapshot for %s", rows[0].Symbol)

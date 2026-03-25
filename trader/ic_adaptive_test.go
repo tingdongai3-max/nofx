@@ -313,3 +313,88 @@ func TestAdaptiveWeightStateUses2000SectorBlendTarget(t *testing.T) {
 		state.CoinSampleCount,
 	)
 }
+
+func TestAdaptiveWeightStateIsSharedAcrossTraders(t *testing.T) {
+	dbPath := filepath.Join("/tmp", "nofx_ic_shared_global.db")
+	_ = os.Remove(dbPath)
+	gdb, err := store.InitGorm(dbPath)
+	if err != nil {
+		t.Fatalf("open gorm db: %v", err)
+	}
+
+	st, err := store.NewFromGorm(gdb)
+	if err != nil {
+		t.Fatalf("create store from gorm: %v", err)
+	}
+	defer st.Close()
+	if err := st.GormDB().AutoMigrate(&store.ShadowSnapshot{}); err != nil {
+		t.Fatalf("init shadow tables: %v", err)
+	}
+
+	const sampleCount = 64
+	baseTime := time.Now().UTC().Add(-3 * time.Hour)
+	rows := make([]*store.ShadowSnapshot, 0, sampleCount)
+	for i := 0; i < sampleCount; i++ {
+		progress := float64(i) / float64(sampleCount-1)
+		returnPct := -0.04 + progress*0.08
+		rows = append(rows, &store.ShadowSnapshot{
+			TraderID:           "shared-ai-a",
+			DecisionTime:       baseTime.Add(time.Duration(i) * time.Minute).UnixMilli(),
+			Symbol:             "SYNCUSDT",
+			Sector:             "AI",
+			ActionTaken:        i % 2,
+			PriceT0:            100 + float64(i)/10,
+			HeatScore:          52 + progress*18,
+			MarketFactor:       80 - progress*50,
+			TrendFactor:        30 + progress*45,
+			DonchianFactor:     34 + progress*38,
+			VolumeSpikeFactor:  25 + progress*42,
+			MTFResonanceFactor: 22 + progress*44,
+			QuantFactor:        38 + progress*20,
+			QuantOIRaw:         1 + progress*5,
+			QuantImbalanceRaw:  0.04 + progress*0.18,
+			QuantNetflowRaw:    0.8 + progress*2.5,
+			SocialFactor:       24 + progress*36,
+			SocialRankRaw:      0.2 + progress*0.55,
+			SocialUpvoteRaw:    40 + progress*22,
+			OnChainFactor:      45 + progress*10,
+			OnChainRatioRaw:    0.5 + progress*0.8,
+			OnChainBuyRaw:      0.44 + progress*0.16,
+			Filled:             true,
+			PriceT1:            (100 + float64(i)/10) * (1 + returnPct),
+			ReturnPct:          returnPct,
+			FilledAt:           baseTime.Add(time.Duration(i+15) * time.Minute).UnixMilli(),
+			CreatedAt:          baseTime.Add(time.Duration(i) * time.Minute).UnixMilli(),
+			UpdatedAt:          baseTime.Add(time.Duration(i+15) * time.Minute).UnixMilli(),
+		})
+	}
+	if err := st.Shadow().CreateBatch(rows); err != nil {
+		t.Fatalf("create shared adaptive rows: %v", err)
+	}
+
+	market.SetAdaptiveWeightStore(st)
+	defer market.SetAdaptiveWeightStore(nil)
+	market.InvalidateAdaptiveWeightScope("")
+
+	stateA := market.GetAdaptiveWeightState("shared-ai-a", "AI", "SYNCUSDT")
+	stateB := market.GetAdaptiveWeightState("shared-ai-b", "AI", "SYNCUSDT")
+
+	if stateA.TraderID != store.GlobalConsensusTraderID {
+		t.Fatalf("expected shared pool trader id %q, got %q", store.GlobalConsensusTraderID, stateA.TraderID)
+	}
+	if stateB.TraderID != store.GlobalConsensusTraderID {
+		t.Fatalf("expected shared pool trader id %q, got %q", store.GlobalConsensusTraderID, stateB.TraderID)
+	}
+	if stateA.SampleCount != sampleCount || stateB.SampleCount != sampleCount {
+		t.Fatalf("expected shared sample count %d, got A=%d B=%d", sampleCount, stateA.SampleCount, stateB.SampleCount)
+	}
+	if stateA.CoinSampleCount != sampleCount || stateB.CoinSampleCount != sampleCount {
+		t.Fatalf("expected shared coin sample count %d, got A=%d B=%d", sampleCount, stateA.CoinSampleCount, stateB.CoinSampleCount)
+	}
+	if stateA.GetWeightSignature() != stateB.GetWeightSignature() {
+		t.Fatalf("expected identical shared DNA signature, got A=%s B=%s", stateA.GetWeightSignature(), stateB.GetWeightSignature())
+	}
+	if math.Abs(stateA.BlendAdaptive-stateB.BlendAdaptive) > 1e-9 {
+		t.Fatalf("expected identical adaptive blend, got A=%.8f B=%.8f", stateA.BlendAdaptive, stateB.BlendAdaptive)
+	}
+}

@@ -16,6 +16,7 @@ import { StrategyStudioPage } from './pages/StrategyStudioPage'
 import { StrategyMarketPage } from './pages/StrategyMarketPage'
 import { CandidateDashboardPage } from './pages/CandidateDashboardPage'
 import { DataLabPage } from './pages/DataLabPage'
+import { RealLiveMonitor } from './pages/RealLiveMonitor'
 import { LoginRequiredOverlay } from './components/auth/LoginRequiredOverlay'
 import HeaderBar from './components/common/HeaderBar'
 import { LanguageProvider, useLanguage } from './contexts/LanguageContext'
@@ -440,6 +441,27 @@ export function App() {
       </div>
     )
   }
+  if (route === '/real-backtest') {
+    if (!user || !token) {
+      window.location.href = '/login'
+      return null
+    }
+    return (
+      <div className="min-h-screen" style={{ background: '#0B0E11', color: '#EAECEF' }}>
+        <HeaderBar
+          isLoggedIn={!!user}
+          currentPage="traders"
+          language={language}
+          onLanguageChange={setLanguage}
+          user={user}
+          onLogout={logout}
+          onLoginRequired={handleLoginRequired}
+          onPageChange={navigateToPage}
+        />
+        <RealLiveMonitor language={language} />
+      </div>
+    )
+  }
   // Data page - publicly accessible with embedded dashboard
   if (route === '/data' || route === '/candidate-data') {
     if (!user || !token) {
@@ -539,23 +561,7 @@ export function App() {
           onPageChange={labPageNavigate}
         />
         <main className="pt-16">
-          <DataLabPage
-            language={language}
-            selectedTrader={selectedTrader}
-            selectedTraderId={selectedTraderId}
-            traders={traders}
-            onTraderSelect={(traderId) => {
-              setSelectedTraderId(traderId)
-              const url = new URL(window.location.href)
-              const trader = traders?.find((t) => t.trader_id === traderId)
-              if (trader) {
-                url.searchParams.set('trader', getTraderSlug(trader))
-              } else {
-                url.searchParams.delete('trader')
-              }
-              window.history.replaceState({}, '', url.toString())
-            }}
-          />
+          <DataLabPage language={language} />
         </main>
         <LoginRequiredOverlay
           isOpen={loginOverlayOpen}
@@ -620,21 +626,7 @@ export function App() {
                 }}
               />
             ) : currentPage === 'lab' ? (
-              <DataLabPage
-                language={language}
-                selectedTrader={selectedTrader}
-                selectedTraderId={selectedTraderId}
-                traders={traders}
-                onTraderSelect={(traderId) => {
-                  setSelectedTraderId(traderId)
-                  const trader = traders?.find(t => t.trader_id === traderId)
-                  if (trader) {
-                    const url = new URL(window.location.href)
-                    url.searchParams.set('trader', getTraderSlug(trader))
-                    window.history.replaceState({}, '', url.toString())
-                  }
-                }}
-              />
+              <DataLabPage language={language} />
             ) : currentPage === 'strategy-market' ? (
               <StrategyMarketPage />
             ) : currentPage === 'traders' ? (

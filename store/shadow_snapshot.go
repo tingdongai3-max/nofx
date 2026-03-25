@@ -21,41 +21,48 @@ var (
 
 // ShadowSnapshot stores the full T0 candidate cross-section plus the T+N realized outcome.
 type ShadowSnapshot struct {
-	ID                 uint    `gorm:"primaryKey" json:"id"`
-	TraderID           string  `gorm:"column:trader_id;not null;index:idx_shadow_trader_time,priority:1;uniqueIndex:uidx_shadow_batch_symbol,priority:1" json:"trader_id"`
-	DecisionTime       int64   `gorm:"column:decision_time;not null;index:idx_shadow_trader_time,priority:2;index:idx_shadow_fill_due,priority:2;uniqueIndex:uidx_shadow_batch_symbol,priority:2" json:"decision_time"`
-	Symbol             string  `gorm:"column:symbol;not null;uniqueIndex:uidx_shadow_batch_symbol,priority:3" json:"symbol"`
-	Sector             string  `gorm:"column:sector;default:'';index" json:"sector"`
-	ActionTaken        int     `gorm:"column:action_taken;not null;default:0" json:"action_taken"`
-	PriceT0            float64 `gorm:"column:price_t0;not null;default:0" json:"price_t0"`
-	HeatScore          float64 `gorm:"column:heat_score;default:0" json:"heat_score"`
-	TradingSub         float64 `gorm:"column:trading_sub;default:0" json:"trading_sub"`
-	QuantSub           float64 `gorm:"column:quant_sub;default:0" json:"quant_sub"`
-	MarketFactor       float64 `gorm:"column:market_factor;default:0" json:"market_factor"`
-	TrendFactor        float64 `gorm:"column:trend_factor;default:0" json:"trend_factor"`
-	DonchianFactor     float64 `gorm:"column:donchian_factor;default:0" json:"-"`
-	VolumeSpikeFactor  float64 `gorm:"column:volume_spike_factor;default:0" json:"volume_spike_factor"`
-	MTFResonanceFactor float64 `gorm:"column:mtf_resonance_factor;default:0" json:"-"`
-	QuantFactor        float64 `gorm:"column:quant_factor;default:0" json:"quant_factor"`
-	QuantOIRaw         float64 `gorm:"column:quant_oi_raw;default:0" json:"-"`
-	QuantImbalanceRaw  float64 `gorm:"column:quant_imbalance_raw;default:0" json:"-"`
-	QuantNetflowRaw    float64 `gorm:"column:quant_netflow_raw;default:0" json:"-"`
-	SocialFactor       float64 `gorm:"column:social_factor;default:0" json:"social_factor"`
-	SocialRankRaw      float64 `gorm:"column:social_rank_raw;default:0" json:"-"`
-	SocialUpvoteRaw    float64 `gorm:"column:social_upvote_raw;default:0" json:"-"`
-	OnChainFactor      float64 `gorm:"column:onchain_factor;default:0" json:"onchain_factor"`
-	OnChainRatioRaw    float64 `gorm:"column:onchain_ratio_raw;default:0" json:"-"`
-	OnChainBuyRaw      float64 `gorm:"column:onchain_buy_raw;default:0" json:"-"`
-	RawFactors         string  `gorm:"column:raw_factors;type:text;default:''" json:"raw_factors,omitempty"`
-	VolUtilization     float64 `gorm:"column:vol_utilization;default:0" json:"vol_utilization"`
-	FundingRate        float64 `gorm:"column:funding_rate;default:0" json:"funding_rate"`
-	SourceSummary      string  `gorm:"column:source_summary;default:''" json:"source_summary"`
-	Filled             bool    `gorm:"column:filled;not null;default:false;index:idx_shadow_fill_due,priority:1" json:"filled"`
-	PriceT1            float64 `gorm:"column:price_t1;default:0" json:"price_t1"`
-	ReturnPct          float64 `gorm:"column:return_pct;default:0" json:"return_pct"`
-	FilledAt           int64   `gorm:"column:filled_at;default:0" json:"filled_at"`
-	CreatedAt          int64   `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt          int64   `gorm:"column:updated_at;not null" json:"updated_at"`
+	ID                   uint    `gorm:"primaryKey" json:"id"`
+	TraderID             string  `gorm:"column:trader_id;not null;index:idx_shadow_trader_time,priority:1;uniqueIndex:uidx_shadow_batch_symbol,priority:1" json:"trader_id"`
+	DecisionTime         int64   `gorm:"column:decision_time;not null;index:idx_shadow_trader_time,priority:2;index:idx_shadow_fill_due,priority:2;uniqueIndex:uidx_shadow_batch_symbol,priority:2" json:"decision_time"`
+	Symbol               string  `gorm:"column:symbol;not null;uniqueIndex:uidx_shadow_batch_symbol,priority:3" json:"symbol"`
+	Sector               string  `gorm:"column:sector;default:'';index" json:"sector"`
+	ActionTaken          int     `gorm:"column:action_taken;not null;default:0" json:"action_taken"`
+	PriceT0              float64 `gorm:"column:price_t0;not null;default:0" json:"price_t0"`
+	HeatScore            float64 `gorm:"column:heat_score;default:0" json:"heat_score"`
+	TradingSub           float64 `gorm:"column:trading_sub;default:0" json:"trading_sub"`
+	QuantSub             float64 `gorm:"column:quant_sub;default:0" json:"quant_sub"`
+	MarketFactor         float64 `gorm:"column:market_factor;default:0" json:"market_factor"`
+	TrendFactor          float64 `gorm:"column:trend_factor;default:0" json:"trend_factor"`
+	DonchianFactor       float64 `gorm:"column:donchian_factor;default:0" json:"-"`
+	VolumeSpikeFactor    float64 `gorm:"column:volume_spike_factor;default:0" json:"volume_spike_factor"`
+	MTFResonanceFactor   float64 `gorm:"column:mtf_resonance_factor;default:0" json:"-"`
+	QuantFactor          float64 `gorm:"column:quant_factor;default:0" json:"quant_factor"`
+	QuantOIRaw           float64 `gorm:"column:quant_oi_raw;default:0" json:"-"`
+	QuantImbalanceRaw    float64 `gorm:"column:quant_imbalance_raw;default:0" json:"-"`
+	QuantNetflowRaw      float64 `gorm:"column:quant_netflow_raw;default:0" json:"-"`
+	SocialFactor         float64 `gorm:"column:social_factor;default:0" json:"social_factor"`
+	SocialRankRaw        float64 `gorm:"column:social_rank_raw;default:0" json:"-"`
+	SocialUpvoteRaw      float64 `gorm:"column:social_upvote_raw;default:0" json:"-"`
+	OnChainFactor        float64 `gorm:"column:onchain_factor;default:0" json:"onchain_factor"`
+	OnChainRatioRaw      float64 `gorm:"column:onchain_ratio_raw;default:0" json:"-"`
+	OnChainBuyRaw        float64 `gorm:"column:onchain_buy_raw;default:0" json:"-"`
+	RawFactors           string  `gorm:"column:raw_factors;type:text;default:''" json:"raw_factors,omitempty"`
+	VolUtilization       float64 `gorm:"column:vol_utilization;default:0" json:"vol_utilization"`
+	FundingRate          float64 `gorm:"column:funding_rate;default:0" json:"funding_rate"`
+	SourceSummary        string  `gorm:"column:source_summary;default:''" json:"source_summary"`
+	ArchetypeLabel       string  `gorm:"column:archetype_label;default:'';index" json:"archetype_label,omitempty"`
+	ArchetypeDistance    float64 `gorm:"column:archetype_distance;default:0" json:"archetype_distance,omitempty"`
+	ArchetypeThreshold   float64 `gorm:"column:archetype_threshold;default:0" json:"archetype_threshold,omitempty"`
+	Incubating           bool    `gorm:"column:incubating;not null;default:false;index" json:"incubating,omitempty"`
+	IncubationPromoted   bool    `gorm:"column:incubation_promoted;not null;default:false;index" json:"incubation_promoted,omitempty"`
+	IncubationReleasedAt int64   `gorm:"column:incubation_released_at;default:0" json:"incubation_released_at,omitempty"`
+	KnnAuditTag          string  `gorm:"column:knn_audit_tag;default:'';index" json:"knn_audit_tag,omitempty"`
+	Filled               bool    `gorm:"column:filled;not null;default:false;index:idx_shadow_fill_due,priority:1" json:"filled"`
+	PriceT1              float64 `gorm:"column:price_t1;default:0" json:"price_t1"`
+	ReturnPct            float64 `gorm:"column:return_pct;default:0" json:"return_pct"`
+	FilledAt             int64   `gorm:"column:filled_at;default:0" json:"filled_at"`
+	CreatedAt            int64   `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt            int64   `gorm:"column:updated_at;not null" json:"updated_at"`
 }
 
 // ShadowRawFactors stores the underlying subfactor z-scores and availability
@@ -115,7 +122,9 @@ type ScoreBinPerformance struct {
 }
 
 const (
+	GlobalConsensusTraderID         = "GLOBAL_CONSENSUS"
 	PERFORMANCE_SYMBOL_LIMIT        = 5000
+	PERFORMANCE_RECENT_SAMPLE_LIMIT = 200
 	PERFORMANCE_TIME_WINDOW         = 7 * 24 * time.Hour
 	CONFIDENCE_THRESHOLD_MIN        = 30
 	PERFORMANCE_SMOOTHING_STEP      = 1
@@ -141,6 +150,21 @@ func NormalizePerformanceWindowSize(windowSize int) int {
 
 func (ShadowSnapshot) TableName() string {
 	return "shadow_snapshots"
+}
+
+func isGlobalConsensusTraderID(traderID string) bool {
+	return strings.EqualFold(strings.TrimSpace(traderID), GlobalConsensusTraderID)
+}
+
+func cloneShadowSnapshotForConsensus(row *ShadowSnapshot) *ShadowSnapshot {
+	if row == nil || isGlobalConsensusTraderID(row.TraderID) {
+		return nil
+	}
+
+	copyRow := *row
+	copyRow.ID = 0
+	copyRow.TraderID = GlobalConsensusTraderID
+	return &copyRow
 }
 
 // RegisterCacheRefreshHook registers a callback executed by RefreshCache.
@@ -200,7 +224,51 @@ func NewShadowSnapshotStore(db *gorm.DB) *ShadowSnapshotStore {
 }
 
 func (s *ShadowSnapshotStore) initTables() error {
-	return s.db.AutoMigrate(&ShadowSnapshot{})
+	if err := s.db.AutoMigrate(&ShadowSnapshot{}); err != nil {
+		return err
+	}
+	if err := s.dropLegacyShadowExitTrainingArtifacts(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *ShadowSnapshotStore) dropLegacyShadowExitTrainingArtifacts() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+
+	if err := s.db.Exec(`DROP INDEX IF EXISTS uidx_shadow_exit_training_snapshot`).Error; err != nil {
+		return fmt.Errorf("failed to drop legacy shadow exit training unique index: %w", err)
+	}
+	if err := s.db.Exec(`DROP INDEX IF EXISTS uidx_shadow_exit_training_path`).Error; err != nil {
+		return fmt.Errorf("failed to drop shadow exit training path index: %w", err)
+	}
+	if err := s.db.Exec(`DROP INDEX IF EXISTS idx_shadow_exit_training_snapshot`).Error; err != nil {
+		return fmt.Errorf("failed to drop shadow exit training snapshot index: %w", err)
+	}
+	if err := s.db.Exec(`DROP INDEX IF EXISTS idx_shadow_exit_training_direction_dim`).Error; err != nil {
+		return fmt.Errorf("failed to drop shadow exit training direction dimension index: %w", err)
+	}
+	if err := s.db.Exec(`DROP INDEX IF EXISTS idx_shadow_exit_training_direction_bucket`).Error; err != nil {
+		return fmt.Errorf("failed to drop shadow exit training direction bucket index: %w", err)
+	}
+	if err := s.db.Exec(`DROP INDEX IF EXISTS idx_shadow_exit_training_leading_factor`).Error; err != nil {
+		return fmt.Errorf("failed to drop shadow exit training leading factor index: %w", err)
+	}
+	if err := s.db.Exec(`DROP INDEX IF EXISTS idx_shadow_exit_training_pending`).Error; err != nil {
+		return fmt.Errorf("failed to drop shadow exit training pending index: %w", err)
+	}
+	if err := s.db.Exec(`DROP INDEX IF EXISTS idx_shadow_exit_training_symbol_time`).Error; err != nil {
+		return fmt.Errorf("failed to drop shadow exit training symbol time index: %w", err)
+	}
+	if err := s.db.Exec(`DROP INDEX IF EXISTS idx_shadow_exit_training_trader_time`).Error; err != nil {
+		return fmt.Errorf("failed to drop shadow exit training trader time index: %w", err)
+	}
+	if err := s.db.Exec(`DROP TABLE IF EXISTS shadow_exit_training`).Error; err != nil {
+		return fmt.Errorf("failed to drop shadow exit training table: %w", err)
+	}
+	return nil
 }
 
 func (s *ShadowSnapshotStore) CreateBatch(snapshots []*ShadowSnapshot) error {
@@ -208,6 +276,7 @@ func (s *ShadowSnapshotStore) CreateBatch(snapshots []*ShadowSnapshot) error {
 		return nil
 	}
 
+	rowsToPersist := make([]*ShadowSnapshot, 0, len(snapshots)*2)
 	nowMs := time.Now().UTC().UnixMilli()
 	for _, snapshot := range snapshots {
 		if snapshot == nil {
@@ -219,6 +288,13 @@ func (s *ShadowSnapshotStore) CreateBatch(snapshots []*ShadowSnapshot) error {
 		if snapshot.UpdatedAt == 0 {
 			snapshot.UpdatedAt = snapshot.CreatedAt
 		}
+		rowsToPersist = append(rowsToPersist, snapshot)
+		if consensusRow := cloneShadowSnapshotForConsensus(snapshot); consensusRow != nil {
+			rowsToPersist = append(rowsToPersist, consensusRow)
+		}
+	}
+	if len(rowsToPersist) == 0 {
+		return nil
 	}
 
 	return s.db.Clauses(clause.OnConflict{
@@ -228,38 +304,45 @@ func (s *ShadowSnapshotStore) CreateBatch(snapshots []*ShadowSnapshot) error {
 			{Name: "symbol"},
 		},
 		DoUpdates: clause.Assignments(map[string]interface{}{
-			"action_taken":         gorm.Expr("excluded.action_taken"),
-			"price_t0":             gorm.Expr("excluded.price_t0"),
-			"sector":               gorm.Expr("excluded.sector"),
-			"heat_score":           gorm.Expr("excluded.heat_score"),
-			"trading_sub":          gorm.Expr("excluded.trading_sub"),
-			"quant_sub":            gorm.Expr("excluded.quant_sub"),
-			"market_factor":        gorm.Expr("excluded.market_factor"),
-			"trend_factor":         gorm.Expr("excluded.trend_factor"),
-			"donchian_factor":      gorm.Expr("excluded.donchian_factor"),
-			"volume_spike_factor":  gorm.Expr("excluded.volume_spike_factor"),
-			"mtf_resonance_factor": gorm.Expr("excluded.mtf_resonance_factor"),
-			"quant_factor":         gorm.Expr("excluded.quant_factor"),
-			"quant_oi_raw":         gorm.Expr("excluded.quant_oi_raw"),
-			"quant_imbalance_raw":  gorm.Expr("excluded.quant_imbalance_raw"),
-			"quant_netflow_raw":    gorm.Expr("excluded.quant_netflow_raw"),
-			"social_factor":        gorm.Expr("excluded.social_factor"),
-			"social_rank_raw":      gorm.Expr("excluded.social_rank_raw"),
-			"social_upvote_raw":    gorm.Expr("excluded.social_upvote_raw"),
-			"onchain_factor":       gorm.Expr("excluded.onchain_factor"),
-			"onchain_ratio_raw":    gorm.Expr("excluded.onchain_ratio_raw"),
-			"onchain_buy_raw":      gorm.Expr("excluded.onchain_buy_raw"),
-			"raw_factors":          gorm.Expr("excluded.raw_factors"),
-			"vol_utilization":      gorm.Expr("excluded.vol_utilization"),
-			"funding_rate":         gorm.Expr("excluded.funding_rate"),
-			"source_summary":       gorm.Expr("excluded.source_summary"),
-			"filled":               false,
-			"price_t1":             0,
-			"return_pct":           0,
-			"filled_at":            0,
-			"updated_at":           gorm.Expr("excluded.updated_at"),
+			"action_taken":           gorm.Expr("excluded.action_taken"),
+			"price_t0":               gorm.Expr("excluded.price_t0"),
+			"sector":                 gorm.Expr("excluded.sector"),
+			"heat_score":             gorm.Expr("excluded.heat_score"),
+			"trading_sub":            gorm.Expr("excluded.trading_sub"),
+			"quant_sub":              gorm.Expr("excluded.quant_sub"),
+			"market_factor":          gorm.Expr("excluded.market_factor"),
+			"trend_factor":           gorm.Expr("excluded.trend_factor"),
+			"donchian_factor":        gorm.Expr("excluded.donchian_factor"),
+			"volume_spike_factor":    gorm.Expr("excluded.volume_spike_factor"),
+			"mtf_resonance_factor":   gorm.Expr("excluded.mtf_resonance_factor"),
+			"quant_factor":           gorm.Expr("excluded.quant_factor"),
+			"quant_oi_raw":           gorm.Expr("excluded.quant_oi_raw"),
+			"quant_imbalance_raw":    gorm.Expr("excluded.quant_imbalance_raw"),
+			"quant_netflow_raw":      gorm.Expr("excluded.quant_netflow_raw"),
+			"social_factor":          gorm.Expr("excluded.social_factor"),
+			"social_rank_raw":        gorm.Expr("excluded.social_rank_raw"),
+			"social_upvote_raw":      gorm.Expr("excluded.social_upvote_raw"),
+			"onchain_factor":         gorm.Expr("excluded.onchain_factor"),
+			"onchain_ratio_raw":      gorm.Expr("excluded.onchain_ratio_raw"),
+			"onchain_buy_raw":        gorm.Expr("excluded.onchain_buy_raw"),
+			"raw_factors":            gorm.Expr("excluded.raw_factors"),
+			"vol_utilization":        gorm.Expr("excluded.vol_utilization"),
+			"funding_rate":           gorm.Expr("excluded.funding_rate"),
+			"source_summary":         gorm.Expr("excluded.source_summary"),
+			"archetype_label":        gorm.Expr("excluded.archetype_label"),
+			"archetype_distance":     gorm.Expr("excluded.archetype_distance"),
+			"archetype_threshold":    gorm.Expr("excluded.archetype_threshold"),
+			"incubating":             gorm.Expr("excluded.incubating"),
+			"incubation_promoted":    gorm.Expr("excluded.incubation_promoted"),
+			"incubation_released_at": gorm.Expr("excluded.incubation_released_at"),
+			"knn_audit_tag":          gorm.Expr("excluded.knn_audit_tag"),
+			"filled":                 false,
+			"price_t1":               0,
+			"return_pct":             0,
+			"filled_at":              0,
+			"updated_at":             gorm.Expr("excluded.updated_at"),
 		}),
-	}).Create(&snapshots).Error
+	}).Create(&rowsToPersist).Error
 }
 
 func (s *ShadowSnapshotStore) MarkActionTaken(traderID string, decisionTime int64, symbols []string) error {
@@ -267,8 +350,13 @@ func (s *ShadowSnapshotStore) MarkActionTaken(traderID string, decisionTime int6
 		return nil
 	}
 
+	traderIDs := []string{traderID}
+	if !isGlobalConsensusTraderID(traderID) {
+		traderIDs = append(traderIDs, GlobalConsensusTraderID)
+	}
+
 	result := s.db.Model(&ShadowSnapshot{}).
-		Where("trader_id = ? AND decision_time = ? AND symbol IN ?", traderID, decisionTime, symbols).
+		Where("trader_id IN ? AND decision_time = ? AND symbol IN ?", traderIDs, decisionTime, symbols).
 		Updates(map[string]interface{}{
 			"action_taken": 1,
 			"updated_at":   time.Now().UTC().UnixMilli(),
@@ -285,7 +373,7 @@ func (s *ShadowSnapshotStore) GetPendingFill(cutoffDecisionTime int64, limit int
 	}
 
 	var snapshots []*ShadowSnapshot
-	err := s.db.Where("filled = ? AND decision_time <= ?", false, cutoffDecisionTime).
+	err := s.db.Where("filled = ? AND decision_time <= ? AND trader_id <> ?", false, cutoffDecisionTime, GlobalConsensusTraderID).
 		Order("decision_time ASC, id ASC").
 		Limit(limit).
 		Find(&snapshots).Error
@@ -296,17 +384,150 @@ func (s *ShadowSnapshotStore) GetPendingFill(cutoffDecisionTime int64, limit int
 }
 
 func (s *ShadowSnapshotStore) MarkFilled(id uint, priceT1, returnPct float64, filledAt int64) error {
+	var snapshot ShadowSnapshot
+	err := s.db.Where("id = ?", id).First(&snapshot).Error
+	if err != nil {
+		return fmt.Errorf("failed to load shadow snapshot before fill update: %w", err)
+	}
+
+	knnAuditTag := ""
+	if returnPct <= -0.03 {
+		knnAuditTag = "[REBEL_SON]"
+	}
+
 	result := s.db.Model(&ShadowSnapshot{}).
 		Where("id = ?", id).
 		Updates(map[string]interface{}{
-			"filled":     true,
-			"price_t1":   priceT1,
-			"return_pct": returnPct,
-			"filled_at":  filledAt,
-			"updated_at": filledAt,
+			"filled":        true,
+			"price_t1":      priceT1,
+			"return_pct":    returnPct,
+			"knn_audit_tag": knnAuditTag,
+			"filled_at":     filledAt,
+			"updated_at":    filledAt,
 		})
 	if result.Error != nil {
 		return fmt.Errorf("failed to mark shadow snapshot filled: %w", result.Error)
+	}
+
+	if !isGlobalConsensusTraderID(snapshot.TraderID) {
+		result = s.db.Model(&ShadowSnapshot{}).
+			Where("trader_id = ? AND decision_time = ? AND symbol = ?", GlobalConsensusTraderID, snapshot.DecisionTime, snapshot.Symbol).
+			Updates(map[string]interface{}{
+				"filled":        true,
+				"price_t1":      priceT1,
+				"return_pct":    returnPct,
+				"knn_audit_tag": knnAuditTag,
+				"filled_at":     filledAt,
+				"updated_at":    filledAt,
+			})
+		if result.Error != nil {
+			return fmt.Errorf("failed to sync consensus shadow snapshot fill: %w", result.Error)
+		}
+	}
+	return nil
+}
+
+func (s *ShadowSnapshotStore) MarkLatestIncubating(traderID, symbol, archetypeLabel string, distance, threshold float64, updatedAt int64) error {
+	if s == nil || s.db == nil || strings.TrimSpace(traderID) == "" || strings.TrimSpace(symbol) == "" {
+		return nil
+	}
+	if updatedAt == 0 {
+		updatedAt = time.Now().UTC().UnixMilli()
+	}
+
+	var snapshot ShadowSnapshot
+	err := s.db.Where("trader_id = ? AND symbol = ? AND filled = ?", traderID, symbol, false).
+		Order("decision_time DESC, id DESC").
+		First(&snapshot).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to load latest incubating shadow snapshot: %w", err)
+	}
+
+	values := map[string]interface{}{
+		"archetype_label":        archetypeLabel,
+		"archetype_distance":     distance,
+		"archetype_threshold":    threshold,
+		"incubating":             true,
+		"incubation_promoted":    false,
+		"incubation_released_at": 0,
+		"updated_at":             updatedAt,
+	}
+	if err := s.db.Model(&ShadowSnapshot{}).Where("id = ?", snapshot.ID).Updates(values).Error; err != nil {
+		return fmt.Errorf("failed to mark shadow snapshot incubating: %w", err)
+	}
+
+	if isGlobalConsensusTraderID(snapshot.TraderID) {
+		return nil
+	}
+	if err := s.db.Model(&ShadowSnapshot{}).
+		Where("trader_id = ? AND decision_time = ? AND symbol = ?", GlobalConsensusTraderID, snapshot.DecisionTime, snapshot.Symbol).
+		Updates(values).Error; err != nil {
+		return fmt.Errorf("failed to sync consensus incubating shadow snapshot: %w", err)
+	}
+	return nil
+}
+
+func (s *ShadowSnapshotStore) ListIncubatingFilledForPromotion(traderID string, limit int) ([]*ShadowSnapshot, error) {
+	if limit <= 0 {
+		limit = 2000
+	}
+
+	query := s.db.Where("filled = ? AND incubating = ? AND incubation_promoted = ?", true, true, false)
+	if traderID != "" {
+		query = query.Where("trader_id = ?", traderID)
+	} else {
+		query = query.Where("trader_id <> ?", GlobalConsensusTraderID)
+	}
+
+	var snapshots []*ShadowSnapshot
+	err := query.Order("decision_time DESC, id DESC").
+		Limit(limit).
+		Find(&snapshots).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to list incubating shadow samples: %w", err)
+	}
+	return snapshots, nil
+}
+
+func (s *ShadowSnapshotStore) PromoteIncubationCohort(archetypeLabel string, ids []uint, releasedAt int64) error {
+	if s == nil || s.db == nil || strings.TrimSpace(archetypeLabel) == "" || len(ids) == 0 {
+		return nil
+	}
+	if releasedAt == 0 {
+		releasedAt = time.Now().UTC().UnixMilli()
+	}
+
+	var snapshots []*ShadowSnapshot
+	if err := s.db.Where("id IN ?", ids).Find(&snapshots).Error; err != nil {
+		return fmt.Errorf("failed to load incubating cohort for promotion: %w", err)
+	}
+	if len(snapshots) == 0 {
+		return nil
+	}
+
+	values := map[string]interface{}{
+		"archetype_label":        archetypeLabel,
+		"incubating":             false,
+		"incubation_promoted":    true,
+		"incubation_released_at": releasedAt,
+		"updated_at":             releasedAt,
+	}
+	if err := s.db.Model(&ShadowSnapshot{}).Where("id IN ?", ids).Updates(values).Error; err != nil {
+		return fmt.Errorf("failed to promote incubating cohort: %w", err)
+	}
+
+	for _, snapshot := range snapshots {
+		if snapshot == nil || isGlobalConsensusTraderID(snapshot.TraderID) {
+			continue
+		}
+		if err := s.db.Model(&ShadowSnapshot{}).
+			Where("trader_id = ? AND decision_time = ? AND symbol = ?", GlobalConsensusTraderID, snapshot.DecisionTime, snapshot.Symbol).
+			Updates(values).Error; err != nil {
+			return fmt.Errorf("failed to sync consensus cohort promotion: %w", err)
+		}
 	}
 	return nil
 }
@@ -335,8 +556,8 @@ func (s *ShadowSnapshotStore) ListPerformanceBinsByTrader(traderID string, inclu
 	where := "trader_id = ?"
 	args := []interface{}{traderID}
 	if includeAllTraders {
-		where = "1 = 1"
-		args = nil
+		where = "trader_id <> ?"
+		args = []interface{}{GlobalConsensusTraderID}
 	}
 
 	return s.listPerformanceBinsRaw(performanceBinQueryConfig{
@@ -355,8 +576,8 @@ func (s *ShadowSnapshotStore) ListSmoothedPerformanceBinsByTrader(traderID strin
 	where := "trader_id = ?"
 	args := []interface{}{traderID}
 	if includeAllTraders {
-		where = "1 = 1"
-		args = nil
+		where = "trader_id <> ?"
+		args = []interface{}{GlobalConsensusTraderID}
 	}
 
 	return s.listSmoothedPerformanceBins(performanceBinQueryConfig{
@@ -382,10 +603,10 @@ func (s *ShadowSnapshotStore) ListPerformanceBinsBySector(traderID, sector strin
 	sectorWhere := "trader_id = ? AND sector = ?"
 	sectorArgs := []interface{}{traderID, sector}
 	if includeAllTraders {
-		globalWhere = "1 = 1"
-		globalArgs = nil
-		sectorWhere = "sector = ?"
-		sectorArgs = []interface{}{sector}
+		globalWhere = "trader_id <> ?"
+		globalArgs = []interface{}{GlobalConsensusTraderID}
+		sectorWhere = "trader_id <> ? AND sector = ?"
+		sectorArgs = []interface{}{GlobalConsensusTraderID, sector}
 	}
 
 	globalBins, err := s.listPerformanceBinsRaw(performanceBinQueryConfig{
@@ -409,6 +630,31 @@ func (s *ShadowSnapshotStore) ListPerformanceBinsBySector(traderID, sector strin
 	return SmoothPerformanceBins(sectorBins, globalBins, "global"), nil
 }
 
+func (s *ShadowSnapshotStore) ListRawPerformanceBinsBySector(traderID, sector string, includeAllTraders bool) ([]*ScoreBinPerformance, error) {
+	if sector == "" || (!includeAllTraders && traderID == "") {
+		return nil, nil
+	}
+
+	where := "trader_id = ? AND sector = ?"
+	args := []interface{}{traderID, sector}
+	if includeAllTraders {
+		where = "trader_id <> ? AND sector = ?"
+		args = []interface{}{GlobalConsensusTraderID, sector}
+	}
+
+	return s.listSmoothedPerformanceBins(performanceBinQueryConfig{
+		scopeLabel: "sector",
+		where:      where,
+		args:       args,
+		useTimeCut: true,
+	}, PERFORMANCE_WINDOW_SIZE_DEFAULT, func(row *ShadowSnapshot) (float64, bool) {
+		if row == nil || !isFiniteScore(row.HeatScore) {
+			return 0, false
+		}
+		return row.HeatScore, true
+	})
+}
+
 func (s *ShadowSnapshotStore) ListSmoothedPerformanceBinsBySector(traderID, sector string, windowSize int, includeAllTraders bool) ([]*ScoreBinPerformance, error) {
 	if sector == "" || (!includeAllTraders && traderID == "") {
 		return nil, nil
@@ -422,8 +668,8 @@ func (s *ShadowSnapshotStore) ListSmoothedPerformanceBinsBySector(traderID, sect
 	where := "trader_id = ? AND sector = ?"
 	args := []interface{}{traderID, sector}
 	if includeAllTraders {
-		where = "sector = ?"
-		args = []interface{}{sector}
+		where = "trader_id <> ? AND sector = ?"
+		args = []interface{}{GlobalConsensusTraderID, sector}
 	}
 
 	sectorBins, err := s.listSmoothedPerformanceBins(performanceBinQueryConfig{
@@ -451,8 +697,8 @@ func (s *ShadowSnapshotStore) ListPerformanceBinsBySymbol(traderID, symbol strin
 	where := "trader_id = ? AND symbol = ?"
 	args := []interface{}{traderID, symbol}
 	if includeAllTraders {
-		where = "symbol = ?"
-		args = []interface{}{symbol}
+		where = "trader_id <> ? AND symbol = ?"
+		args = []interface{}{GlobalConsensusTraderID, symbol}
 	}
 
 	symbolBins, err := s.listPerformanceBinsRaw(performanceBinQueryConfig{
@@ -486,6 +732,31 @@ func (s *ShadowSnapshotStore) ListPerformanceBinsBySymbol(traderID, symbol strin
 	return SmoothPerformanceBins(symbolBins, globalBins, "global"), nil
 }
 
+func (s *ShadowSnapshotStore) ListRawPerformanceBinsBySymbol(traderID, symbol string, includeAllTraders bool) ([]*ScoreBinPerformance, error) {
+	if symbol == "" || (!includeAllTraders && traderID == "") {
+		return nil, nil
+	}
+
+	where := "trader_id = ? AND symbol = ?"
+	args := []interface{}{traderID, symbol}
+	if includeAllTraders {
+		where = "trader_id <> ? AND symbol = ?"
+		args = []interface{}{GlobalConsensusTraderID, symbol}
+	}
+
+	return s.listSmoothedPerformanceBins(performanceBinQueryConfig{
+		scopeLabel: "symbol",
+		where:      where,
+		args:       args,
+		limit:      PERFORMANCE_SYMBOL_LIMIT,
+	}, PERFORMANCE_WINDOW_SIZE_DEFAULT, func(row *ShadowSnapshot) (float64, bool) {
+		if row == nil || !isFiniteScore(row.HeatScore) {
+			return 0, false
+		}
+		return row.HeatScore, true
+	})
+}
+
 func (s *ShadowSnapshotStore) ListSmoothedPerformanceBinsBySymbol(traderID, symbol string, windowSize int, includeAllTraders bool) ([]*ScoreBinPerformance, error) {
 	if symbol == "" || (!includeAllTraders && traderID == "") {
 		return nil, nil
@@ -494,8 +765,8 @@ func (s *ShadowSnapshotStore) ListSmoothedPerformanceBinsBySymbol(traderID, symb
 	where := "trader_id = ? AND symbol = ?"
 	args := []interface{}{traderID, symbol}
 	if includeAllTraders {
-		where = "symbol = ?"
-		args = []interface{}{symbol}
+		where = "trader_id <> ? AND symbol = ?"
+		args = []interface{}{GlobalConsensusTraderID, symbol}
 	}
 
 	symbolBins, err := s.listSmoothedPerformanceBins(performanceBinQueryConfig{
@@ -574,13 +845,7 @@ func (s *ShadowSnapshotStore) listSmoothedPerformanceBins(
 		return nil, err
 	}
 
-	windowSize = NormalizePerformanceWindowSize(windowSize)
-	logger.Infof("V3_AUDIT_PERF_SMOOTH: Scope=%s Step=%d Window=%d Samples=%d",
-		cfg.scopeLabel,
-		PERFORMANCE_SMOOTHING_STEP,
-		windowSize,
-		len(rows),
-	)
+	logger.Infof("V3_AUDIT_PERF_RAW: Scope=%s Samples=%d", cfg.scopeLabel, len(rows))
 	return AggregateSmoothedPerformanceBins(rows, scoreSelector, windowSize), nil
 }
 
@@ -592,8 +857,8 @@ func (s *ShadowSnapshotStore) ListPerformanceSnapshotsByTrader(traderID string, 
 	where := "trader_id = ?"
 	args := []interface{}{traderID}
 	if includeAllTraders {
-		where = "1 = 1"
-		args = nil
+		where = "trader_id <> ?"
+		args = []interface{}{GlobalConsensusTraderID}
 	}
 
 	return s.listPerformanceSnapshotsRaw(performanceBinQueryConfig{
@@ -612,8 +877,8 @@ func (s *ShadowSnapshotStore) ListPerformanceSnapshotsBySector(traderID, sector 
 	where := "trader_id = ? AND sector = ?"
 	args := []interface{}{traderID, sector}
 	if includeAllTraders {
-		where = "sector = ?"
-		args = []interface{}{sector}
+		where = "trader_id <> ? AND sector = ?"
+		args = []interface{}{GlobalConsensusTraderID, sector}
 	}
 
 	return s.listPerformanceSnapshotsRaw(performanceBinQueryConfig{
@@ -632,8 +897,8 @@ func (s *ShadowSnapshotStore) ListPerformanceSnapshotsBySymbol(traderID, symbol 
 	where := "trader_id = ? AND symbol = ?"
 	args := []interface{}{traderID, symbol}
 	if includeAllTraders {
-		where = "symbol = ?"
-		args = []interface{}{symbol}
+		where = "trader_id <> ? AND symbol = ?"
+		args = []interface{}{GlobalConsensusTraderID, symbol}
 	}
 
 	return s.listPerformanceSnapshotsRaw(performanceBinQueryConfig{
@@ -787,58 +1052,25 @@ func AggregateSmoothedPerformanceBins(
 		return nil
 	}
 
-	windowSize = NormalizePerformanceWindowSize(windowSize)
-	halfWindow := float64(windowSize) / 2.0
-	minScore := 100.0
-	maxScore := 0.0
+	buckets := make(map[int]*performanceBucket)
 	for _, sample := range samples {
-		if sample.score < minScore {
-			minScore = sample.score
+		binStart := int(math.Floor(sample.score))
+		if binStart < 0 {
+			binStart = 0
 		}
-		if sample.score > maxScore {
-			maxScore = sample.score
-		}
-	}
-
-	startCenter := int(math.Floor(minScore))
-	endCenter := int(math.Ceil(maxScore))
-	if startCenter < 0 {
-		startCenter = 0
-	}
-	if endCenter > 100 {
-		endCenter = 100
-	}
-
-	bins := make([]*ScoreBinPerformance, 0, endCenter-startCenter+1)
-	for center := startCenter; center <= endCenter; center += PERFORMANCE_SMOOTHING_STEP {
-		lower := float64(center) - halfWindow
-		upper := float64(center) + halfWindow
-		bucket := &performanceBucket{}
-		for _, sample := range samples {
-			if sample.score < lower || sample.score > upper {
-				continue
-			}
-			applyPerformanceSample(bucket, sample)
-		}
-		if bucket.tradeCount == 0 {
-			continue
+		if binStart > 100 {
+			binStart = 100
 		}
 
-		profitFactorLong, profitFactorShort := calculateProfitFactors(bucket.sumPositive, bucket.sumNegative)
-		bins = append(bins, &ScoreBinPerformance{
-			BinStart:                 center,
-			BinLabel:                 fmt.Sprintf("%d", center),
-			TradeCount:               bucket.tradeCount,
-			ExpectedValueLong:        sanitizeExpectedValue(bucket.sumLogLong / float64(bucket.tradeCount)),
-			MedianExpectedValueLong:  sanitizeExpectedValue(medianFloat64(bucket.logLongs)),
-			ProfitFactorLong:         profitFactorLong,
-			ExpectedValueShort:       sanitizeExpectedValue(bucket.sumLogShort / float64(bucket.tradeCount)),
-			MedianExpectedValueShort: sanitizeExpectedValue(medianFloat64(bucket.logShorts)),
-			ProfitFactorShort:        profitFactorShort,
-		})
+		bucket := buckets[binStart]
+		if bucket == nil {
+			bucket = &performanceBucket{}
+			buckets[binStart] = bucket
+		}
+		applyPerformanceSample(bucket, sample)
 	}
 
-	return bins
+	return buildPerformanceBinsFromBuckets(buckets, nil)
 }
 
 func FindPerformanceBinForScore(
@@ -965,6 +1197,15 @@ func applyPerformanceSample(bucket *performanceBucket, sample performanceSample)
 }
 
 func buildFixedPerformanceBins(buckets map[int]*performanceBucket) []*ScoreBinPerformance {
+	return buildPerformanceBinsFromBuckets(buckets, func(binStart int) string {
+		return fmt.Sprintf("%d-%d", binStart, binStart+5)
+	})
+}
+
+func buildPerformanceBinsFromBuckets(
+	buckets map[int]*performanceBucket,
+	labelFn func(int) string,
+) []*ScoreBinPerformance {
 	if len(buckets) == 0 {
 		return nil
 	}
@@ -982,10 +1223,14 @@ func buildFixedPerformanceBins(buckets map[int]*performanceBucket) []*ScoreBinPe
 			continue
 		}
 
+		label := fmt.Sprintf("%d", binStart)
+		if labelFn != nil {
+			label = labelFn(binStart)
+		}
 		profitFactorLong, profitFactorShort := calculateProfitFactors(bucket.sumPositive, bucket.sumNegative)
 		bins = append(bins, &ScoreBinPerformance{
 			BinStart:                 binStart,
-			BinLabel:                 fmt.Sprintf("%d-%d", binStart, binStart+5),
+			BinLabel:                 label,
 			TradeCount:               bucket.tradeCount,
 			ExpectedValueLong:        sanitizeExpectedValue(bucket.sumLogLong / float64(bucket.tradeCount)),
 			MedianExpectedValueLong:  sanitizeExpectedValue(medianFloat64(bucket.logLongs)),
@@ -1075,6 +1320,8 @@ func (s *ShadowSnapshotStore) ListFilledForAdaptive(traderID string, limit int) 
 	query := s.db.Where("filled = ?", true)
 	if traderID != "" {
 		query = query.Where("trader_id = ?", traderID)
+	} else {
+		query = query.Where("trader_id <> ?", GlobalConsensusTraderID)
 	}
 
 	var snapshots []*ShadowSnapshot
@@ -1087,16 +1334,27 @@ func (s *ShadowSnapshotStore) ListFilledForAdaptive(traderID string, limit int) 
 	return snapshots, nil
 }
 
+func (s *ShadowSnapshotStore) ListFilledForNeighborhoodAudit(traderID string, limit int) ([]*ShadowSnapshot, error) {
+	return s.ListFilledForAdaptive(traderID, limit)
+}
+
 func (s *ShadowSnapshotStore) ListFilledForSectorAdaptive(traderID, sector string, limit int) ([]*ShadowSnapshot, error) {
 	if limit <= 0 {
 		limit = 3000
 	}
-	if traderID == "" || sector == "" {
+	if sector == "" {
 		return nil, nil
 	}
 
+	query := s.db.Where("filled = ? AND sector = ?", true, sector)
+	if traderID != "" {
+		query = query.Where("trader_id = ?", traderID)
+	} else {
+		query = query.Where("trader_id <> ?", GlobalConsensusTraderID)
+	}
+
 	var snapshots []*ShadowSnapshot
-	err := s.db.Where("filled = ? AND trader_id = ? AND sector = ?", true, traderID, sector).
+	err := query.
 		Order("decision_time DESC, id DESC").
 		Limit(limit).
 		Find(&snapshots).Error
@@ -1110,12 +1368,19 @@ func (s *ShadowSnapshotStore) ListFilledForCoinAdaptive(traderID, symbol string,
 	if limit <= 0 {
 		limit = 500
 	}
-	if traderID == "" || symbol == "" {
+	if symbol == "" {
 		return nil, nil
 	}
 
+	query := s.db.Where("filled = ? AND symbol = ?", true, symbol)
+	if traderID != "" {
+		query = query.Where("trader_id = ?", traderID)
+	} else {
+		query = query.Where("trader_id <> ?", GlobalConsensusTraderID)
+	}
+
 	var snapshots []*ShadowSnapshot
-	err := s.db.Where("filled = ? AND trader_id = ? AND symbol = ?", true, traderID, symbol).
+	err := query.
 		Order("decision_time DESC, id DESC").
 		Limit(limit).
 		Find(&snapshots).Error
@@ -1152,6 +1417,8 @@ func (s *ShadowSnapshotStore) GetLatestBySymbol(traderID, symbol string, include
 	query := s.db.Where("symbol = ?", symbol)
 	if !includeAllTraders {
 		query = query.Where("trader_id = ?", traderID)
+	} else {
+		query = query.Where("trader_id <> ?", GlobalConsensusTraderID)
 	}
 	err := query.Order("decision_time DESC, id DESC").First(&snapshot).Error
 	if err == gorm.ErrRecordNotFound {
@@ -1161,4 +1428,84 @@ func (s *ShadowSnapshotStore) GetLatestBySymbol(traderID, symbol string, include
 		return nil, fmt.Errorf("failed to get latest shadow snapshot by symbol: %w", err)
 	}
 	return &snapshot, nil
+}
+
+func (s *ShadowSnapshotStore) ListShared(limit int) ([]*ShadowSnapshot, error) {
+	rows, err := s.ListByTrader(GlobalConsensusTraderID, limit)
+	if err != nil || len(rows) > 0 {
+		return rows, err
+	}
+
+	if limit <= 0 {
+		limit = 200
+	}
+
+	var snapshots []*ShadowSnapshot
+	err = s.db.Where("trader_id <> ?", GlobalConsensusTraderID).
+		Order("decision_time DESC, id DESC").
+		Limit(limit).
+		Find(&snapshots).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to list shared shadow snapshots: %w", err)
+	}
+	return snapshots, nil
+}
+
+func (s *ShadowSnapshotStore) GetLatestShared() (*ShadowSnapshot, error) {
+	latest, err := s.GetLatestByTrader(GlobalConsensusTraderID)
+	if err != nil || latest != nil {
+		return latest, err
+	}
+
+	var snapshot ShadowSnapshot
+	err = s.db.Where("trader_id <> ?", GlobalConsensusTraderID).
+		Order("decision_time DESC, id DESC").
+		First(&snapshot).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get latest shared shadow snapshot: %w", err)
+	}
+	return &snapshot, nil
+}
+
+func (s *ShadowSnapshotStore) GetLatestSharedBySymbol(symbol string) (*ShadowSnapshot, error) {
+	latest, err := s.GetLatestBySymbol(GlobalConsensusTraderID, symbol, false)
+	if err != nil || latest != nil {
+		return latest, err
+	}
+	return s.GetLatestBySymbol("", symbol, true)
+}
+
+func (s *ShadowSnapshotStore) ListFilledSharedForAdaptive(limit int) ([]*ShadowSnapshot, error) {
+	rows, err := s.ListFilledForAdaptive(GlobalConsensusTraderID, limit)
+	if err != nil || len(rows) > 0 {
+		return rows, err
+	}
+	return s.ListFilledForAdaptive("", limit)
+}
+
+func (s *ShadowSnapshotStore) ListFilledSharedForNeighborhoodAudit(limit int) ([]*ShadowSnapshot, error) {
+	rows, err := s.ListFilledForNeighborhoodAudit(GlobalConsensusTraderID, limit)
+	if err != nil || len(rows) > 0 {
+		return rows, err
+	}
+	return s.ListFilledForNeighborhoodAudit("", limit)
+}
+
+func (s *ShadowSnapshotStore) ListFilledSharedForSectorAdaptive(sector string, limit int) ([]*ShadowSnapshot, error) {
+	rows, err := s.ListFilledForSectorAdaptive(GlobalConsensusTraderID, sector, limit)
+	if err != nil || len(rows) > 0 {
+		return rows, err
+	}
+	return s.ListFilledForSectorAdaptive("", sector, limit)
+}
+
+func (s *ShadowSnapshotStore) ListFilledSharedForCoinAdaptive(symbol string, limit int) ([]*ShadowSnapshot, error) {
+	rows, err := s.ListFilledForCoinAdaptive(GlobalConsensusTraderID, symbol, limit)
+	if err != nil || len(rows) > 0 {
+		return rows, err
+	}
+	return s.ListFilledForCoinAdaptive("", symbol, limit)
 }

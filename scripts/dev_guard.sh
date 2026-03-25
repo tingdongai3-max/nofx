@@ -11,6 +11,7 @@ set -e
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 source "$PROJECT_ROOT/scripts/go_env.sh"
+BACKEND_BIN="$PROJECT_ROOT/nofx"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -173,6 +174,9 @@ else
     log_info "Frontend OK (3000 already LISTEN)"
 fi
 
+# Restore project root before running backend health checks or recursive make calls.
+cd "$PROJECT_ROOT"
+
 # 4. Smoke test - HTTP verification
 log_info "Running smoke tests..."
 
@@ -194,7 +198,7 @@ fi
 
 # 5. Full-stack health guard
 log_info "Running Go full-stack health guard..."
-if ./nofx healthcheck; then
+if "$BACKEND_BIN" healthcheck; then
     log_info "Full-stack health guard OK"
 else
     if [ "${NOFX_DEV_GUARD_RETRY:-0}" != "1" ]; then

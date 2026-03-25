@@ -30,12 +30,13 @@ func (s *Server) handlePerformanceBinsRequest(c *gin.Context, backcast bool) {
 		return
 	}
 
-	windowSize, ok := s.resolvePerformanceWindowSize(c)
+	windowSize, ok := s.resolvePerformanceWindowSize(c, scope)
 	if !ok {
 		return
 	}
 
-	rows, err := s.loadPerformanceBins(traderID, scope, sector, symbol, windowSize, backcast)
+	resonanceFiltered := s.resolvePerformanceResonanceFilter(c, backcast)
+	rows, err := s.loadPerformanceBins(traderID, scope, sector, symbol, windowSize, backcast, resonanceFiltered)
 	if err != nil {
 		label := "Load performance bins"
 		if backcast {
@@ -48,10 +49,30 @@ func (s *Server) handlePerformanceBinsRequest(c *gin.Context, backcast bool) {
 	c.JSON(http.StatusOK, rows)
 }
 
-func (s *Server) resolvePerformanceWindowSize(c *gin.Context) (int, bool) {
+func derivePerformanceWindowSizeFromSampleTarget(sampleTarget int) int {
+	if sampleTarget >= market.AdaptiveSampleTarget {
+		return store.PERFORMANCE_WINDOW_SIZE_WIDE
+	}
+	return store.PERFORMANCE_WINDOW_SIZE_DEFAULT
+}
+
+func (s *Server) resolvePerformanceWindowSize(c *gin.Context, scope string) (int, bool) {
 	rawWindow := strings.TrimSpace(c.Query("window_size"))
 	if rawWindow == "" {
-		return store.NormalizePerformanceWindowSize(0), true
+		adaptiveMemory, err := s.store.GetAdaptiveMemoryConfig()
+		if err != nil {
+			SafeInternalError(c, "Load adaptive memory config", err)
+			return 0, false
+		}
+
+		switch scope {
+		case "sector":
+			return derivePerformanceWindowSizeFromSampleTarget(adaptiveMemory.SectorSamples), true
+		case "symbol":
+			return derivePerformanceWindowSizeFromSampleTarget(adaptiveMemory.SymbolSamples), true
+		default:
+			return derivePerformanceWindowSizeFromSampleTarget(adaptiveMemory.GlobalSamples), true
+		}
 	}
 
 	windowSize, err := strconv.Atoi(rawWindow)
@@ -60,6 +81,20 @@ func (s *Server) resolvePerformanceWindowSize(c *gin.Context) (int, bool) {
 		return 0, false
 	}
 	return store.NormalizePerformanceWindowSize(windowSize), true
+}
+
+func (s *Server) resolvePerformanceResonanceFilter(c *gin.Context, backcast bool) bool {
+	if !backcast {
+		return false
+	}
+
+	raw := strings.TrimSpace(strings.ToLower(c.DefaultQuery("resonance_filter", "true")))
+	switch raw {
+	case "0", "false", "off", "no":
+		return false
+	default:
+		return true
+	}
 }
 
 func (s *Server) resolveOwnedTraderID(c *gin.Context) (string, bool) {
@@ -77,12 +112,12 @@ func (s *Server) resolveOwnedTraderID(c *gin.Context) (string, bool) {
 	}
 
 	if traderID == "" {
-		traderID = traders[0].ID
+		return store.GlobalConsensusTraderID, true
 	}
 
 	for _, trader := range traders {
 		if trader.ID == traderID {
-			return traderID, true
+			return store.GlobalConsensusTraderID, true
 		}
 	}
 
@@ -151,7 +186,13 @@ func (s *Server) loadPerformanceBins(
 	traderID, scope, sector, symbol string,
 	windowSize int,
 	backcast bool,
+	resonanceFiltered ...bool,
 ) ([]*store.ScoreBinPerformance, error) {
+	useResonanceFilter := backcast
+	if len(resonanceFiltered) > 0 {
+		useResonanceFilter = resonanceFiltered[0]
+	}
+
 	loadWithPool := func(includeAllTraders bool) ([]*store.ScoreBinPerformance, error) {
 		if s.performanceCache != nil {
 			var (
@@ -159,7 +200,7 @@ func (s *Server) loadPerformanceBins(
 				err      error
 			)
 			if backcast {
-				matrices, err = s.performanceCache.GetBackcastMatricesWithWindowWithPool(traderID, sector, symbol, windowSize, includeAllTraders)
+				matrices, err = s.performanceCache.GetBackcastMatricesWithWindowWithPoolFiltered(traderID, sector, symbol, windowSize, includeAllTraders, useResonanceFilter)
 			} else {
 				matrices, err = s.performanceCache.GetMatricesWithWindowWithPool(traderID, sector, symbol, windowSize, includeAllTraders)
 			}
@@ -179,45 +220,29 @@ func (s *Server) loadPerformanceBins(
 		}
 
 		if backcast {
+			queryTraderID := traderID
+			if includeAllTraders {
+				queryTraderID = ""
+			}
 			switch scope {
 			case "global":
-				rows, err := s.store.Shadow().ListPerformanceSnapshotsByTrader(traderID, includeAllTraders)
+				rows, err := s.store.Shadow().ListFilledForAdaptive(queryTraderID, store.PERFORMANCE_RECENT_SAMPLE_LIMIT)
 				if err != nil {
 					return nil, err
 				}
-				return market.RecalculateHistoricalBinsWithWindow(filterSnapshotsWithRawFactors(rows), market.GetAdaptiveWeightState(traderID, "", ""), windowSize), nil
+				return s.recalculateBackcastBins(rows, market.GetAdaptiveWeightState(traderID, "", ""), windowSize, useResonanceFilter)
 			case "sector":
-				rows, err := s.store.Shadow().ListPerformanceSnapshotsBySector(traderID, sector, includeAllTraders)
+				rows, err := s.store.Shadow().ListFilledForSectorAdaptive(queryTraderID, sector, store.PERFORMANCE_RECENT_SAMPLE_LIMIT)
 				if err != nil {
 					return nil, err
 				}
-				sectorBins := market.RecalculateHistoricalBinsWithWindow(filterSnapshotsWithRawFactors(rows), market.GetAdaptiveWeightState(traderID, sector, ""), windowSize)
-				globalRows, err := s.store.Shadow().ListPerformanceSnapshotsByTrader(traderID, includeAllTraders)
-				if err != nil {
-					return nil, err
-				}
-				globalBins := market.RecalculateHistoricalBinsWithWindow(filterSnapshotsWithRawFactors(globalRows), market.GetAdaptiveWeightState(traderID, "", ""), windowSize)
-				return store.SmoothPerformanceBins(sectorBins, globalBins, "global"), nil
+				return s.recalculateBackcastBins(rows, market.GetAdaptiveWeightState(traderID, sector, ""), windowSize, useResonanceFilter)
 			case "symbol":
-				rows, err := s.store.Shadow().ListPerformanceSnapshotsBySymbol(traderID, symbol, includeAllTraders)
+				rows, err := s.store.Shadow().ListFilledForCoinAdaptive(queryTraderID, symbol, store.PERFORMANCE_RECENT_SAMPLE_LIMIT)
 				if err != nil {
 					return nil, err
 				}
-				symbolBins := market.RecalculateHistoricalBinsWithWindow(filterSnapshotsWithRawFactors(rows), market.GetAdaptiveWeightState(traderID, sector, symbol), windowSize)
-				globalRows, err := s.store.Shadow().ListPerformanceSnapshotsByTrader(traderID, includeAllTraders)
-				if err != nil {
-					return nil, err
-				}
-				globalBins := market.RecalculateHistoricalBinsWithWindow(filterSnapshotsWithRawFactors(globalRows), market.GetAdaptiveWeightState(traderID, "", ""), windowSize)
-				if strings.TrimSpace(sector) == "" {
-					return store.SmoothPerformanceBins(symbolBins, globalBins, "global"), nil
-				}
-				sectorRows, err := s.store.Shadow().ListPerformanceSnapshotsBySector(traderID, sector, includeAllTraders)
-				if err != nil {
-					return nil, err
-				}
-				sectorBins := market.RecalculateHistoricalBinsWithWindow(filterSnapshotsWithRawFactors(sectorRows), market.GetAdaptiveWeightState(traderID, sector, ""), windowSize)
-				return store.SmoothPerformanceBinsWithFallbackChain(symbolBins, sectorBins, "sector", globalBins, "global"), nil
+				return s.recalculateBackcastBins(rows, market.GetAdaptiveWeightState(traderID, sector, symbol), windowSize, useResonanceFilter)
 			}
 		}
 
@@ -225,9 +250,9 @@ func (s *Server) loadPerformanceBins(
 		case "global":
 			return s.store.Shadow().ListSmoothedPerformanceBinsByTrader(traderID, windowSize, includeAllTraders)
 		case "sector":
-			return s.store.Shadow().ListSmoothedPerformanceBinsBySector(traderID, sector, windowSize, includeAllTraders)
+			return s.store.Shadow().ListRawPerformanceBinsBySector(traderID, sector, includeAllTraders)
 		case "symbol":
-			return s.store.Shadow().ListSmoothedPerformanceBinsBySymbol(traderID, symbol, windowSize, includeAllTraders)
+			return s.store.Shadow().ListRawPerformanceBinsBySymbol(traderID, symbol, includeAllTraders)
 		default:
 			return nil, nil
 		}
@@ -241,6 +266,31 @@ func (s *Server) loadPerformanceBins(
 		return loadWithPool(true)
 	}
 	return rows, nil
+}
+
+func (s *Server) recalculateBackcastBins(
+	rows []*store.ShadowSnapshot,
+	state market.AdaptiveWeightState,
+	windowSize int,
+	resonanceFiltered bool,
+) ([]*store.ScoreBinPerformance, error) {
+	filteredRows := filterSnapshotsWithRawFactors(rows)
+	if len(filteredRows) == 0 {
+		return nil, nil
+	}
+	if !resonanceFiltered {
+		return market.RecalculateHistoricalFactors(filteredRows, state, windowSize), nil
+	}
+
+	guardConfig, err := s.store.GetResonanceGuardConfig()
+	if err != nil {
+		return nil, err
+	}
+	filter := kernel.BuildResonanceSnapshotFilter(filteredRows, guardConfig.AdaptiveEntryFloor, guardConfig.AdaptiveEntryLambda, 2.0)
+	if filter == nil {
+		return market.RecalculateHistoricalFactors(filteredRows, state, windowSize), nil
+	}
+	return market.RecalculateHistoricalFactors(filteredRows, state, windowSize, filter), nil
 }
 
 func hasPerformanceBins(rows []*store.ScoreBinPerformance) bool {

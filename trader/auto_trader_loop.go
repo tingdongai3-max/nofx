@@ -145,6 +145,29 @@ func (at *AutoTrader) runCycle(tickTime time.Time) error {
 		record.ExecutionLog = append(record.ExecutionLog,
 			fmt.Sprintf("AI call duration: %d ms", record.AIRequestDurationMs))
 	}
+	if aiDecision != nil && (aiDecision.AIFinishReason != "" || aiDecision.AITotalTokens > 0 || aiDecision.AIRawBodyTail != "") {
+		logger.Infof(
+			"🧾 AI decision meta: finish_reason=%q usage(prompt=%d completion=%d total=%d) max_tokens=%d",
+			aiDecision.AIFinishReason,
+			aiDecision.AIPromptTokens,
+			aiDecision.AICompletionTokens,
+			aiDecision.AITotalTokens,
+			aiDecision.AIMaxTokens,
+		)
+		if strings.TrimSpace(aiDecision.AIRawBodyTail) != "" {
+			logger.Infof("🧾 AI raw body tail: %s", aiDecision.AIRawBodyTail)
+		}
+		record.ExecutionLog = append(record.ExecutionLog,
+			fmt.Sprintf(
+				"AI meta: finish_reason=%q usage(prompt=%d completion=%d total=%d) max_tokens=%d",
+				aiDecision.AIFinishReason,
+				aiDecision.AIPromptTokens,
+				aiDecision.AICompletionTokens,
+				aiDecision.AITotalTokens,
+				aiDecision.AIMaxTokens,
+			),
+		)
+	}
 
 	at.updateCandidateSnapshot(ctx, tickTime)
 	if shadowErr := at.persistShadowSnapshots(decisionTime, ctx); shadowErr != nil {
@@ -160,6 +183,12 @@ func (at *AutoTrader) runCycle(tickTime time.Time) error {
 		record.InputPrompt = aiDecision.UserPrompt
 		record.CoTTrace = aiDecision.CoTTrace
 		record.RawResponse = aiDecision.RawResponse // Save raw AI response for debugging
+		record.AIFinishReason = aiDecision.AIFinishReason
+		record.AIPromptTokens = aiDecision.AIPromptTokens
+		record.AICompletionTokens = aiDecision.AICompletionTokens
+		record.AITotalTokens = aiDecision.AITotalTokens
+		record.AIRawBodyTail = aiDecision.AIRawBodyTail
+		record.AIMaxTokens = aiDecision.AIMaxTokens
 		if len(aiDecision.Decisions) > 0 {
 			decisionJSON, _ := json.MarshalIndent(aiDecision.Decisions, "", "  ")
 			record.DecisionJSON = string(decisionJSON)
@@ -257,6 +286,27 @@ func (at *AutoTrader) runCycle(tickTime time.Time) error {
 		if !running {
 			logger.Infof("⏹ Trader stopped during decision execution, aborting remaining decisions")
 			break
+		}
+
+		if at.shouldSuppressDynamicCloseAction(d.Action) {
+			logger.Infof("⏱ Fixed timed-exit mode ignored dynamic close signal: %s %s", d.Symbol, d.Action)
+			actionRecord := store.DecisionAction{
+				Action:        d.Action,
+				Symbol:        d.Symbol,
+				Quantity:      0,
+				Leverage:      d.Leverage,
+				Price:         0,
+				StopLoss:      d.StopLoss,
+				TakeProfit:    d.TakeProfit,
+				Confidence:    d.Confidence,
+				Reasoning:     buildFixedTimedExitReason(at.getFixedAutoCloseHoldDuration()),
+				Timestamp:     time.Now().UTC(),
+				Success:       true,
+				ExecutionMode: "suppressed_fixed_15m",
+			}
+			record.ExecutionLog = append(record.ExecutionLog, fmt.Sprintf("• %s %s suppressed: fixed timed exit only", d.Symbol, d.Action))
+			record.Decisions = append(record.Decisions, actionRecord)
+			continue
 		}
 
 		actionRecord := store.DecisionAction{
@@ -430,9 +480,9 @@ func (at *AutoTrader) resolveCandidatePerformanceSummary(
 
 	var currentBin *store.ScoreBinPerformance
 	if matrices != nil {
-		currentBin = store.FindPerformanceBinForScore(matrices.Symbol, logicScore)
+		currentBin = store.FindPerformanceBinForScore(matrices.Sector, logicScore)
 		if currentBin == nil {
-			currentBin = store.FindPerformanceBinForScore(matrices.Sector, logicScore)
+			currentBin = store.FindPerformanceBinForScore(matrices.Symbol, logicScore)
 		}
 		if currentBin == nil {
 			currentBin = store.FindPerformanceBinForScore(matrices.Global, logicScore)
@@ -709,6 +759,11 @@ func (at *AutoTrader) buildTradingContext(tickTime time.Time, callCount int) (*k
 		},
 		Positions:      positionInfos,
 		CandidateCoins: candidateCoins,
+	}
+	if liveWeights, weightErr := kernel.GetLiveAttributionWeights(); weightErr == nil && len(liveWeights) > 0 {
+		ctx.LiveAttributionWeights = liveWeights
+	} else if weightErr != nil {
+		logger.Infof("⚠️ [%s] Failed to load live attribution weights: %v", at.name, weightErr)
 	}
 
 	// 7. Add recent closed trades (if store is available)

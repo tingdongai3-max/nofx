@@ -37,6 +37,10 @@ func (at *AutoTrader) saveEquitySnapshot(ctx *kernel.Context, snapshotTime time.
 
 // saveDecision saves AI decision log to database (only records AI input/output, for debugging)
 func (at *AutoTrader) saveDecision(record *store.DecisionRecord) error {
+	return at.saveDecisionForTrader(record, at.id)
+}
+
+func (at *AutoTrader) saveDecisionForTrader(record *store.DecisionRecord, traderID string) error {
 	if at.store == nil {
 		return nil
 	}
@@ -44,7 +48,7 @@ func (at *AutoTrader) saveDecision(record *store.DecisionRecord) error {
 	if record.CycleNumber <= 0 {
 		record.CycleNumber = at.reserveDecisionCycleNumber()
 	}
-	record.TraderID = at.id
+	record.TraderID = traderID
 
 	if record.Timestamp.IsZero() {
 		record.Timestamp = time.Now().UTC()
@@ -55,7 +59,7 @@ func (at *AutoTrader) saveDecision(record *store.DecisionRecord) error {
 		return err
 	}
 
-	logger.Infof("📝 Decision record saved: trader=%s, cycle=%d", at.id, record.CycleNumber)
+	logger.Infof("📝 Decision record saved: trader=%s, cycle=%d", traderID, record.CycleNumber)
 	return nil
 }
 
@@ -469,20 +473,28 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 	case "open_long", "open_short":
 		// Open position: create new position record
 		nowMs := time.Now().UTC().UnixMilli()
+		entryLogicScore, entryExpectedEV, ok := at.lookupCurrentExitEntryMetrics(symbol, side)
+		if !ok {
+			entryLogicScore = 0
+			entryExpectedEV = 0
+		}
 		pos := &store.TraderPosition{
-			TraderID:     at.id,
-			ExchangeID:   at.exchangeID, // Exchange account UUID
-			ExchangeType: at.exchange,   // Exchange type: binance/bybit/okx/etc
-			Symbol:       symbol,
-			Side:         side, // LONG or SHORT
-			Quantity:     quantity,
-			EntryPrice:   price,
-			EntryOrderID: orderID,
-			EntryTime:    nowMs,
-			Leverage:     leverage,
-			Status:       "OPEN",
-			CreatedAt:    nowMs,
-			UpdatedAt:    nowMs,
+			TraderID:        at.id,
+			ExchangeID:      at.exchangeID, // Exchange account UUID
+			ExchangeType:    at.exchange,   // Exchange type: binance/bybit/okx/etc
+			Symbol:          symbol,
+			Side:            side, // LONG or SHORT
+			Quantity:        quantity,
+			EntryPrice:      price,
+			EntryOrderID:    orderID,
+			EntryTime:       nowMs,
+			AutoCloseAt:     nowMs + int64(at.getFixedAutoCloseHoldDuration()/time.Millisecond),
+			Leverage:        leverage,
+			EntryLogicScore: entryLogicScore,
+			EntryExpectedEV: entryExpectedEV,
+			Status:          "OPEN",
+			CreatedAt:       nowMs,
+			UpdatedAt:       nowMs,
 		}
 		if err := at.store.Position().Create(pos); err != nil {
 			logger.Infof("  ⚠️ Failed to record position: %v", err)
@@ -511,6 +523,10 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 
 // createOrderRecord creates an order record struct from order details
 func (at *AutoTrader) createOrderRecord(orderID, symbol, action, positionSide string, quantity, price float64, leverage int) *store.TraderOrder {
+	return at.createOrderRecordForTrader(at.id, orderID, symbol, action, positionSide, quantity, price, leverage)
+}
+
+func (at *AutoTrader) createOrderRecordForTrader(traderID, orderID, symbol, action, positionSide string, quantity, price float64, leverage int) *store.TraderOrder {
 	// Determine order type (market for auto trader)
 	orderType := "MARKET"
 
@@ -533,7 +549,7 @@ func (at *AutoTrader) createOrderRecord(orderID, symbol, action, positionSide st
 	normalizedSymbol := market.Normalize(symbol)
 
 	return &store.TraderOrder{
-		TraderID:        at.id,
+		TraderID:        traderID,
 		ExchangeID:      at.exchangeID,
 		ExchangeType:    at.exchange,
 		ExchangeOrderID: orderID,
@@ -560,6 +576,10 @@ func (at *AutoTrader) createOrderRecord(orderID, symbol, action, positionSide st
 
 // recordOrderFill records order fill/trade details
 func (at *AutoTrader) recordOrderFill(orderRecordID int64, exchangeOrderID, symbol, action string, price, quantity, fee float64) {
+	at.recordOrderFillForTrader(at.id, orderRecordID, exchangeOrderID, symbol, action, price, quantity, fee)
+}
+
+func (at *AutoTrader) recordOrderFillForTrader(traderID string, orderRecordID int64, exchangeOrderID, symbol, action string, price, quantity, fee float64) {
 	if at.store == nil {
 		return
 	}
@@ -580,7 +600,7 @@ func (at *AutoTrader) recordOrderFill(orderRecordID int64, exchangeOrderID, symb
 	normalizedSymbol := market.Normalize(symbol)
 
 	fill := &store.TraderFill{
-		TraderID:        at.id,
+		TraderID:        traderID,
 		ExchangeID:      at.exchangeID,
 		ExchangeType:    at.exchange,
 		OrderID:         orderRecordID,
@@ -608,7 +628,7 @@ func (at *AutoTrader) recordOrderFill(orderRecordID int64, exchangeOrderID, symb
 			positionSide = "SHORT"
 		}
 
-		if openPos, err := at.store.Position().GetOpenPositionBySymbol(at.id, symbol, positionSide); err == nil && openPos != nil {
+		if openPos, err := at.store.Position().GetOpenPositionBySymbol(traderID, symbol, positionSide); err == nil && openPos != nil {
 			if positionSide == "LONG" {
 				fill.RealizedPnL = (price - openPos.EntryPrice) * quantity
 			} else {

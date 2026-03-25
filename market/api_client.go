@@ -35,6 +35,87 @@ func NewAPIClient() *APIClient {
 	}
 }
 
+func (c *APIClient) GetBookTicker(symbol string) (*BookTicker, error) {
+	url := fmt.Sprintf("%s/fapi/v1/ticker/bookTicker", baseURL)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	q := req.URL.Query()
+	q.Add("symbol", symbol)
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var raw struct {
+		Symbol   string `json:"symbol"`
+		BidPrice string `json:"bidPrice"`
+		BidQty   string `json:"bidQty"`
+		AskPrice string `json:"askPrice"`
+		AskQty   string `json:"askQty"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	bidPrice, _ := strconv.ParseFloat(raw.BidPrice, 64)
+	bidQty, _ := strconv.ParseFloat(raw.BidQty, 64)
+	askPrice, _ := strconv.ParseFloat(raw.AskPrice, 64)
+	askQty, _ := strconv.ParseFloat(raw.AskQty, 64)
+	return &BookTicker{
+		Symbol:   raw.Symbol,
+		BidPrice: bidPrice,
+		BidQty:   bidQty,
+		AskPrice: askPrice,
+		AskQty:   askQty,
+	}, nil
+}
+
+func (c *APIClient) GetFundingRate(symbol string) (float64, error) {
+	url := fmt.Sprintf("%s/fapi/v1/premiumIndex", baseURL)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	q := req.URL.Query()
+	q.Add("symbol", symbol)
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+
+	var result struct {
+		LastFundingRate string `json:"lastFundingRate"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, err
+	}
+
+	rate, err := strconv.ParseFloat(result.LastFundingRate, 64)
+	if err != nil {
+		return 0, err
+	}
+	return rate, nil
+}
+
 func (c *APIClient) GetExchangeInfo() (*ExchangeInfo, error) {
 	url := fmt.Sprintf("%s/fapi/v1/exchangeInfo", baseURL)
 	resp, err := c.client.Get(url)

@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+func (t *KuCoinTrader) currentMarginMode() string {
+	if t != nil && !t.isCrossMargin {
+		return "ISOLATED"
+	}
+	return "CROSS"
+}
+
 // OpenLong opens long position
 func (t *KuCoinTrader) OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
 	// Cancel old orders
@@ -37,7 +44,7 @@ func (t *KuCoinTrader) OpenLong(symbol string, quantity float64, leverage int) (
 		"size":       lots,
 		"leverage":   fmt.Sprintf("%d", leverage),
 		"reduceOnly": false,
-		"marginMode": "CROSS", // Use cross margin mode
+		"marginMode": t.currentMarginMode(),
 	}
 
 	data, err := t.doRequest("POST", kucoinOrderPath, body)
@@ -92,7 +99,7 @@ func (t *KuCoinTrader) OpenShort(symbol string, quantity float64, leverage int) 
 		"size":       lots,
 		"leverage":   fmt.Sprintf("%d", leverage),
 		"reduceOnly": false,
-		"marginMode": "CROSS", // Use cross margin mode
+		"marginMode": t.currentMarginMode(),
 	}
 
 	data, err := t.doRequest("POST", kucoinOrderPath, body)
@@ -510,6 +517,7 @@ func (t *KuCoinTrader) CancelAllOrders(symbol string) error {
 // SetMarginMode sets margin mode
 func (t *KuCoinTrader) SetMarginMode(symbol string, isCrossMargin bool) error {
 	// KuCoin sets margin mode per position, handled automatically
+	t.isCrossMargin = isCrossMargin
 	logger.Infof("✓ KuCoin margin mode: %v (handled per position)", isCrossMargin)
 	return nil
 }

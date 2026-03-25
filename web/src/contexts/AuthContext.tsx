@@ -36,40 +36,70 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
+function readStoredUser(raw: string | null): User | null {
+  if (!raw) {
+    return null
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<User>
+    if (typeof parsed.id === 'string' && typeof parsed.email === 'string') {
+      return { id: parsed.id, email: parsed.email }
+    }
+  } catch {
+    // Fall through and clear the invalid cache entry.
+  }
+
+  return null
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [token, setToken] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
 
   useEffect(() => {
-    // Reset 401 flag on page load to allow fresh 401 handling
-    reset401Flag()
+    let cancelled = false
 
-    // Check if admin mode is active (uses cached system config)
-    getSystemConfig()
-      .then(() => {
-        // No longer simulate login in admin mode; check local storage uniformly
-        const savedToken = localStorage.getItem('auth_token')
-        const savedUser = localStorage.getItem('auth_user')
-        if (savedToken && savedUser) {
-          setToken(savedToken)
-          setUser(JSON.parse(savedUser))
-        }
+    const bootstrap = async () => {
+      // Reset 401 flag on page load to allow fresh 401 handling
+      reset401Flag()
 
-        setIsLoading(false)
-      })
-      .catch((err) => {
+      // Check if admin mode is active (uses cached system config)
+      try {
+        await getSystemConfig()
+      } catch (err) {
         console.error('Failed to fetch system config:', err)
-        // On error, continue checking local storage
-        const savedToken = localStorage.getItem('auth_token')
-        const savedUser = localStorage.getItem('auth_user')
+      }
 
-        if (savedToken && savedUser) {
-          setToken(savedToken)
-          setUser(JSON.parse(savedUser))
-        }
+      if (cancelled) {
+        return
+      }
+
+      // No longer simulate login in admin mode; check local storage uniformly.
+      const savedToken = localStorage.getItem('auth_token')
+      const savedUserRaw = localStorage.getItem('auth_user')
+      const savedUser = readStoredUser(savedUserRaw)
+
+      if (savedToken && savedUser) {
+        setToken(savedToken)
+        setUser(savedUser)
+      } else if (savedUserRaw) {
+        // Clear corrupt auth cache so a bad legacy value cannot block startup.
+        localStorage.removeItem('auth_token')
+        localStorage.removeItem('auth_user')
+      }
+
+      if (!cancelled) {
         setIsLoading(false)
-      })
+      }
+    }
+
+    void bootstrap()
+
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   // Listen for unauthorized events from httpClient (401 responses)

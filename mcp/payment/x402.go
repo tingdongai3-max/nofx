@@ -34,9 +34,9 @@ const (
 
 // X402v2PaymentRequired is the structure of the Payment-Required header (x402 v2).
 type X402v2PaymentRequired struct {
-	X402Version int              `json:"x402Version"`
+	X402Version int                `json:"x402Version"`
 	Accepts     []X402AcceptOption `json:"accepts"`
-	Resource    *X402Resource    `json:"resource"`
+	Resource    *X402Resource      `json:"resource"`
 }
 
 // X402AcceptOption is a payment option from the x402 v2 header.

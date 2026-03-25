@@ -3,6 +3,7 @@ package market
 import (
 	"math"
 	"testing"
+	"time"
 
 	"nofx/store"
 )
@@ -55,6 +56,90 @@ func TestEWMASpearmanCorrelation(t *testing.T) {
 	}
 	if negative > -0.99 {
 		t.Fatalf("expected near-perfect negative Spearman IC, got %.6f", negative)
+	}
+}
+
+func TestTemporalWeightedSpearmanCorrelationDetectsRegimeShiftThirtyPercentFaster(t *testing.T) {
+	const minuteMs = int64(time.Minute / time.Millisecond)
+
+	factor := make([]float64, 0, 5000)
+	returns := make([]float64, 0, 5000)
+	decisionTimes := make([]int64, 0, 5000)
+
+	oldBase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	for i := 0; i < 4000; i++ {
+		value := float64(i + 1)
+		factor = append(factor, value)
+		returns = append(returns, float64(4000-i))
+		decisionTimes = append(decisionTimes, oldBase+int64(i)*minuteMs)
+	}
+
+	recentBase := oldBase + int64(45*24*time.Hour/time.Millisecond)
+	for i := 0; i < 1000; i++ {
+		value := float64(4001 + i)
+		factor = append(factor, value)
+		returns = append(returns, value)
+		decisionTimes = append(decisionTimes, recentBase+int64(i)*minuteMs)
+	}
+
+	legacy := EWMASpearmanCorrelation(factor, returns, ICHalfLife)
+	weighted := TemporalWeightedSpearmanCorrelation(factor, returns, decisionTimes, ICHalfLife)
+
+	if weighted <= legacy {
+		t.Fatalf("expected temporal weighting to react faster than legacy EWMA, got weighted=%.6f legacy=%.6f", weighted, legacy)
+	}
+	if weighted < 0.85 {
+		t.Fatalf("expected temporal weighting to align strongly with the recent regime, got %.6f", weighted)
+	}
+
+	legacyGap := math.Abs(1 - legacy)
+	weightedGap := math.Abs(1 - weighted)
+	if legacyGap <= 0 {
+		t.Fatalf("expected non-zero legacy gap, got legacy=%.6f", legacy)
+	}
+	improvement := (legacyGap - weightedGap) / legacyGap
+	if improvement < 0.30 {
+		t.Fatalf("expected temporal weighting to close the recent-regime gap by at least 30%%, got improvement=%.4f weighted=%.6f legacy=%.6f", improvement, weighted, legacy)
+	}
+}
+
+func TestDynamicExponentialDecayWeightsNormalizeAndScaleWithDepth(t *testing.T) {
+	weightsFast, lambdaFast := dynamicExponentialDecayWeights(5, 500)
+	weightsSlow, lambdaSlow := dynamicExponentialDecayWeights(5, 5000)
+
+	if len(weightsFast) != 5 || len(weightsSlow) != 5 {
+		t.Fatalf("expected 5 weights in both cases, got fast=%d slow=%d", len(weightsFast), len(weightsSlow))
+	}
+
+	sumFast := 0.0
+	sumSlow := 0.0
+	for _, weight := range weightsFast {
+		sumFast += weight
+	}
+	for _, weight := range weightsSlow {
+		sumSlow += weight
+	}
+
+	if math.Abs(sumFast-1) > 1e-9 {
+		t.Fatalf("expected fast weights to normalize to 1, got %.12f", sumFast)
+	}
+	if math.Abs(sumSlow-1) > 1e-9 {
+		t.Fatalf("expected slow weights to normalize to 1, got %.12f", sumSlow)
+	}
+	if !(lambdaFast > lambdaSlow) {
+		t.Fatalf("expected smaller depth to yield larger lambda, got fast=%.12f slow=%.12f", lambdaFast, lambdaSlow)
+	}
+
+	ratioFast := weightsFast[1] / weightsFast[0]
+	ratioSlow := weightsSlow[1] / weightsSlow[0]
+	if math.Abs(ratioFast-math.Exp(-lambdaFast)) > 1e-9 {
+		t.Fatalf("expected fast decay ratio to match lambda, got ratio=%.12f lambda=%.12f", ratioFast, lambdaFast)
+	}
+	if math.Abs(ratioSlow-math.Exp(-lambdaSlow)) > 1e-9 {
+		t.Fatalf("expected slow decay ratio to match lambda, got ratio=%.12f lambda=%.12f", ratioSlow, lambdaSlow)
+	}
+	if !(ratioFast < ratioSlow) {
+		t.Fatalf("expected shallower memory depth to decay faster, got fast=%.12f slow=%.12f", ratioFast, ratioSlow)
 	}
 }
 
@@ -378,7 +463,7 @@ func TestComputeICsFromRowsIncludesVolumeSpike(t *testing.T) {
 		{Filled: true, ReturnPct: 0.05, VolumeSpikeFactor: 40, DonchianFactor: 42, MTFResonanceFactor: 38, QuantOIRaw: 4, QuantImbalanceRaw: 0.20, QuantNetflowRaw: 3.2, SocialRankRaw: 0.8, SocialUpvoteRaw: 70, OnChainRatioRaw: 1.1, OnChainBuyRaw: 0.60},
 	}
 
-	ics, sampleCount := computeICsFromRows(rows)
+	ics, sampleCount := computeICsFromRows(rows, 5000, "global")
 	if sampleCount != 4 {
 		t.Fatalf("expected 4 samples, got %d", sampleCount)
 	}
@@ -402,6 +487,59 @@ func TestComputeICsFromRowsIncludesVolumeSpike(t *testing.T) {
 	}
 	if ics["market"] != 0 {
 		t.Fatalf("expected zero market IC for empty factor series, got %.6f", ics["market"])
+	}
+}
+
+func TestComputeICsFromRowsRecentSamplesDrivePrimaryAxis(t *testing.T) {
+	const minuteMs = int64(time.Minute / time.Millisecond)
+
+	rows := make([]*store.ShadowSnapshot, 0, 180)
+	oldBase := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	for i := 0; i < 120; i++ {
+		value := float64(i + 1)
+		rows = append(rows, &store.ShadowSnapshot{
+			Filled:       true,
+			DecisionTime: oldBase + int64(i)*minuteMs,
+			ReturnPct:    float64(120 - i),
+			TrendFactor:  value,
+		})
+	}
+
+	recentBase := oldBase + int64(21*24*time.Hour/time.Millisecond)
+	for i := 0; i < 60; i++ {
+		value := float64(121 + i)
+		rows = append(rows, &store.ShadowSnapshot{
+			Filled:       true,
+			DecisionTime: recentBase + int64(i)*minuteMs,
+			ReturnPct:    value,
+			TrendFactor:  value,
+		})
+	}
+
+	ics, sampleCount := computeICsFromRows(rows, 100, "symbol")
+	if sampleCount != len(rows) {
+		t.Fatalf("expected %d samples, got %d", len(rows), sampleCount)
+	}
+	trendSeries := make([]float64, 0, len(rows))
+	returns := make([]float64, 0, len(rows))
+	for _, row := range rows {
+		trendSeries = append(trendSeries, row.TrendFactor)
+		returns = append(returns, row.ReturnPct)
+	}
+	legacy := EWMASpearmanCorrelation(trendSeries, returns, ICHalfLife)
+	if ics["trend"] <= legacy {
+		t.Fatalf("expected temporal weighting to outperform legacy EWMA, got weighted=%.6f legacy=%.6f", ics["trend"], legacy)
+	}
+	if ics["trend"] < 0.60 {
+		t.Fatalf("expected recent correct trend samples to remain strongly positive, got %.6f", ics["trend"])
+	}
+
+	weights := buildEmpiricalWeightsForOrder(adaptiveVisibleFactorOrder, defaultAdaptiveWeights(), ics)
+	if weights["trend"] <= weights["market"] || weights["trend"] <= weights["social"] || weights["trend"] <= weights["onchain"] {
+		t.Fatalf("expected trend to become the decision axis after temporal weighting, got weights=%v", weights)
+	}
+	if weights["trend"] < 0.80 {
+		t.Fatalf("expected trend axis to receive dominant weight, got %.6f", weights["trend"])
 	}
 }
 

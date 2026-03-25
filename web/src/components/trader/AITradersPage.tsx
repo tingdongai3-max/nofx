@@ -17,6 +17,7 @@ import { ExchangeConfigModal } from './ExchangeConfigModal'
 import { TelegramConfigModal } from './TelegramConfigModal'
 import { ModelConfigModal } from './ModelConfigModal'
 import { ConfigStatusGrid } from './ConfigStatusGrid'
+import { GlobalTradingSettingsPanel } from './GlobalTradingSettingsPanel'
 import { TradersList } from './TradersList'
 import {
   Bot,
@@ -686,6 +687,11 @@ export function AITradersPage({ onTraderSelect }: AITradersPageProps) {
             </button>
           </div>
         </div>
+
+        <GlobalTradingSettingsPanel
+          traders={traders || []}
+          loadingTraders={isTradersLoading}
+        />
 
         {/* Configuration Status Grid */}
         <ConfigStatusGrid

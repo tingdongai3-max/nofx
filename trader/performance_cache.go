@@ -125,31 +125,48 @@ func (c *PerformanceMatrixCache) getMatricesWithWindow(traderID, sector, symbol 
 }
 
 func (c *PerformanceMatrixCache) GetBackcastMatrices(traderID, sector, symbol string) (*kernel.PerformanceBinMatrices, error) {
-	return c.GetBackcastMatricesWithWindow(traderID, sector, symbol, store.PERFORMANCE_WINDOW_SIZE_DEFAULT)
+	return c.GetBackcastMatricesWithWindowFiltered(traderID, sector, symbol, store.PERFORMANCE_WINDOW_SIZE_DEFAULT, true)
 }
 
 func (c *PerformanceMatrixCache) GetBackcastMatricesWithWindow(traderID, sector, symbol string, windowSize int) (*kernel.PerformanceBinMatrices, error) {
-	return c.getBackcastMatricesWithWindow(traderID, sector, symbol, windowSize, false)
+	return c.GetBackcastMatricesWithWindowFiltered(traderID, sector, symbol, windowSize, true)
 }
 
 func (c *PerformanceMatrixCache) GetBackcastMatricesWithWindowWithPool(traderID, sector, symbol string, windowSize int, includeAllTraders bool) (*kernel.PerformanceBinMatrices, error) {
-	return c.getBackcastMatricesWithWindow(traderID, sector, symbol, windowSize, includeAllTraders)
+	return c.GetBackcastMatricesWithWindowWithPoolFiltered(traderID, sector, symbol, windowSize, includeAllTraders, true)
 }
 
-func (c *PerformanceMatrixCache) getBackcastMatricesWithWindow(traderID, sector, symbol string, windowSize int, includeAllTraders bool) (*kernel.PerformanceBinMatrices, error) {
+func (c *PerformanceMatrixCache) GetBackcastMatricesWithWindowFiltered(
+	traderID, sector, symbol string,
+	windowSize int,
+	resonanceFiltered bool,
+) (*kernel.PerformanceBinMatrices, error) {
+	return c.getBackcastMatricesWithWindow(traderID, sector, symbol, windowSize, false, resonanceFiltered)
+}
+
+func (c *PerformanceMatrixCache) GetBackcastMatricesWithWindowWithPoolFiltered(
+	traderID, sector, symbol string,
+	windowSize int,
+	includeAllTraders bool,
+	resonanceFiltered bool,
+) (*kernel.PerformanceBinMatrices, error) {
+	return c.getBackcastMatricesWithWindow(traderID, sector, symbol, windowSize, includeAllTraders, resonanceFiltered)
+}
+
+func (c *PerformanceMatrixCache) getBackcastMatricesWithWindow(traderID, sector, symbol string, windowSize int, includeAllTraders bool, resonanceFiltered bool) (*kernel.PerformanceBinMatrices, error) {
 	if c == nil || c.store == nil || (traderID == "" && !includeAllTraders) {
 		return nil, nil
 	}
 
 	windowSize = store.NormalizePerformanceWindowSize(windowSize)
-	globalBins, err := c.getBackcastGlobal(traderID, windowSize, includeAllTraders)
+	globalBins, err := c.getBackcastGlobal(traderID, windowSize, includeAllTraders, resonanceFiltered)
 	if err != nil {
 		return nil, err
 	}
 
 	var sectorBins []*store.ScoreBinPerformance
 	if sector != "" {
-		sectorBins, err = c.getBackcastSector(traderID, sector, windowSize, includeAllTraders)
+		sectorBins, err = c.getBackcastSector(traderID, sector, windowSize, includeAllTraders, resonanceFiltered)
 		if err != nil {
 			return nil, err
 		}
@@ -157,7 +174,7 @@ func (c *PerformanceMatrixCache) getBackcastMatricesWithWindow(traderID, sector,
 
 	var symbolBins []*store.ScoreBinPerformance
 	if symbol != "" {
-		symbolBins, err = c.getBackcastSymbol(traderID, sector, symbol, windowSize, includeAllTraders)
+		symbolBins, err = c.getBackcastSymbol(traderID, sector, symbol, windowSize, includeAllTraders, resonanceFiltered)
 		if err != nil {
 			return nil, err
 		}
@@ -180,47 +197,50 @@ func (c *PerformanceMatrixCache) getGlobal(traderID string, windowSize int, incl
 func (c *PerformanceMatrixCache) getSector(traderID, sector string, windowSize int, includeAllTraders bool) ([]*store.ScoreBinPerformance, error) {
 	cacheKey := performanceSectorCacheKey(traderID, sector, windowSize, includeAllTraders)
 	return c.getOrLoad("snapshot_sector", c.sector, cacheKey, c.globalSectorTTL, func() ([]*store.ScoreBinPerformance, error) {
-		return c.store.Shadow().ListSmoothedPerformanceBinsBySector(traderID, sector, windowSize, includeAllTraders)
+		return c.store.Shadow().ListRawPerformanceBinsBySector(traderID, sector, includeAllTraders)
 	})
 }
 
 func (c *PerformanceMatrixCache) getSymbol(traderID, symbol string, windowSize int, includeAllTraders bool) ([]*store.ScoreBinPerformance, error) {
 	cacheKey := performanceSymbolCacheKey(traderID, symbol, windowSize, includeAllTraders)
 	return c.getOrLoad("snapshot_symbol", c.symbol, cacheKey, c.symbolTTL, func() ([]*store.ScoreBinPerformance, error) {
-		return c.store.Shadow().ListSmoothedPerformanceBinsBySymbol(traderID, symbol, windowSize, includeAllTraders)
+		return c.store.Shadow().ListRawPerformanceBinsBySymbol(traderID, symbol, includeAllTraders)
 	})
 }
 
-func (c *PerformanceMatrixCache) getBackcastGlobal(traderID string, windowSize int, includeAllTraders bool) ([]*store.ScoreBinPerformance, error) {
+func (c *PerformanceMatrixCache) getBackcastGlobal(traderID string, windowSize int, includeAllTraders bool, resonanceFiltered bool) ([]*store.ScoreBinPerformance, error) {
 	state := market.GetAdaptiveWeightState(traderID, "", "")
-	cacheKey := performanceBackcastGlobalCacheKey(traderID, windowSize, includeAllTraders, state.GetWeightSignature())
+	cacheKey := performanceBackcastGlobalCacheKey(traderID, windowSize, includeAllTraders, resonanceFiltered, state.GetWeightSignature())
 	return c.getOrLoad("backcast_global", c.backcastGlobal, cacheKey, c.globalSectorTTL, func() ([]*store.ScoreBinPerformance, error) {
-		rows, err := c.store.Shadow().ListPerformanceSnapshotsByTrader(traderID, includeAllTraders)
+		queryTraderID := traderID
+		if includeAllTraders {
+			queryTraderID = ""
+		}
+		rows, err := c.store.Shadow().ListFilledForAdaptive(queryTraderID, store.PERFORMANCE_RECENT_SAMPLE_LIMIT)
 		if err != nil {
 			return nil, err
 		}
-		return market.RecalculateHistoricalBinsWithWindow(filterRowsWithRawFactors(rows), state, windowSize), nil
+		return c.recalculateBackcastBins(rows, state, windowSize, resonanceFiltered)
 	})
 }
 
-func (c *PerformanceMatrixCache) getBackcastSector(traderID, sector string, windowSize int, includeAllTraders bool) ([]*store.ScoreBinPerformance, error) {
+func (c *PerformanceMatrixCache) getBackcastSector(traderID, sector string, windowSize int, includeAllTraders bool, resonanceFiltered bool) ([]*store.ScoreBinPerformance, error) {
 	state := market.GetAdaptiveWeightState(traderID, sector, "")
-	cacheKey := performanceBackcastSectorCacheKey(traderID, sector, windowSize, includeAllTraders, state.GetWeightSignature())
+	cacheKey := performanceBackcastSectorCacheKey(traderID, sector, windowSize, includeAllTraders, resonanceFiltered, state.GetWeightSignature())
 	return c.getOrLoad("backcast_sector", c.backcastSector, cacheKey, c.globalSectorTTL, func() ([]*store.ScoreBinPerformance, error) {
-		rows, err := c.store.Shadow().ListPerformanceSnapshotsBySector(traderID, sector, includeAllTraders)
+		queryTraderID := traderID
+		if includeAllTraders {
+			queryTraderID = ""
+		}
+		rows, err := c.store.Shadow().ListFilledForSectorAdaptive(queryTraderID, sector, store.PERFORMANCE_RECENT_SAMPLE_LIMIT)
 		if err != nil {
 			return nil, err
 		}
-		sectorBins := market.RecalculateHistoricalBinsWithWindow(filterRowsWithRawFactors(rows), state, windowSize)
-		globalBins, err := c.getBackcastGlobal(traderID, windowSize, includeAllTraders)
-		if err != nil {
-			return nil, err
-		}
-		return store.SmoothPerformanceBins(sectorBins, globalBins, "global"), nil
+		return c.recalculateBackcastBins(rows, state, windowSize, resonanceFiltered)
 	})
 }
 
-func (c *PerformanceMatrixCache) getBackcastSymbol(traderID, sector, symbol string, windowSize int, includeAllTraders bool) ([]*store.ScoreBinPerformance, error) {
+func (c *PerformanceMatrixCache) getBackcastSymbol(traderID, sector, symbol string, windowSize int, includeAllTraders bool, resonanceFiltered bool) ([]*store.ScoreBinPerformance, error) {
 	resolvedSector := sector
 	if resolvedSector == "" {
 		latest, err := c.store.Shadow().GetLatestBySymbol(traderID, symbol, includeAllTraders)
@@ -233,28 +253,44 @@ func (c *PerformanceMatrixCache) getBackcastSymbol(traderID, sector, symbol stri
 	}
 
 	state := market.GetAdaptiveWeightState(traderID, resolvedSector, symbol)
-	cacheKey := performanceBackcastSymbolCacheKey(traderID, resolvedSector, symbol, windowSize, includeAllTraders, state.GetWeightSignature())
+	cacheKey := performanceBackcastSymbolCacheKey(traderID, resolvedSector, symbol, windowSize, includeAllTraders, resonanceFiltered, state.GetWeightSignature())
 	return c.getOrLoad("backcast_symbol", c.backcastSymbol, cacheKey, c.symbolTTL, func() ([]*store.ScoreBinPerformance, error) {
-		rows, err := c.store.Shadow().ListPerformanceSnapshotsBySymbol(traderID, symbol, includeAllTraders)
+		queryTraderID := traderID
+		if includeAllTraders {
+			queryTraderID = ""
+		}
+		rows, err := c.store.Shadow().ListFilledForCoinAdaptive(queryTraderID, symbol, store.PERFORMANCE_RECENT_SAMPLE_LIMIT)
 		if err != nil {
 			return nil, err
 		}
-
-		symbolBins := market.RecalculateHistoricalBinsWithWindow(filterRowsWithRawFactors(rows), state, windowSize)
-		globalBins, err := c.getBackcastGlobal(traderID, windowSize, includeAllTraders)
-		if err != nil {
-			return nil, err
-		}
-		if resolvedSector == "" {
-			return store.SmoothPerformanceBins(symbolBins, globalBins, "global"), nil
-		}
-
-		sectorBins, err := c.getBackcastSector(traderID, resolvedSector, windowSize, includeAllTraders)
-		if err != nil {
-			return nil, err
-		}
-		return store.SmoothPerformanceBinsWithFallbackChain(symbolBins, sectorBins, "sector", globalBins, "global"), nil
+		return c.recalculateBackcastBins(rows, state, windowSize, resonanceFiltered)
 	})
+}
+
+func (c *PerformanceMatrixCache) recalculateBackcastBins(
+	rows []*store.ShadowSnapshot,
+	state market.AdaptiveWeightState,
+	windowSize int,
+	resonanceFiltered bool,
+) ([]*store.ScoreBinPerformance, error) {
+	filteredRows := filterRowsWithRawFactors(rows)
+	if len(filteredRows) == 0 {
+		return nil, nil
+	}
+
+	if !resonanceFiltered || c == nil || c.store == nil {
+		return market.RecalculateHistoricalFactors(filteredRows, state, windowSize), nil
+	}
+
+	guardConfig, err := c.store.GetResonanceGuardConfig()
+	if err != nil {
+		return nil, err
+	}
+	filter := kernel.BuildResonanceSnapshotFilter(filteredRows, guardConfig.AdaptiveEntryFloor, guardConfig.AdaptiveEntryLambda, 2.0)
+	if filter == nil {
+		return market.RecalculateHistoricalFactors(filteredRows, state, windowSize), nil
+	}
+	return market.RecalculateHistoricalFactors(filteredRows, state, windowSize, filter), nil
 }
 
 func (c *PerformanceMatrixCache) getOrLoad(
@@ -325,20 +361,20 @@ func performanceSymbolCacheKey(traderID, symbol string, windowSize int, includeA
 	return fmt.Sprintf("%s::%s::w%d", performancePoolTag(traderID, includeAllTraders), symbol, store.NormalizePerformanceWindowSize(windowSize))
 }
 
-func performanceBackcastPoolTag(traderID string, includeAllTraders bool, signature string) string {
-	return fmt.Sprintf("%s::backcast::sig_%s", performancePoolTag(traderID, includeAllTraders), signature)
+func performanceBackcastPoolTag(traderID string, includeAllTraders bool, resonanceFiltered bool, signature string) string {
+	return fmt.Sprintf("%s::backcast::rf_%t::sig_%s", performancePoolTag(traderID, includeAllTraders), resonanceFiltered, signature)
 }
 
-func performanceBackcastGlobalCacheKey(traderID string, windowSize int, includeAllTraders bool, signature string) string {
-	return fmt.Sprintf("%s::w%d", performanceBackcastPoolTag(traderID, includeAllTraders, signature), store.NormalizePerformanceWindowSize(windowSize))
+func performanceBackcastGlobalCacheKey(traderID string, windowSize int, includeAllTraders bool, resonanceFiltered bool, signature string) string {
+	return fmt.Sprintf("%s::w%d", performanceBackcastPoolTag(traderID, includeAllTraders, resonanceFiltered, signature), store.NormalizePerformanceWindowSize(windowSize))
 }
 
-func performanceBackcastSectorCacheKey(traderID, sector string, windowSize int, includeAllTraders bool, signature string) string {
-	return fmt.Sprintf("%s::%s::w%d", performanceBackcastPoolTag(traderID, includeAllTraders, signature), sector, store.NormalizePerformanceWindowSize(windowSize))
+func performanceBackcastSectorCacheKey(traderID, sector string, windowSize int, includeAllTraders bool, resonanceFiltered bool, signature string) string {
+	return fmt.Sprintf("%s::%s::w%d", performanceBackcastPoolTag(traderID, includeAllTraders, resonanceFiltered, signature), sector, store.NormalizePerformanceWindowSize(windowSize))
 }
 
-func performanceBackcastSymbolCacheKey(traderID, sector, symbol string, windowSize int, includeAllTraders bool, signature string) string {
-	return fmt.Sprintf("%s::%s::%s::w%d", performanceBackcastPoolTag(traderID, includeAllTraders, signature), sector, symbol, store.NormalizePerformanceWindowSize(windowSize))
+func performanceBackcastSymbolCacheKey(traderID, sector, symbol string, windowSize int, includeAllTraders bool, resonanceFiltered bool, signature string) string {
+	return fmt.Sprintf("%s::%s::%s::w%d", performanceBackcastPoolTag(traderID, includeAllTraders, resonanceFiltered, signature), sector, symbol, store.NormalizePerformanceWindowSize(windowSize))
 }
 
 func filterRowsWithRawFactors(rows []*store.ShadowSnapshot) []*store.ShadowSnapshot {

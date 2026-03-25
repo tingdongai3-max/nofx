@@ -14,19 +14,25 @@ import { API_BASE, httpClient } from './helpers'
 
 async function fetchPerformanceBins(
   path: 'performance-bins' | 'performance-bins/backcast',
-  traderId: string,
+  traderId?: string,
   scope: 'global' | 'sector' | 'symbol' = 'global',
   target?: string,
-  windowSize?: number
+  windowSize?: number,
+  resonanceFiltered?: boolean
 ): Promise<ScoreBinPerformance[]> {
   const params = new URLSearchParams()
-  params.append('trader_id', traderId)
+  if (traderId) {
+    params.append('trader_id', traderId)
+  }
   params.append('scope', scope)
   if (target) {
     params.append('target', target)
   }
   if (typeof windowSize === 'number' && Number.isFinite(windowSize) && windowSize > 0) {
     params.append('window_size', Math.round(windowSize).toString())
+  }
+  if (typeof resonanceFiltered === 'boolean') {
+    params.append('resonance_filter', resonanceFiltered ? 'true' : 'false')
   }
 
   const result = await httpClient.get<ScoreBinPerformance[]>(
@@ -147,21 +153,29 @@ export const dataApi = {
     return result.data!
   },
 
-  async getShadowSnapshots(traderId: string, limit: number = 200): Promise<ShadowSnapshot[]> {
+  async getShadowSnapshots(traderId?: string, limit: number = 200): Promise<ShadowSnapshot[]> {
+    const params = new URLSearchParams()
+    if (traderId) {
+      params.append('trader_id', traderId)
+    }
+    params.append('limit', limit.toString())
+
     const result = await httpClient.get<ShadowSnapshot[]>(
-      `${API_BASE}/shadow-snapshots?trader_id=${encodeURIComponent(traderId)}&limit=${limit}`
+      `${API_BASE}/shadow-snapshots?${params.toString()}`
     )
     if (!result.success) throw new Error('Failed to fetch shadow snapshots')
     return Array.isArray(result.data) ? result.data : []
   },
 
   async getAdaptiveWeights(
-    traderId: string,
+    traderId?: string,
     scope: 'global' | 'sector' | 'symbol' = 'global',
     target?: string
   ): Promise<AdaptiveWeightState> {
     const params = new URLSearchParams()
-    params.append('trader_id', traderId)
+    if (traderId) {
+      params.append('trader_id', traderId)
+    }
     params.append('scope', scope)
     if (target) {
       params.append('target', target)
@@ -177,7 +191,7 @@ export const dataApi = {
         sector_sample_count: 0,
         coin_sample_count: 0,
         alpha: 0,
-        sample_target: 2000,
+        sample_target: 5000,
         blend_default: 1,
         blend_adaptive: 0,
         factors: [],
@@ -189,7 +203,7 @@ export const dataApi = {
   },
 
   async getPerformanceBins(
-    traderId: string,
+    traderId?: string,
     scope: 'global' | 'sector' | 'symbol' = 'global',
     target?: string,
     windowSize?: number
@@ -198,12 +212,20 @@ export const dataApi = {
   },
 
   async getBackcastPerformanceBins(
-    traderId: string,
+    traderId?: string,
     scope: 'global' | 'sector' | 'symbol' = 'global',
     target?: string,
-    windowSize?: number
+    windowSize?: number,
+    resonanceFiltered: boolean = true
   ): Promise<ScoreBinPerformance[]> {
-    return fetchPerformanceBins('performance-bins/backcast', traderId, scope, target, windowSize)
+    return fetchPerformanceBins(
+      'performance-bins/backcast',
+      traderId,
+      scope,
+      target,
+      windowSize,
+      resonanceFiltered
+    )
   },
 
   async checkFullStackHealth(): Promise<{ status: string; full_stack?: boolean; error?: string }> {

@@ -311,8 +311,8 @@ func (s *PositionStore) GetHoldingTimeStats(traderID string) ([]HoldingTimeStats
 	}
 
 	rangeStats := map[string]*struct {
-		count   int
-		wins    int
+		count    int
+		wins     int
 		totalPnL float64
 	}{
 		"<1h":   {},

@@ -117,47 +117,57 @@ type AutoTraderConfig struct {
 
 // AutoTrader automatic trader
 type AutoTrader struct {
-	id                    string // Trader unique identifier
-	name                  string // Trader display name
-	aiModel               string // AI model name
-	exchange              string // Trading platform type (binance/bybit/etc)
-	exchangeID            string // Exchange account UUID
-	showInCompetition     bool   // Whether to show in competition page
-	config                AutoTraderConfig
-	trader                Trader // Use Trader interface (supports multiple platforms)
-	mcpClient             mcp.AIClient
-	store                 *store.Store           // Data storage (decision records, etc.)
-	strategyEngine        *kernel.StrategyEngine // Strategy engine (uses strategy configuration)
-	cycleNumber           int                    // Current cycle number
-	initialBalance        float64
-	dailyPnL              float64
-	customPrompt          string // Custom trading strategy prompt
-	overrideBasePrompt    bool   // Whether to override base prompt
-	lastResetTime         time.Time
-	stopUntil             time.Time
-	isRunning             bool
-	isRunningMutex        sync.RWMutex     // Mutex to protect isRunning flag
-	stateMu               sync.RWMutex     // Protects cycle counters and trader runtime state
-	startTime             time.Time        // System start time
-	callCount             int              // AI call count
-	positionFirstSeenTime map[string]int64 // Position first seen time (symbol_side -> timestamp in milliseconds)
-	positionFirstSeenMu   sync.RWMutex
-	stopMonitorCh         chan struct{}  // Used to stop monitoring goroutine
-	monitorWg             sync.WaitGroup // Used to wait for monitoring goroutine to finish
-	activeCycleWg         sync.WaitGroup
-	peakPnLCache          map[string]float64 // Peak profit cache (symbol -> peak P&L percentage)
-	peakPnLCacheMutex     sync.RWMutex       // Cache read-write lock
-	lastBalanceSyncTime   time.Time          // Last balance sync time
-	userID                string             // User ID
-	gridState             *GridState         // Grid trading state (only used when StrategyType == "grid_trading")
-	claw402WalletAddr     string             // Claw402 wallet address (derived from private key at start)
-	performanceCache      *PerformanceMatrixCache
-	candidateTelemetry    map[string]candidateTelemetrySnapshot
-	candidateSnapshot     CandidateSnapshot // Latest candidate-market snapshot aligned with the most recent AI cycle
-	candidateSnapshotMu   sync.RWMutex
-	shadowTargetWindow    time.Duration
-	shadowPollInterval    time.Duration
-	shadowPriceFetcher    func(symbol string, target time.Time) (float64, error)
+	id                       string // Trader unique identifier
+	name                     string // Trader display name
+	aiModel                  string // AI model name
+	exchange                 string // Trading platform type (binance/bybit/etc)
+	exchangeID               string // Exchange account UUID
+	showInCompetition        bool   // Whether to show in competition page
+	config                   AutoTraderConfig
+	trader                   Trader // Use Trader interface (supports multiple platforms)
+	mcpClient                mcp.AIClient
+	store                    *store.Store           // Data storage (decision records, etc.)
+	strategyEngine           *kernel.StrategyEngine // Strategy engine (uses strategy configuration)
+	cycleNumber              int                    // Current cycle number
+	initialBalance           float64
+	dailyPnL                 float64
+	customPrompt             string // Custom trading strategy prompt
+	overrideBasePrompt       bool   // Whether to override base prompt
+	lastResetTime            time.Time
+	stopUntil                time.Time
+	isRunning                bool
+	isRunningMutex           sync.RWMutex     // Mutex to protect isRunning flag
+	stateMu                  sync.RWMutex     // Protects cycle counters and trader runtime state
+	startTime                time.Time        // System start time
+	callCount                int              // AI call count
+	positionFirstSeenTime    map[string]int64 // Position first seen time (symbol_side -> timestamp in milliseconds)
+	positionFirstSeenMu      sync.RWMutex
+	stopMonitorCh            chan struct{} // Used to stop monitoring goroutine
+	stopMonitorClosed        bool
+	monitorWg                sync.WaitGroup // Used to wait for monitoring goroutine to finish
+	activeCycleWg            sync.WaitGroup
+	peakPnLCache             map[string]float64 // Peak profit cache (symbol -> peak P&L percentage)
+	peakPnLCacheMutex        sync.RWMutex       // Cache read-write lock
+	lastBalanceSyncTime      time.Time          // Last balance sync time
+	userID                   string             // User ID
+	gridState                *GridState         // Grid trading state (only used when StrategyType == "grid_trading")
+	claw402WalletAddr        string             // Claw402 wallet address (derived from private key at start)
+	performanceCache         *PerformanceMatrixCache
+	candidateTelemetry       map[string]candidateTelemetrySnapshot
+	candidateSnapshot        CandidateSnapshot // Latest candidate-market snapshot aligned with the most recent AI cycle
+	candidateSnapshotMu      sync.RWMutex
+	shadowTargetWindow       time.Duration
+	shadowPollInterval       time.Duration
+	shadowTrackerMu          sync.Mutex
+	shadowTrackerRunning     bool
+	shadowPriceFetcher       func(symbol string, target time.Time) (float64, error)
+	realBacktestScanInterval time.Duration
+	realBacktestHoldDuration time.Duration
+	realBacktestTimerMu      sync.Mutex
+	realBacktestCloseTimers  map[int64]*time.Timer
+	realBacktestClosingIDs   map[int64]struct{}
+	fixedAutoCloseMu         sync.Mutex
+	fixedAutoClosingIDs      map[int64]struct{}
 }
 
 type candidateTelemetrySnapshot struct {
@@ -383,34 +393,39 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 	logger.Infof("✓ [%s] Using strategy engine (strategy configuration loaded)", config.Name)
 
 	return &AutoTrader{
-		id:                    config.ID,
-		name:                  config.Name,
-		aiModel:               config.AIModel,
-		exchange:              config.Exchange,
-		exchangeID:            config.ExchangeID,
-		showInCompetition:     config.ShowInCompetition,
-		config:                config,
-		trader:                trader,
-		mcpClient:             mcpClient,
-		store:                 st,
-		strategyEngine:        strategyEngine,
-		cycleNumber:           cycleNumber,
-		initialBalance:        config.InitialBalance,
-		lastResetTime:         time.Now(),
-		startTime:             time.Now(),
-		callCount:             0,
-		isRunning:             false,
-		positionFirstSeenTime: make(map[string]int64),
-		stopMonitorCh:         make(chan struct{}),
-		monitorWg:             sync.WaitGroup{},
-		peakPnLCache:          make(map[string]float64),
-		peakPnLCacheMutex:     sync.RWMutex{},
-		lastBalanceSyncTime:   time.Now(),
-		userID:                userID,
-		performanceCache:      performanceCache,
-		candidateTelemetry:    make(map[string]candidateTelemetrySnapshot),
-		shadowTargetWindow:    defaultShadowTargetWindow,
-		shadowPollInterval:    defaultShadowPollInterval,
+		id:                       config.ID,
+		name:                     config.Name,
+		aiModel:                  config.AIModel,
+		exchange:                 config.Exchange,
+		exchangeID:               config.ExchangeID,
+		showInCompetition:        config.ShowInCompetition,
+		config:                   config,
+		trader:                   trader,
+		mcpClient:                mcpClient,
+		store:                    st,
+		strategyEngine:           strategyEngine,
+		cycleNumber:              cycleNumber,
+		initialBalance:           config.InitialBalance,
+		lastResetTime:            time.Now(),
+		startTime:                time.Now(),
+		callCount:                0,
+		isRunning:                false,
+		positionFirstSeenTime:    make(map[string]int64),
+		stopMonitorCh:            make(chan struct{}),
+		monitorWg:                sync.WaitGroup{},
+		peakPnLCache:             make(map[string]float64),
+		peakPnLCacheMutex:        sync.RWMutex{},
+		lastBalanceSyncTime:      time.Now(),
+		userID:                   userID,
+		performanceCache:         performanceCache,
+		candidateTelemetry:       make(map[string]candidateTelemetrySnapshot),
+		shadowTargetWindow:       defaultShadowTargetWindow,
+		shadowPollInterval:       defaultShadowPollInterval,
+		realBacktestScanInterval: defaultRealBacktestScanInterval,
+		realBacktestHoldDuration: defaultRealBacktestHoldDuration,
+		realBacktestCloseTimers:  make(map[int64]*time.Timer),
+		realBacktestClosingIDs:   make(map[int64]struct{}),
+		fixedAutoClosingIDs:      make(map[int64]struct{}),
 	}, nil
 }
 
@@ -418,9 +433,11 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 func (at *AutoTrader) Run() error {
 	at.isRunningMutex.Lock()
 	at.isRunning = true
+	if at.stopMonitorCh == nil || at.stopMonitorClosed {
+		at.stopMonitorCh = make(chan struct{})
+		at.stopMonitorClosed = false
+	}
 	at.isRunningMutex.Unlock()
-
-	at.stopMonitorCh = make(chan struct{})
 	at.startTime = time.Now()
 
 	logger.Info("🚀 AI-driven automatic trading system started")
@@ -433,8 +450,8 @@ func (at *AutoTrader) Run() error {
 	at.monitorWg.Add(1)
 	defer at.monitorWg.Done()
 
-	// Start drawdown monitoring
-	at.startDrawdownMonitor()
+	// Start fixed timed-exit monitoring
+	at.startFixedAutoCloseMonitor()
 	at.startShadowTrackerDaemon()
 
 	// Start Lighter order sync if using Lighter exchange
@@ -547,6 +564,12 @@ func (at *AutoTrader) Run() error {
 					logger.Infof("❌ Grid execution failed: %v", err)
 				}
 			} else {
+				if enabled, err := at.isRealBacktestEnabled(); err != nil {
+					logger.Warnf("⚠️ Failed to read real backtest config: %v", err)
+				} else if enabled {
+					logger.Infof("🎯 [%s] Real backtest mode active, AI cycle skipped", at.name)
+					continue
+				}
 				at.startAICycle(scheduledTick)
 			}
 		case <-at.stopMonitorCh:
@@ -582,10 +605,14 @@ func (at *AutoTrader) Stop() {
 		return
 	}
 	at.isRunning = false
+	if at.stopMonitorCh != nil && !at.stopMonitorClosed {
+		close(at.stopMonitorCh) // Notify monitoring goroutine to stop
+		at.stopMonitorClosed = true
+	}
 	at.isRunningMutex.Unlock()
 
-	close(at.stopMonitorCh) // Notify monitoring goroutine to stop
-	at.monitorWg.Wait()     // Wait for monitoring goroutine to finish
+	at.cancelAllRealBacktestAutoCloseTimers()
+	at.monitorWg.Wait() // Wait for monitoring goroutine to finish
 	at.activeCycleWg.Wait()
 	logger.Info("⏹ Automatic trading system stopped")
 }
@@ -614,6 +641,11 @@ func (at *AutoTrader) GetAIModel() string {
 // GetExchange gets exchange
 func (at *AutoTrader) GetExchange() string {
 	return at.exchange
+}
+
+// GetExchangeID gets the backing exchange account ID.
+func (at *AutoTrader) GetExchangeID() string {
+	return at.exchangeID
 }
 
 // GetShowInCompetition returns whether trader should be shown in competition

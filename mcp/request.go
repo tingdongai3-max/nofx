@@ -4,9 +4,9 @@ package mcp
 // Supports plain messages (Role+Content), assistant tool-call messages (ToolCalls),
 // and tool result messages (Role="tool", ToolCallID, Content).
 type Message struct {
-	Role       string     `json:"role"`                  // "system", "user", "assistant", "tool"
-	Content    string     `json:"content,omitempty"`     // Text content (omitted when ToolCalls present)
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`  // Set by assistant when calling tools
+	Role       string     `json:"role"`                   // "system", "user", "assistant", "tool"
+	Content    string     `json:"content,omitempty"`      // Text content (omitted when ToolCalls present)
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // Set by assistant when calling tools
 	ToolCallID string     `json:"tool_call_id,omitempty"` // Set on role="tool" result messages
 }
 
@@ -27,8 +27,13 @@ type ToolCallFunction struct {
 // text reply (Content) and any structured tool calls (ToolCalls).
 // Exactly one of the two fields will be non-empty for a well-formed response.
 type LLMResponse struct {
-	Content   string     // Plain-text reply (final answer)
-	ToolCalls []ToolCall // Structured tool invocations
+	Content          string     // Plain-text reply (final answer)
+	ToolCalls        []ToolCall // Structured tool invocations
+	FinishReason     string     // Provider finish reason, e.g. "stop" or "length"
+	PromptTokens     int        // Prompt token usage reported by provider
+	CompletionTokens int        // Completion token usage reported by provider
+	TotalTokens      int        // Total token usage reported by provider
+	RawBodyTail      string     // Tail of the raw response body for truncation/debug analysis
 }
 
 // Tool represents a tool/function that AI can call
@@ -47,9 +52,9 @@ type FunctionDef struct {
 // Request AI API request (supports advanced features)
 type Request struct {
 	// Basic fields
-	Model    string    `json:"model"`              // Model name
-	Messages []Message `json:"messages"`           // Conversation message list
-	Stream   bool      `json:"stream,omitempty"`   // Whether to stream response
+	Model    string    `json:"model"`            // Model name
+	Messages []Message `json:"messages"`         // Conversation message list
+	Stream   bool      `json:"stream,omitempty"` // Whether to stream response
 
 	// Optional parameters (for fine-grained control)
 	Temperature      *float64 `json:"temperature,omitempty"`       // Temperature (0-2), controls randomness

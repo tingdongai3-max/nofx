@@ -6,19 +6,15 @@ import type {
   AdaptiveWeightState,
   ScoreBinPerformance,
   ShadowSnapshot,
-  TraderInfo,
 } from '../types'
 import { api } from '../lib/api'
+import { useSystemConfig } from '../hooks/useSystemConfig'
 import { DeepVoidBackground } from '../components/common/DeepVoidBackground'
 import { AdaptiveRadarChart } from '../components/charts/AdaptiveRadarChart'
 import { ScoreBinPerformanceChart } from '../components/charts/ScoreBinPerformanceChart'
 
 interface DataLabPageProps {
   language: Language
-  selectedTrader?: TraderInfo
-  selectedTraderId?: string
-  traders?: TraderInfo[]
-  onTraderSelect: (traderId: string) => void
 }
 
 type Scope =
@@ -26,7 +22,7 @@ type Scope =
   | { type: 'sector'; target: string }
   | { type: 'symbol'; target: string }
 
-type PerformanceWindowSize = 5 | 10
+const PERFORMANCE_BIN_STEP = 1
 
 function formatDecision(actionTaken: number, language: Language) {
   if (actionTaken === 1) {
@@ -261,19 +257,15 @@ function normalizeNestedGroupWeights(
 
 export function DataLabPage({
   language,
-  selectedTrader,
-  selectedTraderId,
-  traders,
-  onTraderSelect,
 }: DataLabPageProps) {
+  const { config: systemConfig } = useSystemConfig()
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({})
   const [currentScope, setCurrentScope] = useState<Scope>({ type: 'global' })
   const [realtimeBackcast, setRealtimeBackcast] = useState(false)
-  const [performanceWindowSize, setPerformanceWindowSize] =
-    useState<PerformanceWindowSize>(5)
+  const [resonanceFiltered, setResonanceFiltered] = useState(true)
   const { data, error, isLoading } = useSWR<ShadowSnapshot[]>(
-    selectedTraderId ? `shadow-snapshots-${selectedTraderId}` : null,
-    () => api.getShadowSnapshots(selectedTraderId!, 200),
+    'shadow-snapshots-global',
+    () => api.getShadowSnapshots(undefined, 200),
     {
       refreshInterval: 60000,
       revalidateOnFocus: false,
@@ -299,13 +291,6 @@ export function DataLabPage({
   }
   const defaultSectorTarget = focusSnapshot?.sector || availableSectors[0] || ''
   const defaultSymbolTarget = focusSnapshot?.symbol || availableSymbols[0] || ''
-
-  useEffect(() => {
-    setCurrentScope({ type: 'global' })
-    setExpandedGroups({})
-    setRealtimeBackcast(false)
-    setPerformanceWindowSize(5)
-  }, [selectedTraderId])
 
   useEffect(() => {
     if (currentScope.type === 'sector') {
@@ -342,12 +327,10 @@ export function DataLabPage({
     error: adaptiveError,
     isLoading: adaptiveLoading,
   } = useSWR<AdaptiveWeightState>(
-    selectedTraderId
-      ? `adaptive-weights-${selectedTraderId}-${currentScope.type}-${currentScope.type === 'global' ? 'all' : currentScope.target}`
-      : null,
+    `adaptive-weights-global-${currentScope.type}-${currentScope.type === 'global' ? 'all' : currentScope.target}`,
     () =>
       api.getAdaptiveWeights(
-        selectedTraderId!,
+        undefined,
         currentScope.type,
         currentScope.type === 'global' ? undefined : currentScope.target
       ),
@@ -357,27 +340,38 @@ export function DataLabPage({
       dedupingInterval: 20000,
     }
   )
+
+  const sampleTarget =
+    systemConfig?.adaptive_global_samples || adaptiveState?.sample_target || 5000
+  const sectorSampleTarget = systemConfig?.adaptive_sector_samples || 3000
+  const coinSampleTarget = systemConfig?.adaptive_symbol_samples || 1000
+  const scopeSampleTarget =
+    currentScope.type === 'symbol'
+      ? coinSampleTarget
+      : currentScope.type === 'sector'
+        ? sectorSampleTarget
+        : sampleTarget
+
   const {
     data: performanceBins,
     error: performanceBinsError,
     isLoading: performanceBinsLoading,
   } = useSWR<ScoreBinPerformance[]>(
-    selectedTraderId
-      ? `performance-bins-${realtimeBackcast ? 'backcast' : 'snapshot'}-${selectedTraderId}-${currentScope.type}-${currentScope.type === 'global' ? 'all' : currentScope.target}-window-${performanceWindowSize}`
-      : null,
+    `performance-bins-${realtimeBackcast ? 'backcast' : 'snapshot'}-global-${currentScope.type}-${currentScope.type === 'global' ? 'all' : currentScope.target}-step-${PERFORMANCE_BIN_STEP}-rf-${resonanceFiltered ? 'on' : 'off'}`,
     () =>
       realtimeBackcast
         ? api.getBackcastPerformanceBins(
-            selectedTraderId!,
+            undefined,
             currentScope.type,
             currentScope.type === 'global' ? undefined : currentScope.target,
-            performanceWindowSize
+            PERFORMANCE_BIN_STEP,
+            resonanceFiltered
           )
         : api.getPerformanceBins(
-            selectedTraderId!,
+            undefined,
             currentScope.type,
             currentScope.type === 'global' ? undefined : currentScope.target,
-            performanceWindowSize
+            PERFORMANCE_BIN_STEP
           ),
     {
       refreshInterval: 60000,
@@ -385,15 +379,12 @@ export function DataLabPage({
       dedupingInterval: 20000,
     }
   )
-
   const adaptiveFactors = adaptiveState?.factors || []
   const hiddenFactors = adaptiveState?.hidden_factors || []
   const nestedWeights = adaptiveState?.nested_weights || {}
   const performanceBinRows = performanceBins || []
-  const peakWindowTradeCount = performanceBinRows.reduce(
-    (max, row) => Math.max(max, row.trade_count),
-    0
-  )
+  const positiveSampleCount = adaptiveState?.sample_count || 0
+  const dnaUpdatedAt = adaptiveState?.updated_at || 0
   const scopeDescription = describeScope(currentScope, language)
   const performanceModeLabel = realtimeBackcast
     ? language === 'zh'
@@ -402,16 +393,12 @@ export function DataLabPage({
     : language === 'zh'
       ? '快照分数'
       : 'Snapshot Scores'
-  const sampleTarget = adaptiveState?.sample_target || 2000
-  const coinSampleTarget = 500
   const scopeSampleCount =
     currentScope.type === 'symbol'
       ? adaptiveState?.coin_sample_count || 0
       : currentScope.type === 'sector'
         ? adaptiveState?.sector_sample_count || adaptiveState?.sample_count || 0
         : adaptiveState?.sample_count || 0
-  const scopeSampleTarget =
-    currentScope.type === 'symbol' ? coinSampleTarget : sampleTarget
   const warmingUp = scopeSampleCount < scopeSampleTarget
   const symbolSampleInsufficient =
     currentScope.type === 'symbol' && scopeSampleCount < 10
@@ -470,14 +457,11 @@ export function DataLabPage({
     setCurrentScope({ type: currentScope.type, target })
   }
 
-  const smoothingWindowLabel =
-    performanceWindowSize === 10
-      ? language === 'zh'
-        ? '宽窗 ±5'
-        : 'Wide ±5'
-      : language === 'zh'
-        ? '标准 ±2.5'
-        : 'Standard ±2.5'
+  const rawBinStepLabel = language === 'zh' ? '原始分箱步长 1' : 'Raw bin step 1'
+  const rawBinCountLabel =
+    language === 'zh'
+      ? `${performanceBinRows.length} 个分箱点`
+      : `${performanceBinRows.length} raw points`
 
   return (
     <DeepVoidBackground className="pb-10">
@@ -492,50 +476,10 @@ export function DataLabPage({
           }}
         >
           <div className="border-b border-white/10 px-6 py-6 sm:px-8">
-            <div className="flex flex-col gap-6 xl:flex-row xl:items-end xl:justify-between">
-              <div className="max-w-3xl">
-                <p className="text-xs uppercase tracking-[0.32em] text-[#F0B90B]/80">
-                  {language === 'zh' ? 'Data Lab / Shadow Tracker' : 'Data Lab / Shadow Tracker'}
-                </p>
-                <h1 className="mt-3 text-3xl font-semibold text-white sm:text-[2.4rem]">
-                  {language === 'zh' ? '影子快照监控台' : 'Shadow Snapshot Monitor'}
-                </h1>
-                <p className="mt-3 max-w-2xl text-sm leading-6 text-[#B7BDC6]">
-                  {language === 'zh'
-                    ? '每次 AI 决策都会把候选池在 T0 的物理截面落盘，Shadow Daemon 会在 T+15m 回填真实收益，专门暴露 AI 错失机会的盲区。'
-                    : 'Every AI cycle stores the full T0 candidate cross-section, then the shadow daemon backfills T+15m realized returns to expose missed opportunities.'}
-                </p>
-              </div>
-
-              <div className="w-full max-w-sm">
-                <label className="mb-2 block text-xs uppercase tracking-[0.28em] text-[#848E9C]">
-                  {language === 'zh' ? '观察 Trader' : 'Trader'}
-                </label>
-                <select
-                  value={selectedTraderId || ''}
-                  onChange={(e) => onTraderSelect(e.target.value)}
-                  className="w-full rounded-2xl border px-4 py-3 text-sm outline-none transition"
-                  style={{
-                    borderColor: 'rgba(240, 185, 11, 0.18)',
-                    background: 'rgba(11, 14, 17, 0.78)',
-                    color: '#EAECEF',
-                  }}
-                >
-                  {(traders || []).map((trader) => (
-                    <option key={trader.trader_id} value={trader.trader_id}>
-                      {trader.trader_name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-          </div>
-
-          <div className="border-b border-white/10 px-6 py-6 sm:px-8">
             <div className="mb-5 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
               <div>
-                <p className="text-xs uppercase tracking-[0.28em] text-[#22D3EE]/80">
-                  {language === 'zh' ? 'Adaptive Radar' : 'Adaptive Radar'}
+                <p className="text-xs uppercase tracking-[0.28em] text-[#F59E0B]/80">
+                  {language === 'zh' ? '自适应雷达' : 'Adaptive Radar'}
                 </p>
                 <h2 className="mt-2 text-2xl font-semibold text-white">
                   {language === 'zh' ? '自适应雷达' : 'Adaptive Radar'}
@@ -591,9 +535,7 @@ export function DataLabPage({
                     >
                       {scopeOptions.map((option) => (
                         <option key={option} value={option}>
-                          {currentScope.type === 'symbol'
-                            ? formatSymbolTarget(option)
-                            : option}
+                          {currentScope.type === 'symbol' ? formatSymbolTarget(option) : option}
                         </option>
                       ))}
                     </select>
@@ -608,37 +550,37 @@ export function DataLabPage({
             </div>
 
             <div className="mb-5 flex flex-wrap gap-3">
-                <div className="rounded-full border border-[#F0B90B]/20 bg-[#F0B90B]/10 px-3 py-2 text-xs font-medium text-[#F6D782]">
-                  {language === 'zh'
-                    ? `观测维度 ${scopeDescription}`
-                    : `Scope ${scopeDescription}`}
-                </div>
-                <div className="rounded-full border border-[#22D3EE]/20 bg-[#22D3EE]/10 px-3 py-2 text-xs font-medium text-[#9FEAF6]">
-                  {language === 'zh'
-                    ? `有效样本 ${scopeSampleCount} / ${scopeSampleTarget}${warmingUp ? ' · 预热中' : ' · 已接管'}`
-                    : `Samples ${scopeSampleCount} / ${scopeSampleTarget}${warmingUp ? ' · Warming Up' : ' · Active'}`}
-                </div>
-                <div className="rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-2 text-xs font-medium text-emerald-200">
-                  {currentScope.type === 'global'
-                    ? language === 'zh'
-                      ? `覆盖范围 全部赛道 / 样本 ${adaptiveState?.sample_count || 0}`
-                      : `Coverage All Sectors / ${adaptiveState?.sample_count || 0}`
-                    : language === 'zh'
-                      ? `赛道 ${adaptiveState?.sector || focusSnapshot?.sector || '--'} / 样本 ${adaptiveState?.sector_sample_count || 0}`
-                      : `Sector ${adaptiveState?.sector || focusSnapshot?.sector || '--'} / ${adaptiveState?.sector_sample_count || 0}`}
-                </div>
-                {currentScope.type === 'symbol' ? (
-                  <div className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-2 text-xs font-medium text-[#D1D4DC]">
-                    {language === 'zh'
-                      ? `专属样本 ${adaptiveState?.coin_sample_count || 0} / ${coinSampleTarget} · α ${formatAlpha(adaptiveState?.alpha || 0)}`
-                      : `Coin Samples ${adaptiveState?.coin_sample_count || 0} / ${coinSampleTarget} · α ${formatAlpha(adaptiveState?.alpha || 0)}`}
-                  </div>
-                ) : null}
+              <div className="rounded-full border border-[#F0B90B]/20 bg-[#F0B90B]/10 px-3 py-2 text-xs font-medium text-[#F6D782]">
+                {language === 'zh'
+                  ? `观测维度 ${scopeDescription}`
+                  : `Scope ${scopeDescription}`}
+              </div>
+              <div className="rounded-full border border-[#22D3EE]/20 bg-[#22D3EE]/10 px-3 py-2 text-xs font-medium text-[#9FEAF6]">
+                {language === 'zh'
+                  ? `有效样本 ${scopeSampleCount} / ${scopeSampleTarget}${warmingUp ? ' · 预热中' : ' · 已接管'}`
+                  : `Samples ${scopeSampleCount} / ${scopeSampleTarget}${warmingUp ? ' · Warming Up' : ' · Active'}`}
+              </div>
+              <div className="rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-2 text-xs font-medium text-emerald-200">
+                {currentScope.type === 'global'
+                  ? language === 'zh'
+                    ? `覆盖范围 全部赛道 / 样本 ${adaptiveState?.sample_count || 0}`
+                    : `Coverage All Sectors / ${adaptiveState?.sample_count || 0}`
+                  : language === 'zh'
+                    ? `赛道 ${adaptiveState?.sector || focusSnapshot?.sector || '--'} / 样本 ${adaptiveState?.sector_sample_count || 0}`
+                    : `Sector ${adaptiveState?.sector || focusSnapshot?.sector || '--'} / ${adaptiveState?.sector_sample_count || 0}`}
+              </div>
+              {currentScope.type === 'symbol' ? (
                 <div className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-2 text-xs font-medium text-[#D1D4DC]">
                   {language === 'zh'
-                    ? `经验占比 ${((adaptiveState?.blend_adaptive || 0) * 100).toFixed(0)}%`
-                    : `Adaptive Blend ${((adaptiveState?.blend_adaptive || 0) * 100).toFixed(0)}%`}
+                    ? `专属样本 ${adaptiveState?.coin_sample_count || 0} / ${coinSampleTarget} · α ${formatAlpha(adaptiveState?.alpha || 0)}`
+                    : `Coin Samples ${adaptiveState?.coin_sample_count || 0} / ${coinSampleTarget} · α ${formatAlpha(adaptiveState?.alpha || 0)}`}
                 </div>
+              ) : null}
+              <div className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-2 text-xs font-medium text-[#D1D4DC]">
+                {language === 'zh'
+                  ? `经验占比 ${((adaptiveState?.blend_adaptive || 0) * 100).toFixed(0)}%`
+                  : `Adaptive Blend ${((adaptiveState?.blend_adaptive || 0) * 100).toFixed(0)}%`}
+              </div>
             </div>
 
             <div className="grid gap-5 xl:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
@@ -881,8 +823,8 @@ export function DataLabPage({
                 </h2>
                 <p className="mt-2 max-w-3xl text-sm leading-6 text-[#B7BDC6]">
                   {language === 'zh'
-                    ? 'Filled 影子样本会按 1 分步长做滑动窗口统计，每个点都使用中心分数附近的重叠样本来生成更连续的 EV 趋势。开启实时权重重算后，会用当前自适应权重回溯重算历史原始因子的逻辑分数。'
-                    : 'Filled shadow samples are now evaluated with a 1-point sliding window so each point blends nearby scores into a continuous EV curve. Real-time back-cast rescored historical raw factors with the current adaptive weights.'}
+                    ? 'Filled 影子样本按 1 分原始分箱直接渲染，Tooltip 只显示当前分箱点，尖峰不会被区间平滑吞没。开启实时权重重算后，会用当前自适应权重回溯重算历史原始因子的逻辑分数。'
+                    : 'Filled shadow samples are rendered as raw 1-point bins so sharp peaks stay visible. The tooltip shows the current bin point only, and real-time back-cast rescored historical raw factors with the current adaptive weights.'}
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-3">
@@ -899,47 +841,33 @@ export function DataLabPage({
                       : 'Real-time Back-cast'}
                   </span>
                 </label>
-                <div className="inline-flex rounded-full border border-white/10 bg-black/20 p-1">
-                  {([5, 10] as const).map((windowSize) => {
-                    const active = performanceWindowSize === windowSize
-                    const label =
-                      windowSize === 10
-                        ? language === 'zh'
-                          ? '宽窗 ±5'
-                          : 'Wide ±5'
-                        : language === 'zh'
-                          ? '标准 ±2.5'
-                          : 'Std ±2.5'
-                    return (
-                      <button
-                        key={windowSize}
-                        type="button"
-                        onClick={() => setPerformanceWindowSize(windowSize)}
-                        className="rounded-full px-4 py-2 text-xs font-semibold tracking-[0.18em] transition"
-                        style={{
-                          background: active ? 'rgba(245, 158, 11, 0.18)' : 'transparent',
-                          color: active ? '#FDE68A' : '#94A3B8',
-                        }}
-                      >
-                        {label}
-                      </button>
-                    )
-                  })}
+                <label className="inline-flex items-center gap-3 rounded-full border border-emerald-400/20 bg-emerald-400/10 px-3 py-2 text-xs font-medium text-emerald-100">
+                  <input
+                    type="checkbox"
+                    checked={resonanceFiltered}
+                    onChange={(e) => setResonanceFiltered(e.target.checked)}
+                    className="h-4 w-4 rounded border-white/20 bg-transparent accent-emerald-400"
+                  />
+                  <span>
+                    {language === 'zh'
+                      ? '马氏滤镜'
+                      : 'Mahalanobis Filter'}
+                  </span>
+                </label>
+                <div className="rounded-full border border-white/10 bg-black/20 px-3 py-2 text-xs font-medium text-[#D1D4DC]">
+                  {language === 'zh'
+                    ? `原始分箱 · ${rawBinStepLabel}`
+                    : `Raw bins · ${rawBinStepLabel}`}
                 </div>
                 <div className="rounded-full border border-[#F59E0B]/20 bg-[#F59E0B]/10 px-3 py-2 text-xs font-medium text-[#FDE68A]">
                   {language === 'zh'
-                    ? `${scopeDescription} · ${performanceModeLabel} · ${performanceBinRows.length} 个滑窗点`
-                    : `${scopeDescription} · ${performanceModeLabel} · ${performanceBinRows.length} points`}
+                    ? `${scopeDescription} · ${performanceModeLabel} · ${rawBinCountLabel}`
+                    : `${scopeDescription} · ${performanceModeLabel} · ${rawBinCountLabel}`}
                 </div>
                 <div className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-2 text-xs font-medium text-[#D1D4DC]">
                   {language === 'zh'
-                    ? `峰值窗口 N ${peakWindowTradeCount}`
-                    : `Peak Window N ${peakWindowTradeCount}`}
-                </div>
-                <div className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-2 text-xs font-medium text-[#D1D4DC]">
-                  {language === 'zh'
-                    ? `平滑强度 ${smoothingWindowLabel}`
-                    : `Smoothing ${smoothingWindowLabel}`}
+                    ? `正样本数 ${positiveSampleCount}`
+                    : `Positive Sample Count ${positiveSampleCount}`}
                 </div>
               </div>
             </div>
@@ -955,11 +883,11 @@ export function DataLabPage({
                   <div className="text-xs text-[#848E9C]">
                     {language === 'zh'
                       ? realtimeBackcast
-                        ? '当前模式会用最新自适应权重重算历史原始因子，并以 1 分步长滑动窗口生成平滑 EV 曲线。Y 轴只参考 N>10 的稳健区间，稀疏样本会被截断并自动淡化。'
-                        : '图表已切到滑动窗口统计。每个分数点都会参考附近样本；Y 轴只参考 N>10 的稳健 EV 区间。金柱/蓝柱代表 PF，金实线/蓝实线代表 Mean EV，Tooltip 同时显示 Median EV 与 Weighted_Rank；红虚线是 EV=0，灰虚线是 PF=1.0。'
+                        ? '当前模式会用最新自适应权重重算历史原始因子，并以 1 分 raw bin 生成 EV 曲线。折线是线性连接，Y 轴只参考 N>10 的稳健区间，稀疏样本会被截断并自动淡化。'
+                        : '图表已切到原始分箱统计。每个分数点独立渲染，折线使用线性连接；Y 轴只参考 N>10 的稳健 EV 区间。金柱/蓝柱代表 PF，金实线/蓝实线代表 Mean EV，Tooltip 只显示当前分箱点、Median EV 与 Weighted_Rank；红虚线是 EV=0，灰虚线是 PF=1.0。'
                       : realtimeBackcast
-                        ? 'This mode rescored historical raw factors with the latest adaptive weights and rebuilds the EV curve with a 1-point sliding window. The EV axis follows the robust N>10 range, while sparse samples are clipped and faded.'
-                        : 'The chart now uses a sliding window, so each score also references nearby samples. The EV axis follows the robust N>10 range. Amber/blue bars show PF, amber/blue solid lines show mean EV, the tooltip also includes median EV and Weighted_Rank, the red dashed line marks EV=0, and the gray dashed line marks PF=1.0.'}
+                        ? 'This mode rescored historical raw factors with the latest adaptive weights and rebuilds the EV curve from raw 1-point bins. The line uses linear joins, while the EV axis follows the robust N>10 range and sparse samples are clipped and faded.'
+                        : 'The chart now uses raw 1-point bins with linear line joins. The EV axis follows the robust N>10 range. Amber/blue bars show PF, amber/blue solid lines show mean EV, and the tooltip shows the current bin point plus median EV and Weighted_Rank; the red dashed line marks EV=0 and the gray dashed line marks PF=1.0.'}
                   </div>
                 </div>
                 {performanceBinsError ? (
@@ -984,7 +912,8 @@ export function DataLabPage({
                   data={performanceBinRows}
                   language={language}
                   realtimeBackcast={realtimeBackcast}
-                  windowSize={performanceWindowSize}
+                  positiveSampleCount={positiveSampleCount}
+                  lastUpdatedAt={dnaUpdatedAt}
                 />
               )}
             </div>
@@ -997,7 +926,7 @@ export function DataLabPage({
               </p>
               <p className="mt-3 text-3xl font-semibold text-white">{snapshots.length}</p>
               <p className="mt-2 text-sm text-[#B7BDC6]">
-                {selectedTrader?.trader_name || '--'}
+                GLOBAL_CONSENSUS
               </p>
             </div>
             <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
@@ -1114,7 +1043,7 @@ export function DataLabPage({
               </table>
             </div>
           </div>
-        </div>
+      </div>
       </section>
     </DeepVoidBackground>
   )

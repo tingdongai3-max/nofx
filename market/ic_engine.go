@@ -28,11 +28,8 @@ const (
 
 	AdaptiveSampleTarget   = 2000
 	adaptiveCacheTTL       = 1 * time.Minute
-	adaptiveSectorLimit    = 3000
-	adaptiveCoinLimit      = 500
 	ConfidenceThreshold    = 30.0
-	ICHalfLife             = 1000.0
-	adaptiveScopeGlobal    = "global"
+	ICHalfLife             = 2000.0
 	adaptiveSectorFallback = "Unclassified"
 	empiricalWeightFloor   = 0.01
 	empiricalWeightCeiling = 0.90
@@ -163,19 +160,7 @@ func SetAdaptiveWeightStore(st *store.Store) {
 }
 
 func InvalidateAdaptiveWeightScope(traderID string) {
-	if traderID == "" {
-		clearAdaptiveWeightCache()
-		return
-	}
-
-	prefix := normalizedAdaptiveTrader(traderID) + "|"
-	adaptiveCache.Range(func(key, _ any) bool {
-		keyString, ok := key.(string)
-		if ok && strings.HasPrefix(keyString, prefix) {
-			adaptiveCache.Delete(key)
-		}
-		return true
-	})
+	clearAdaptiveWeightCache()
 }
 
 func GetAdaptiveWeights(traderID, sector, symbol string) map[string]float64 {
@@ -220,13 +205,37 @@ func RecalculateHistoricalBins(rows []*store.ShadowSnapshot, state AdaptiveWeigh
 	return RecalculateHistoricalBinsWithWindow(rows, state, store.PERFORMANCE_WINDOW_SIZE_DEFAULT)
 }
 
-func RecalculateHistoricalBinsWithWindow(rows []*store.ShadowSnapshot, state AdaptiveWeightState, windowSize int) []*store.ScoreBinPerformance {
+// RecalculateHistoricalFactors keeps the historical recalc entry point explicit at the
+// call sites that need a sector-aware rebuild before bin aggregation.
+func RecalculateHistoricalFactors(
+	rows []*store.ShadowSnapshot,
+	state AdaptiveWeightState,
+	windowSize int,
+	filters ...func(*store.ShadowSnapshot, float64) bool,
+) []*store.ScoreBinPerformance {
+	return RecalculateHistoricalBinsWithWindow(rows, state, windowSize, filters...)
+}
+
+func RecalculateHistoricalBinsWithWindow(
+	rows []*store.ShadowSnapshot,
+	state AdaptiveWeightState,
+	windowSize int,
+	filters ...func(*store.ShadowSnapshot, float64) bool,
+) []*store.ScoreBinPerformance {
+	var filter func(*store.ShadowSnapshot, float64) bool
+	if len(filters) > 0 {
+		filter = filters[0]
+	}
+
 	recalculated := RecalculateHistoricalScores(rows, state)
 	return store.AggregateSmoothedPerformanceBins(rows, func(row *store.ShadowSnapshot) (float64, bool) {
 		if row == nil {
 			return 0, false
 		}
 		score, ok := recalculated[row.ID]
+		if ok && filter != nil && !filter(row, score) {
+			return 0, false
+		}
 		return score, ok
 	}, windowSize)
 }
@@ -357,39 +366,48 @@ func recoverLegacyRawFactors(row *store.ShadowSnapshot) store.ShadowRawFactors {
 		row.VolumeSpikeFactor != 0 ||
 		row.QuantFactor != 0 ||
 		row.SocialFactor != 0 ||
-		row.OnChainFactor != 0
+		row.OnChainFactor != 0 ||
+		row.VolUtilization != 0 ||
+		row.FundingRate != 0 ||
+		row.QuantImbalanceRaw != 0
 	if !hasAnyTelemetry {
 		return store.ShadowRawFactors{}
 	}
 
 	scores := map[string]float64{
-		"market":             percentScoreToZ(row.MarketFactor),
-		"trend":              percentScoreToZ(row.TrendFactor),
-		"trend_group":        percentScoreToZ(row.TrendFactor),
-		"donchian_factor":    percentScoreToZ(row.DonchianFactor),
-		"volume_spike":       percentScoreToZ(row.VolumeSpikeFactor),
-		"volume_spike_group": percentScoreToZ(row.VolumeSpikeFactor),
-		"mtf_resonance":      percentScoreToZ(row.MTFResonanceFactor),
-		"quant_group":        percentScoreToZ(row.QuantFactor),
-		"social_group":       percentScoreToZ(row.SocialFactor),
-		"onchain_group":      percentScoreToZ(row.OnChainFactor),
-		"onchain_ratio":      percentScoreToZ(row.OnChainFactor),
-		"onchain_buy_ratio":  percentScoreToZ(row.OnChainFactor),
+		"market":              percentScoreToZ(row.MarketFactor),
+		"trend":               percentScoreToZ(row.TrendFactor),
+		"trend_group":         percentScoreToZ(row.TrendFactor),
+		"donchian_factor":     percentScoreToZ(row.DonchianFactor),
+		"volume_spike":        percentScoreToZ(row.VolumeSpikeFactor),
+		"volume_spike_group":  percentScoreToZ(row.VolumeSpikeFactor),
+		"mtf_resonance":       percentScoreToZ(row.MTFResonanceFactor),
+		"quant_group":         percentScoreToZ(row.QuantFactor),
+		"social_group":        percentScoreToZ(row.SocialFactor),
+		"onchain_group":       percentScoreToZ(row.OnChainFactor),
+		"onchain_ratio":       percentScoreToZ(row.OnChainFactor),
+		"onchain_buy_ratio":   percentScoreToZ(row.OnChainFactor),
+		"vol_utilization":     row.VolUtilization * 100,
+		"funding_rate":        row.FundingRate * 10000,
+		"orderbook_imbalance": row.QuantImbalanceRaw * 100,
 	}
 
 	available := map[string]bool{
-		"market":             true,
-		"trend":              true,
-		"trend_group":        true,
-		"donchian_factor":    row.DonchianFactor != 0,
-		"volume_spike":       row.VolumeSpikeFactor != 0,
-		"volume_spike_group": row.VolumeSpikeFactor != 0 || row.MTFResonanceFactor != 0,
-		"mtf_resonance":      row.MTFResonanceFactor != 0,
-		"quant_group":        row.QuantFactor != 0,
-		"social_group":       row.SocialFactor != 0,
-		"onchain_group":      row.OnChainFactor != 0,
-		"onchain_ratio":      row.OnChainFactor != 0,
-		"onchain_buy_ratio":  row.OnChainFactor != 0,
+		"market":              true,
+		"trend":               true,
+		"trend_group":         true,
+		"donchian_factor":     row.DonchianFactor != 0,
+		"volume_spike":        row.VolumeSpikeFactor != 0,
+		"volume_spike_group":  row.VolumeSpikeFactor != 0 || row.MTFResonanceFactor != 0,
+		"mtf_resonance":       row.MTFResonanceFactor != 0,
+		"quant_group":         row.QuantFactor != 0,
+		"social_group":        row.SocialFactor != 0,
+		"onchain_group":       row.OnChainFactor != 0,
+		"onchain_ratio":       row.OnChainFactor != 0,
+		"onchain_buy_ratio":   row.OnChainFactor != 0,
+		"vol_utilization":     row.VolUtilization > 0,
+		"funding_rate":        row.FundingRate != 0,
+		"orderbook_imbalance": row.QuantImbalanceRaw != 0,
 	}
 
 	return store.ShadowRawFactors{
@@ -485,6 +503,19 @@ func EWMASpearmanCorrelation(x, y []float64, halfLife float64) float64 {
 	return ewmaWeightedPearson(rankedX, rankedY, halfLife)
 }
 
+// TemporalWeightedSpearmanCorrelation computes Spearman rank IC using
+// DecisionTime-derived exponential decay so recent observations dominate.
+func TemporalWeightedSpearmanCorrelation(x, y []float64, decisionTimes []int64, halfLife float64) float64 {
+	filteredX, filteredY, filteredTimes := filterFiniteTemporalCorrelationTriples(x, y, decisionTimes)
+	if len(filteredX) < 2 {
+		return 0
+	}
+
+	rankedX := RankData(filteredX)
+	rankedY := RankData(filteredY)
+	return temporalWeightedPearson(rankedX, rankedY, filteredTimes, halfLife)
+}
+
 func filterFiniteCorrelationPairs(x, y []float64) ([]float64, []float64) {
 	if len(x) != len(y) || len(x) < 2 {
 		return nil, nil
@@ -502,31 +533,68 @@ func filterFiniteCorrelationPairs(x, y []float64) ([]float64, []float64) {
 	return filteredX, filteredY
 }
 
+func filterFiniteTemporalCorrelationTriples(x, y []float64, decisionTimes []int64) ([]float64, []float64, []int64) {
+	if len(x) != len(y) || len(x) != len(decisionTimes) || len(x) < 2 {
+		return nil, nil, nil
+	}
+
+	filteredX := make([]float64, 0, len(x))
+	filteredY := make([]float64, 0, len(y))
+	filteredTimes := make([]int64, 0, len(x))
+	for i := range x {
+		if !isFinite(x[i]) || !isFinite(y[i]) {
+			continue
+		}
+		filteredX = append(filteredX, x[i])
+		filteredY = append(filteredY, y[i])
+		filteredTimes = append(filteredTimes, decisionTimes[i])
+	}
+	return filteredX, filteredY, filteredTimes
+}
+
 func ewmaWeightedPearson(x, y []float64, halfLife float64) float64 {
 	if len(x) != len(y) || len(x) < 2 {
 		return 0
 	}
-	if halfLife <= 0 {
+	return weightedPearson(x, y, ewmaIndexWeights(len(x), halfLife))
+}
+
+func temporalWeightedPearson(x, y []float64, decisionTimes []int64, halfLife float64) float64 {
+	if len(x) != len(y) || len(x) != len(decisionTimes) || len(x) < 2 {
+		return 0
+	}
+	return weightedPearson(x, y, temporalDecayWeights(decisionTimes, halfLife))
+}
+
+func weightedPearson(x, y, weights []float64) float64 {
+	if len(x) != len(y) || len(x) != len(weights) || len(x) < 2 {
 		return 0
 	}
 
-	weights := make([]float64, len(x))
+	validWeights := make([]float64, len(weights))
 	weightSum := 0.0
-	for i := range x {
-		age := float64(len(x)-1-i) / halfLife
-		weight := math.Pow(2, -age)
-		weights[i] = weight
+	validCount := 0
+	for i, weight := range weights {
+		if !isFinite(weight) || weight <= 0 {
+			continue
+		}
+		validWeights[i] = weight
 		weightSum += weight
+		validCount++
 	}
-	if weightSum <= 0 {
+	if weightSum <= 0 || validCount < 2 {
 		return 0
 	}
 
 	meanX := 0.0
 	meanY := 0.0
 	for i := range x {
-		meanX += weights[i] * x[i]
-		meanY += weights[i] * y[i]
+		weight := validWeights[i]
+		if weight <= 0 {
+			continue
+		}
+		meanX += weight * x[i]
+		meanY += weight * y[i]
 	}
 	meanX /= weightSum
 	meanY /= weightSum
@@ -535,9 +603,12 @@ func ewmaWeightedPearson(x, y []float64, halfLife float64) float64 {
 	var varianceX float64
 	var varianceY float64
 	for i := range x {
+		weight := validWeights[i]
+		if weight <= 0 {
+			continue
+		}
 		dx := x[i] - meanX
 		dy := y[i] - meanY
-		weight := weights[i]
 		covariance += weight * dx * dy
 		varianceX += weight * dx * dx
 		varianceY += weight * dy * dy
@@ -553,6 +624,90 @@ func ewmaWeightedPearson(x, y []float64, halfLife float64) float64 {
 	return covariance / math.Sqrt(varianceX*varianceY)
 }
 
+func ewmaIndexWeights(length int, halfLife float64) []float64 {
+	if length < 2 || halfLife <= 0 {
+		return nil
+	}
+
+	weights := make([]float64, length)
+	for i := 0; i < length; i++ {
+		age := float64(length-1-i) / halfLife
+		weights[i] = math.Pow(2, -age)
+	}
+	return weights
+}
+
+func temporalDecayWeights(decisionTimes []int64, halfLife float64) []float64 {
+	if len(decisionTimes) < 2 || halfLife <= 0 {
+		return nil
+	}
+
+	fallbackWeights := ewmaIndexWeights(len(decisionTimes), halfLife)
+	validTimes := make([]int64, 0, len(decisionTimes))
+	latestDecisionTime := int64(0)
+	for _, decisionTime := range decisionTimes {
+		if decisionTime <= 0 {
+			continue
+		}
+		validTimes = append(validTimes, decisionTime)
+		if decisionTime > latestDecisionTime {
+			latestDecisionTime = decisionTime
+		}
+	}
+	if latestDecisionTime <= 0 {
+		return fallbackWeights
+	}
+
+	sort.Slice(validTimes, func(i, j int) bool {
+		return validTimes[i] < validTimes[j]
+	})
+
+	intervals := make([]int64, 0, len(validTimes)-1)
+	for i := 1; i < len(validTimes); i++ {
+		delta := validTimes[i] - validTimes[i-1]
+		if delta > 0 {
+			intervals = append(intervals, delta)
+		}
+	}
+
+	referenceIntervalMs := medianPositiveInterval(intervals)
+	if referenceIntervalMs <= 0 {
+		return fallbackWeights
+	}
+
+	lambda := math.Ln2 / (halfLife * float64(referenceIntervalMs))
+	weights := make([]float64, len(decisionTimes))
+	for i, decisionTime := range decisionTimes {
+		if decisionTime <= 0 {
+			weights[i] = fallbackWeights[i]
+			continue
+		}
+		deltaT := float64(latestDecisionTime - decisionTime)
+		if deltaT < 0 {
+			deltaT = 0
+		}
+		weights[i] = math.Exp(-lambda * deltaT)
+	}
+	return weights
+}
+
+func medianPositiveInterval(intervals []int64) int64 {
+	if len(intervals) == 0 {
+		return 0
+	}
+
+	values := append([]int64(nil), intervals...)
+	sort.Slice(values, func(i, j int) bool {
+		return values[i] < values[j]
+	})
+
+	mid := len(values) / 2
+	if len(values)%2 == 1 {
+		return values[mid]
+	}
+	return (values[mid-1] + values[mid]) / 2
+}
+
 func computeAdaptiveWeightState(traderID, sector, symbol string) AdaptiveWeightState {
 	defaults := defaultAdaptiveWeights()
 	hiddenDefaults := defaultHiddenAdaptiveWeights()
@@ -565,6 +720,8 @@ func computeAdaptiveWeightState(traderID, sector, symbol string) AdaptiveWeightS
 	hiddenEmpirical := copyWeightMap(hiddenDefaults)
 	hiddenFinalWeights := copyWeightMap(hiddenDefaults)
 	nestedWeights := defaultNestedAdaptiveWeights()
+	st := getAdaptiveWeightStore()
+	adaptiveMemory := loadAdaptiveMemoryConfig(st)
 
 	rawSector := strings.TrimSpace(sector)
 	normalizedTrader := normalizedAdaptiveTrader(traderID)
@@ -575,7 +732,7 @@ func computeAdaptiveWeightState(traderID, sector, symbol string) AdaptiveWeightS
 		TraderID:     normalizedTrader,
 		Symbol:       normalizedSymbol,
 		Sector:       rawSector,
-		SampleTarget: AdaptiveSampleTarget,
+		SampleTarget: adaptiveMemory.GlobalSamples,
 		UpdatedAt:    time.Now().UTC().UnixMilli(),
 	}
 
@@ -586,62 +743,78 @@ func computeAdaptiveWeightState(traderID, sector, symbol string) AdaptiveWeightS
 		return state
 	}
 
-	st := getAdaptiveWeightStore()
-	if st == nil || normalizedTrader == adaptiveScopeGlobal {
+	if st == nil {
 		state.BlendDefault = 1
 		return finalizeState()
 	}
 
+	scopeLabel := "global"
 	switch {
 	case normalizedSymbol != "":
-		globalRows, err := st.Shadow().ListFilledForAdaptive(normalizedTrader, adaptiveSectorLimit)
+		scopeLabel = "symbol"
+	case rawSector != "":
+		scopeLabel = "sector"
+	}
+	logger.Infof(
+		"V3_AUDIT_ADAPTIVE_MEMORY: Scope=%s, Symbol=%s, Sector=%s, GlobalSamples=%d, SectorSamples=%d, SymbolSamples=%d",
+		scopeLabel,
+		normalizedSymbol,
+		rawSector,
+		adaptiveMemory.GlobalSamples,
+		adaptiveMemory.SectorSamples,
+		adaptiveMemory.SymbolSamples,
+	)
+
+	switch {
+	case normalizedSymbol != "":
+		globalRows, err := st.Shadow().ListFilledSharedForAdaptive(adaptiveMemory.GlobalSamples)
 		if err != nil {
 			state.BlendDefault = 1
 			return finalizeState()
 		}
-		sectorRows, err := st.Shadow().ListFilledForSectorAdaptive(normalizedTrader, normalizedSector, adaptiveSectorLimit)
+		sectorRows, err := st.Shadow().ListFilledSharedForSectorAdaptive(normalizedSector, adaptiveMemory.SectorSamples)
 		if err != nil {
 			state.BlendDefault = 1
 			return finalizeState()
 		}
-		coinRows, err := st.Shadow().ListFilledForCoinAdaptive(normalizedTrader, normalizedSymbol, adaptiveCoinLimit)
+		coinRows, err := st.Shadow().ListFilledSharedForCoinAdaptive(normalizedSymbol, adaptiveMemory.SymbolSamples)
 		if err != nil {
 			state.BlendDefault = 1
 			return finalizeState()
 		}
 
-		globalICs, _ = computeICsFromRows(globalRows)
-		sectorICs, state.SectorSampleCount = computeICsFromRows(sectorRows)
-		coinICs, state.CoinSampleCount = computeICsFromRows(coinRows)
+		globalICs, _ = computeICsFromRows(globalRows, adaptiveMemory.GlobalSamples, "global")
+		sectorICs, state.SectorSampleCount = computeICsFromRows(sectorRows, adaptiveMemory.SectorSamples, "sector")
+		coinICs, state.CoinSampleCount = computeICsFromRows(coinRows, adaptiveMemory.SymbolSamples, "symbol")
 		state.SampleCount = state.SectorSampleCount
 		state.Alpha = calculateBayesianShrinkageAlpha(state.CoinSampleCount)
 		finalICs = shrinkFactorICs(globalICs, sectorICs, coinICs, state.SectorSampleCount, state.CoinSampleCount)
 		logAdaptiveShrinkage("symbol", normalizedSymbol, rawSector, globalICs, sectorICs, coinICs, finalICs, state.SectorSampleCount, state.CoinSampleCount)
 	case rawSector != "":
-		globalRows, err := st.Shadow().ListFilledForAdaptive(normalizedTrader, adaptiveSectorLimit)
+		globalRows, err := st.Shadow().ListFilledSharedForAdaptive(adaptiveMemory.GlobalSamples)
 		if err != nil {
 			state.BlendDefault = 1
 			return finalizeState()
 		}
-		sectorRows, err := st.Shadow().ListFilledForSectorAdaptive(normalizedTrader, normalizedSector, adaptiveSectorLimit)
+		sectorRows, err := st.Shadow().ListFilledSharedForSectorAdaptive(normalizedSector, adaptiveMemory.SectorSamples)
 		if err != nil {
 			state.BlendDefault = 1
 			return finalizeState()
 		}
 
-		globalICs, _ = computeICsFromRows(globalRows)
-		sectorICs, state.SectorSampleCount = computeICsFromRows(sectorRows)
+		globalICs, _ = computeICsFromRows(globalRows, adaptiveMemory.GlobalSamples, "global")
+		sectorICs, state.SectorSampleCount = computeICsFromRows(sectorRows, adaptiveMemory.SectorSamples, "sector")
 		state.SampleCount = state.SectorSampleCount
 		finalICs = smoothFactorICs(sectorICs, globalICs, state.SectorSampleCount, false)
 		logAdaptiveShrinkage("sector", normalizedSymbol, rawSector, globalICs, sectorICs, coinICs, finalICs, state.SectorSampleCount, 0)
 	default:
-		globalRows, err := st.Shadow().ListFilledForAdaptive(normalizedTrader, adaptiveSectorLimit)
+		globalRows, err := st.Shadow().ListFilledSharedForAdaptive(adaptiveMemory.GlobalSamples)
 		if err != nil {
 			state.BlendDefault = 1
 			return finalizeState()
 		}
 
-		globalICs, state.SampleCount = computeICsFromRows(globalRows)
+		globalICs, state.SampleCount = computeICsFromRows(globalRows, adaptiveMemory.GlobalSamples, "global")
 		finalICs = copyWeightMap(globalICs)
 		logAdaptiveShrinkage("global", normalizedSymbol, rawSector, globalICs, sectorICs, coinICs, finalICs, 0, 0)
 	}
@@ -665,20 +838,41 @@ func computeAdaptiveWeightState(traderID, sector, symbol string) AdaptiveWeightS
 	return finalizeState()
 }
 
-func computeICsFromRows(rows []*store.ShadowSnapshot) (map[string]float64, int) {
-	factorSamples, returns := buildAdaptiveSampleSet(rows)
+func computeICsFromRows(rows []*store.ShadowSnapshot, sampleLimit int, scope string) (map[string]float64, int) {
+	samples := buildAdaptiveSampleSet(rows)
+	sortAdaptiveSampleSetByDecisionTimeDesc(&samples)
 	ics := zeroAdaptiveValues()
-	if len(returns) < 2 {
-		return ics, len(returns)
+	if len(samples.Returns) < 2 {
+		return ics, len(samples.Returns)
+	}
+
+	effectiveLimit := sampleLimit
+	if effectiveLimit <= 0 {
+		effectiveLimit = len(samples.Returns)
+	}
+
+	weights, lambda := dynamicExponentialDecayWeights(len(samples.Returns), effectiveLimit)
+	if len(weights) == len(samples.Returns) {
+		logger.Infof("V3_AUDIT_ADAPTIVE_DECAY: Scope=%s, QueryLimit=%d, Samples=%d, Lambda=%.6f", scope, effectiveLimit, len(samples.Returns), lambda)
 	}
 
 	for _, factor := range adaptiveFactorOrder {
-		ics[factor] = EWMASpearmanCorrelation(factorSamples[factor], returns, ICHalfLife)
+		ics[factor] = weightedSpearmanCorrelationWithWeights(
+			samples.FactorSamples[factor],
+			samples.Returns,
+			weights,
+		)
 	}
-	return ics, len(returns)
+	return ics, len(samples.Returns)
 }
 
-func buildAdaptiveSampleSet(rows []*store.ShadowSnapshot) (map[string][]float64, []float64) {
+type adaptiveSampleSet struct {
+	FactorSamples map[string][]float64
+	Returns       []float64
+	DecisionTimes []int64
+}
+
+func buildAdaptiveSampleSet(rows []*store.ShadowSnapshot) adaptiveSampleSet {
 	factorSamples := map[string][]float64{
 		"market":            {},
 		"trend":             {},
@@ -697,6 +891,7 @@ func buildAdaptiveSampleSet(rows []*store.ShadowSnapshot) (map[string][]float64,
 		"onchain_buy_ratio": {},
 	}
 	returns := make([]float64, 0, len(rows))
+	decisionTimes := make([]int64, 0, len(rows))
 	for _, row := range rows {
 		if row == nil || !row.Filled || !isFinite(row.ReturnPct) {
 			continue
@@ -741,20 +936,110 @@ func buildAdaptiveSampleSet(rows []*store.ShadowSnapshot) (map[string][]float64,
 		}
 
 		returns = append(returns, row.ReturnPct)
+		decisionTimes = append(decisionTimes, row.DecisionTime)
 		for _, factor := range adaptiveFactorOrder {
 			factorSamples[factor] = append(factorSamples[factor], values[factor])
 		}
 	}
 
-	reverseFloat64s(returns)
-	for _, factor := range adaptiveFactorOrder {
-		reverseFloat64s(factorSamples[factor])
+	return adaptiveSampleSet{
+		FactorSamples: factorSamples,
+		Returns:       returns,
+		DecisionTimes: decisionTimes,
+	}
+}
+
+func sortAdaptiveSampleSetByDecisionTimeDesc(samples *adaptiveSampleSet) {
+	if samples == nil || len(samples.Returns) < 2 || len(samples.DecisionTimes) != len(samples.Returns) {
+		return
 	}
 
-	return factorSamples, returns
+	indices := make([]int, len(samples.Returns))
+	for i := range indices {
+		indices[i] = i
+	}
+	sort.SliceStable(indices, func(i, j int) bool {
+		left := samples.DecisionTimes[indices[i]]
+		right := samples.DecisionTimes[indices[j]]
+		if left == right {
+			return indices[i] < indices[j]
+		}
+		return left > right
+	})
+
+	reorderedReturns := make([]float64, len(samples.Returns))
+	reorderedDecisionTimes := make([]int64, len(samples.DecisionTimes))
+	for factor := range samples.FactorSamples {
+		reordered := make([]float64, len(samples.FactorSamples[factor]))
+		for destIdx, srcIdx := range indices {
+			reordered[destIdx] = samples.FactorSamples[factor][srcIdx]
+		}
+		samples.FactorSamples[factor] = reordered
+	}
+	for destIdx, srcIdx := range indices {
+		reorderedReturns[destIdx] = samples.Returns[srcIdx]
+		reorderedDecisionTimes[destIdx] = samples.DecisionTimes[srcIdx]
+	}
+	samples.Returns = reorderedReturns
+	samples.DecisionTimes = reorderedDecisionTimes
+}
+
+func dynamicExponentialDecayWeights(sampleCount, sampleLimit int) ([]float64, float64) {
+	if sampleCount < 2 {
+		return nil, 0
+	}
+	if sampleLimit <= 0 {
+		sampleLimit = sampleCount
+	}
+
+	lambda := (2.0 * math.Ln2) / float64(sampleLimit)
+	weights := make([]float64, sampleCount)
+	sum := 0.0
+	for i := 0; i < sampleCount; i++ {
+		weight := math.Exp(-lambda * float64(i))
+		weights[i] = weight
+		sum += weight
+	}
+	if sum <= 0 {
+		return nil, lambda
+	}
+	for i := range weights {
+		weights[i] /= sum
+	}
+	return weights, lambda
+}
+
+func weightedSpearmanCorrelationWithWeights(x, y, weights []float64) float64 {
+	filteredX, filteredY := filterFiniteCorrelationPairs(x, y)
+	if len(filteredX) < 2 || len(filteredX) != len(weights) {
+		return 0
+	}
+
+	rankedX := RankData(filteredX)
+	rankedY := RankData(filteredY)
+	return weightedPearson(rankedX, rankedY, weights)
+}
+
+func loadAdaptiveMemoryConfig(st *store.Store) store.AdaptiveMemorySystemConfig {
+	if st == nil {
+		return store.DefaultAdaptiveMemoryConfig()
+	}
+
+	cfg, err := st.GetAdaptiveMemoryConfig()
+	if err != nil {
+		logger.Warnf("⚠️ Failed to load adaptive memory config, using defaults: %v", err)
+		return store.DefaultAdaptiveMemoryConfig()
+	}
+	return cfg
 }
 
 func reverseFloat64s(values []float64) {
+	for left, right := 0, len(values)-1; left < right; left, right = left+1, right-1 {
+		values[left], values[right] = values[right], values[left]
+	}
+}
+
+func reverseInt64s(values []int64) {
 	for left, right := 0, len(values)-1; left < right; left, right = left+1, right-1 {
 		values[left], values[right] = values[right], values[left]
 	}
@@ -1161,10 +1446,7 @@ func buildAdaptiveCacheKey(traderID, sector, symbol string) string {
 }
 
 func normalizedAdaptiveTrader(traderID string) string {
-	if traderID == "" {
-		return adaptiveScopeGlobal
-	}
-	return traderID
+	return store.GlobalConsensusTraderID
 }
 
 func normalizeAdaptiveSector(sector string) string {
