@@ -227,7 +227,7 @@ func (at *AutoTrader) runCycle() error {
 	if at.safeMode {
 		filtered := make([]kernel.Decision, 0)
 		for _, d := range sortedDecisions {
-			if d.Action == "open_long" || d.Action == "open_short" {
+			if d.Action == "open_long" || d.Action == "open_short" || d.Action == "add_position" {
 				logger.Warnf("🛡️ [%s] Safe mode: BLOCKED %s %s (no new positions allowed)", at.name, d.Action, d.Symbol)
 				continue
 			}
@@ -592,7 +592,7 @@ func sortDecisionsByPriority(decisions []kernel.Decision) []kernel.Decision {
 		switch action {
 		case "close_long", "close_short":
 			return 1 // Highest priority: close positions first
-		case "open_long", "open_short":
+		case "open_long", "open_short", "add_position":
 			return 2 // Second priority: open positions later
 		case "hold", "wait":
 			return 3 // Lowest priority: wait

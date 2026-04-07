@@ -178,6 +178,38 @@ Body: {"show_in_competition":<bool>}`,
 			s.routeWithSchema(protected, "GET", "/traders/:id/grid-risk", "Get grid trading risk info",
 				`:id = trader_id from GET /api/my-traders.`,
 				s.handleGetGridRiskInfo)
+			s.routeWithSchema(protected, "GET", "/runtime/capabilities/preview", "Preview runtime capability clipping for a trader",
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&symbol=<optional symbol>
+Returns Binance-only one-way scope data: strategy profile, selected position aggregate, allowed actions, blocked actions, and block reasons.`,
+				s.handleRuntimeCapabilityPreview)
+			s.routeWithSchema(protected, "GET", "/runtime/replay/preview", "Preview validation replay results for a stored Binance user-stream fixture",
+				`Query: ?fixture_id=<validation fixture id>&mode=<optional sequential|out_of_order|duplicate|delayed>
+Runs the phase-7 validation replay bus and returns the replayed event sequence, truth snapshot summary, mismatch list, and capability result.`,
+				s.handleRuntimeReplayPreview)
+			s.routeWithSchema(protected, "GET", "/runtime/restore/preview", "Preview cold-start truth-layer restore validation for a trader",
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&symbol=<optional symbol>
+Runs the phase-7 restore validator and returns the before/after truth snapshots, mismatch reasons, and capability result.`,
+				s.handleRuntimeRestorePreview)
+			s.routeWithSchema(protected, "GET", "/runtime/orders/preview", "Preview Binance-only order truth and reconcile state for a trader",
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&symbol=<optional symbol>
+Returns the order registry truth layer, recent event evidence, reconcile status, working-order summary, and mismatch reasons.`,
+				s.handleRuntimeOrderRegistryPreview)
+			s.routeWithSchema(protected, "GET", "/runtime/scale-out/preview", "Preview Binance-only partial reduce / batch take-profit truth for a trader",
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&symbol=<optional symbol>
+Returns the scale-out plan truth layer, level snapshot, recent event evidence, reconcile status, and protection rebalance state.`,
+				s.handleRuntimeScaleOutPreview)
+			s.routeWithSchema(protected, "GET", "/runtime/scale-in/preview", "Preview Binance-only same-symbol add-position truth for a trader",
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&symbol=<optional symbol>
+Returns the scale-in plan truth layer, level snapshot, recent event evidence, reconcile status, and add-position risk state.`,
+				s.handleRuntimeScaleInPreview)
+			s.routeWithSchema(protected, "GET", "/runtime/protection/preview", "Preview Binance-only fixed protection truth and reconcile state for a trader",
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&symbol=<optional symbol>
+Returns the protection group truth layer, recent protection evidence, reconciliation state, and consistency reasons.`,
+				s.handleRuntimeProtectionPreview)
+			s.routeWithSchema(protected, "GET", "/runtime/protection-adjustment/preview", "Preview Binance-only dynamic protection truth and reconcile state for a trader",
+				`Query: ?trader_id=<EXACT trader_id from GET /api/my-traders>&symbol=<optional symbol>
+Returns the trailing rule truth layer, protection revision, stop-loss movement status, cancel/replace state, and dynamic-protection guard reasons.`,
+				s.handleRuntimeProtectionAdjustmentPreview)
 
 			// AI cost tracking
 			s.route(protected, "GET", "/ai-costs", "Get AI call costs for a trader (?trader_id=xxx&period=today)", s.handleGetAICosts)
@@ -191,7 +223,7 @@ CRITICAL: The "id" field (e.g. "abc123_deepseek") is what you must use for ai_mo
 			s.routeWithSchema(protected, "PUT", "/models", "Configure an AI model provider",
 				`Body: {"models":{"<model_id>":{"enabled":<bool>,"api_key":"<string>","custom_api_url":"<string, leave empty to use provider default>","custom_model_name":"<string, leave empty to use provider default>"}}}
 model_id values: "openai","deepseek","qwen","kimi","grok","gemini","claude"
-Defaults when custom fields empty: openai→api.openai.com/v1, deepseek→api.deepseek.com, qwen→dashscope.aliyuncs.com/compatible-mode/v1, kimi→api.moonshot.ai/v1, grok→api.x.ai/v1, gemini→generativelanguage.googleapis.com/v1beta/openai, claude→api.anthropic.com/v1`,
+Defaults when custom fields empty: openai→api.openai.com/v1, deepseek→api.deepseek.com, qwen→dashscope.aliyuncs.com/compatible-mode/v1, kimi→api.moonshot.ai/v1, grok→api.x.ai/v1, gemini→generativelanguage.googleapis.com/v1beta/openai, claude→api.anthropic.com/v1, minimax→api.minimax.io/anthropic/v1 (Anthropic-compatible Messages API)`,
 				s.handleUpdateModelConfigs)
 
 			// Exchange configuration

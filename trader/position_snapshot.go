@@ -2,9 +2,12 @@ package trader
 
 import (
 	"fmt"
+	"math"
 	"nofx/logger"
 	"nofx/market"
 	"nofx/store"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -100,4 +103,70 @@ func CreatePositionSnapshot(traderID, exchangeID, exchangeType string, trader Tr
 
 	logger.Infof("✅ Position snapshot complete: %d positions created", createdCount)
 	return nil
+}
+
+// CollectLivePositionSnapshots reads current exchange positions and converts them into system snapshot rows.
+// It is shared by runtime previews and recovery coordinators so position parsing happens in one place.
+func CollectLivePositionSnapshots(trader Trader) ([]store.PositionSnapshot, error) {
+	if trader == nil {
+		return nil, nil
+	}
+
+	positions, err := trader.GetPositions()
+	if err != nil {
+		return nil, err
+	}
+
+	snapshots := make([]store.PositionSnapshot, 0, len(positions))
+	for _, pos := range positions {
+		symbol, _ := pos["symbol"].(string)
+		side, _ := pos["side"].(string)
+		entryPrice := safePositionFloat(pos, "entry_price", "entryPrice")
+		markPrice := safePositionFloat(pos, "mark_price", "markPrice")
+		quantity := math.Abs(safePositionFloat(pos, "quantity", "positionAmt"))
+		unrealizedPnL := safePositionFloat(pos, "unrealized_pnl", "unRealizedProfit")
+		leverage := safePositionFloat(pos, "leverage")
+		liquidationPrice := safePositionFloat(pos, "liquidation_price", "liquidationPrice")
+
+		if symbol == "" || side == "" {
+			continue
+		}
+
+		snapshots = append(snapshots, store.PositionSnapshot{
+			Symbol:           market.Normalize(symbol),
+			Side:             strings.ToUpper(strings.TrimSpace(side)),
+			PositionAmt:      quantity,
+			EntryPrice:       entryPrice,
+			MarkPrice:        markPrice,
+			UnrealizedProfit: unrealizedPnL,
+			Leverage:         leverage,
+			LiquidationPrice: liquidationPrice,
+		})
+	}
+
+	return snapshots, nil
+}
+
+func safePositionFloat(data map[string]interface{}, keys ...string) float64 {
+	for _, key := range keys {
+		if value, ok := data[key]; ok {
+			switch v := value.(type) {
+			case float64:
+				return v
+			case float32:
+				return float64(v)
+			case int:
+				return float64(v)
+			case int64:
+				return float64(v)
+			case uint64:
+				return float64(v)
+			case string:
+				if parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+					return parsed
+				}
+			}
+		}
+	}
+	return 0
 }

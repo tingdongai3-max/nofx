@@ -12,6 +12,14 @@ import { LogOut, Loader2, Eye, EyeOff, Copy, Check } from 'lucide-react'
 import { DeepVoidBackground } from '../components/common/DeepVoidBackground'
 import { NofxSelect } from '../components/ui/select'
 import { GridRiskPanel } from '../components/strategy/GridRiskPanel'
+import { OrderRegistryPreviewPanel } from '../components/trader/OrderRegistryPreviewPanel'
+import { RuntimeCapabilityPreviewPanel } from '../components/trader/RuntimeCapabilityPreviewPanel'
+import { ProtectionPreviewPanel } from '../components/trader/ProtectionPreviewPanel'
+import { ProtectionAdjustmentPreviewPanel } from '../components/trader/ProtectionAdjustmentPreviewPanel'
+import { ScaleOutPreviewPanel } from '../components/trader/ScaleOutPreviewPanel'
+import { ScaleInPreviewPanel } from '../components/trader/ScaleInPreviewPanel'
+import { ReplayPreviewPanel } from '../components/trader/ReplayPreviewPanel'
+import { RestorePreviewPanel } from '../components/trader/RestorePreviewPanel'
 import type {
     SystemStatus,
     AccountInfo,
@@ -550,6 +558,85 @@ export function TraderDashboardPage({
                             traderId={selectedTraderId}
                             language={language}
                             refreshInterval={5000}
+                        />
+                    </div>
+                )}
+
+                {selectedTraderId && (
+                    <div className="mb-8 animate-slide-in" style={{ animationDelay: '0.07s' }}>
+                        <ReplayPreviewPanel
+                            fixtureId={`live-readiness-${selectedTraderId}`}
+                            refreshInterval={15000}
+                        />
+                    </div>
+                )}
+
+                {selectedTraderId && (
+                    <div className="mb-8 animate-slide-in" style={{ animationDelay: '0.075s' }}>
+                        <RestorePreviewPanel
+                            traderId={selectedTraderId}
+                            selectedSymbol={selectedChartSymbol}
+                            refreshInterval={15000}
+                        />
+                    </div>
+                )}
+
+                {selectedTraderId && (
+                    <div className="mb-8 animate-slide-in" style={{ animationDelay: '0.08s' }}>
+                        <ProtectionPreviewPanel
+                            traderId={selectedTraderId}
+                            selectedSymbol={selectedChartSymbol}
+                            refreshInterval={8000}
+                        />
+                    </div>
+                )}
+
+                {selectedTraderId && (
+                    <div className="mb-8 animate-slide-in" style={{ animationDelay: '0.085s' }}>
+                        <ProtectionAdjustmentPreviewPanel
+                            traderId={selectedTraderId}
+                            selectedSymbol={selectedChartSymbol}
+                            refreshInterval={8000}
+                        />
+                    </div>
+                )}
+
+                {selectedTraderId && (
+                    <div className="mb-8 animate-slide-in" style={{ animationDelay: '0.09s' }}>
+                        <ScaleOutPreviewPanel
+                            traderId={selectedTraderId}
+                            selectedSymbol={selectedChartSymbol}
+                            refreshInterval={8000}
+                        />
+                    </div>
+                )}
+
+                {selectedTraderId && (
+                    <div className="mb-8 animate-slide-in" style={{ animationDelay: '0.095s' }}>
+                        <ScaleInPreviewPanel
+                            traderId={selectedTraderId}
+                            selectedSymbol={selectedChartSymbol}
+                            refreshInterval={8000}
+                        />
+                    </div>
+                )}
+
+                {selectedTraderId && (
+                    <div className="mb-8 animate-slide-in" style={{ animationDelay: '0.1s' }}>
+                        <OrderRegistryPreviewPanel
+                            traderId={selectedTraderId}
+                            selectedSymbol={selectedChartSymbol}
+                            refreshInterval={8000}
+                        />
+                    </div>
+                )}
+
+                {selectedTraderId && (
+                    <div className="mb-8 animate-slide-in" style={{ animationDelay: '0.12s' }}>
+                        <RuntimeCapabilityPreviewPanel
+                            traderId={selectedTraderId}
+                            selectedSymbol={selectedChartSymbol}
+                            refreshInterval={8000}
                         />
                     </div>
                 )}

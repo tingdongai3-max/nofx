@@ -81,3 +81,39 @@ func TestOptionsWithQwenClient(t *testing.T) {
 		t.Error("MaxTokens should be 6000")
 	}
 }
+
+func TestOptionsWithMiniMaxClient(t *testing.T) {
+	logger := mcp.NewNoopLogger()
+
+	client := NewMiniMaxClientWithOptions(
+		mcp.WithAPIKey("sk-minimax-key"),
+		mcp.WithLogger(logger),
+		mcp.WithMaxTokens(7000),
+	)
+
+	mmClient := client.(*MiniMaxClient)
+
+	if mmClient.Provider != mcp.ProviderMiniMax {
+		t.Error("Provider should be MiniMax")
+	}
+
+	if mmClient.BaseURL != mcp.DefaultMiniMaxBaseURL {
+		t.Errorf("BaseURL should be MiniMax default, got %s", mmClient.BaseURL)
+	}
+
+	if mmClient.Model != mcp.DefaultMiniMaxModel {
+		t.Error("Model should be MiniMax default")
+	}
+
+	if mmClient.APIKey != "sk-minimax-key" {
+		t.Error("APIKey should be set from options")
+	}
+
+	if mmClient.Log != logger {
+		t.Error("Log should be set from options")
+	}
+
+	if mmClient.MaxTokens != 7000 {
+		t.Error("MaxTokens should be 7000")
+	}
+}

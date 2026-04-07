@@ -32,7 +32,7 @@ func (pb *PositionBuilder) ProcessTrade(
 	tradeTimeMs int64,
 	orderID string,
 ) error {
-	if strings.HasPrefix(action, "open_") {
+	if strings.HasPrefix(action, "open_") || action == "add_position" {
 		return pb.handleOpen(traderID, exchangeID, exchangeType, symbol, side, quantity, price, fee, tradeTimeMs, orderID)
 	} else if strings.HasPrefix(action, "close_") {
 		return pb.handleClose(traderID, exchangeID, exchangeType, symbol, side, quantity, price, fee, realizedPnL, tradeTimeMs, orderID)

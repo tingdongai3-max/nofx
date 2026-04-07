@@ -2,14 +2,13 @@ package trader
 
 import (
 	"fmt"
+	"github.com/ethereum/go-ethereum/crypto"
 	"nofx/kernel"
 	"nofx/logger"
 	"nofx/mcp"
 	_ "nofx/mcp/payment"
 	_ "nofx/mcp/provider"
 	"nofx/store"
-	"nofx/wallet"
-	"github.com/ethereum/go-ethereum/crypto"
 	"nofx/trader/aster"
 	"nofx/trader/binance"
 	"nofx/trader/bitget"
@@ -20,6 +19,7 @@ import (
 	"nofx/trader/kucoin"
 	"nofx/trader/lighter"
 	"nofx/trader/okx"
+	"nofx/wallet"
 	"sync"
 	"time"
 )
@@ -117,40 +117,54 @@ type AutoTraderConfig struct {
 
 // AutoTrader automatic trader
 type AutoTrader struct {
-	id                    string // Trader unique identifier
-	name                  string // Trader display name
-	aiModel               string // AI model name
-	exchange              string // Trading platform type (binance/bybit/etc)
-	exchangeID            string // Exchange account UUID
-	showInCompetition     bool   // Whether to show in competition page
-	config                AutoTraderConfig
-	trader                Trader // Use Trader interface (supports multiple platforms)
-	mcpClient             mcp.AIClient
-	store                 *store.Store           // Data storage (decision records, etc.)
-	strategyEngine        *kernel.StrategyEngine // Strategy engine (uses strategy configuration)
-	cycleNumber           int                    // Current cycle number
-	initialBalance        float64
-	dailyPnL              float64
-	customPrompt          string // Custom trading strategy prompt
-	overrideBasePrompt    bool   // Whether to override base prompt
-	lastResetTime         time.Time
-	stopUntil             time.Time
-	isRunning             bool
-	isRunningMutex        sync.RWMutex       // Mutex to protect isRunning flag
-	startTime             time.Time          // System start time
-	callCount             int                // AI call count
-	positionFirstSeenTime map[string]int64   // Position first seen time (symbol_side -> timestamp in milliseconds)
-	stopMonitorCh         chan struct{}      // Used to stop monitoring goroutine
-	monitorWg             sync.WaitGroup     // Used to wait for monitoring goroutine to finish
-	peakPnLCache          map[string]float64 // Peak profit cache (symbol -> peak P&L percentage)
-	peakPnLCacheMutex     sync.RWMutex       // Cache read-write lock
-	lastBalanceSyncTime   time.Time          // Last balance sync time
-	userID                string             // User ID
-	gridState             *GridState         // Grid trading state (only used when StrategyType == "grid_trading")
-	claw402WalletAddr     string             // Claw402 wallet address (derived from private key at start)
-	consecutiveAIFailures int               // Consecutive AI call failures
-	safeMode              bool              // Safe mode: no new positions, protect existing ones
-	safeModeReason        string            // Why safe mode was activated
+	id                           string // Trader unique identifier
+	name                         string // Trader display name
+	aiModel                      string // AI model name
+	exchange                     string // Trading platform type (binance/bybit/etc)
+	exchangeID                   string // Exchange account UUID
+	showInCompetition            bool   // Whether to show in competition page
+	config                       AutoTraderConfig
+	trader                       Trader // Use Trader interface (supports multiple platforms)
+	mcpClient                    mcp.AIClient
+	store                        *store.Store // Data storage (decision records, etc.)
+	strategyProfileStore         *store.StrategyProfileStore
+	positionAggregateBuilder     *store.PositionAggregateBuilder
+	orderStateReconciler         *OrderStateReconciler
+	binanceOrderReconcileManager *BinanceOrderReconcileManager
+	fixedProtectionManager       *FixedProtectionManager
+	protectionStateReconciler    *ProtectionStateReconciler
+	protectionAdjustmentManager  *ProtectionAdjustmentManager
+	scaleOutManager              *ScaleOutManager
+	scaleOutStateReconciler      *ScaleOutStateReconciler
+	scaleInRiskGuard             *ScaleInRiskGuard
+	scaleInManager               *ScaleInManager
+	scaleInStateReconciler       *ScaleInStateReconciler
+	protectionRebalanceManager   *ProtectionRebalanceManager
+	runtimeCapabilityResolver    *RuntimeCapabilityResolver
+	strategyEngine               *kernel.StrategyEngine // Strategy engine (uses strategy configuration)
+	cycleNumber                  int                    // Current cycle number
+	initialBalance               float64
+	dailyPnL                     float64
+	customPrompt                 string // Custom trading strategy prompt
+	overrideBasePrompt           bool   // Whether to override base prompt
+	lastResetTime                time.Time
+	stopUntil                    time.Time
+	isRunning                    bool
+	isRunningMutex               sync.RWMutex       // Mutex to protect isRunning flag
+	startTime                    time.Time          // System start time
+	callCount                    int                // AI call count
+	positionFirstSeenTime        map[string]int64   // Position first seen time (symbol_side -> timestamp in milliseconds)
+	stopMonitorCh                chan struct{}      // Used to stop monitoring goroutine
+	monitorWg                    sync.WaitGroup     // Used to wait for monitoring goroutine to finish
+	peakPnLCache                 map[string]float64 // Peak profit cache (symbol -> peak P&L percentage)
+	peakPnLCacheMutex            sync.RWMutex       // Cache read-write lock
+	lastBalanceSyncTime          time.Time          // Last balance sync time
+	userID                       string             // User ID
+	gridState                    *GridState         // Grid trading state (only used when StrategyType == "grid_trading")
+	claw402WalletAddr            string             // Claw402 wallet address (derived from private key at start)
+	consecutiveAIFailures        int                // Consecutive AI call failures
+	safeMode                     bool               // Safe mode: no new positions, protect existing ones
+	safeModeReason               string             // Why safe mode was activated
 }
 
 // NewAutoTrader creates an automatic trader
@@ -342,32 +356,42 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 	strategyEngine := kernel.NewStrategyEngine(config.StrategyConfig, claw402Key)
 	logger.Infof("✓ [%s] Using strategy engine (strategy configuration loaded)", config.Name)
 
-	return &AutoTrader{
-		id:                    config.ID,
-		name:                  config.Name,
-		aiModel:               config.AIModel,
-		exchange:              config.Exchange,
-		exchangeID:            config.ExchangeID,
-		showInCompetition:     config.ShowInCompetition,
-		config:                config,
-		trader:                trader,
-		mcpClient:             mcpClient,
-		store:                 st,
-		strategyEngine:        strategyEngine,
-		cycleNumber:           cycleNumber,
-		initialBalance:        config.InitialBalance,
-		lastResetTime:         time.Now(),
-		startTime:             time.Now(),
-		callCount:             0,
-		isRunning:             false,
-		positionFirstSeenTime: make(map[string]int64),
-		stopMonitorCh:         make(chan struct{}),
-		monitorWg:             sync.WaitGroup{},
-		peakPnLCache:          make(map[string]float64),
-		peakPnLCacheMutex:     sync.RWMutex{},
-		lastBalanceSyncTime:   time.Now(),
-		userID:                userID,
-	}, nil
+	at := &AutoTrader{
+		id:                           config.ID,
+		name:                         config.Name,
+		aiModel:                      config.AIModel,
+		exchange:                     config.Exchange,
+		exchangeID:                   config.ExchangeID,
+		showInCompetition:            config.ShowInCompetition,
+		config:                       config,
+		trader:                       trader,
+		mcpClient:                    mcpClient,
+		store:                        st,
+		strategyProfileStore:         st.StrategyProfile(),
+		positionAggregateBuilder:     store.NewPositionAggregateBuilder(st),
+		orderStateReconciler:         NewOrderStateReconciler(st),
+		binanceOrderReconcileManager: NewBinanceOrderReconcileManager(st),
+		runtimeCapabilityResolver:    NewRuntimeCapabilityResolver(),
+		strategyEngine:               strategyEngine,
+		cycleNumber:                  cycleNumber,
+		initialBalance:               config.InitialBalance,
+		lastResetTime:                time.Now(),
+		startTime:                    time.Now(),
+		callCount:                    0,
+		isRunning:                    false,
+		positionFirstSeenTime:        make(map[string]int64),
+		stopMonitorCh:                make(chan struct{}),
+		monitorWg:                    sync.WaitGroup{},
+		peakPnLCache:                 make(map[string]float64),
+		peakPnLCacheMutex:            sync.RWMutex{},
+		lastBalanceSyncTime:          time.Now(),
+		userID:                       userID,
+	}
+	at.configureBinanceProtectionStack()
+	at.configureBinanceProtectionAdjustmentStack()
+	at.configureBinanceScaleOutStack()
+	at.configureBinanceScaleInStack()
+	return at, nil
 }
 
 // Run runs the automatic trading main loop
@@ -443,8 +467,22 @@ func (at *AutoTrader) Run() error {
 	// Start Binance order sync if using Binance exchange
 	if at.exchange == "binance" {
 		if binanceTrader, ok := at.trader.(*binance.FuturesTrader); ok && at.store != nil {
-			binanceTrader.StartOrderSync(at.id, at.exchangeID, at.exchange, at.store, 30*time.Second)
+			binanceTrader.StartOrderSyncWithCallback(at.id, at.exchangeID, at.exchange, at.store, 30*time.Second, at.handleBinanceTradeSynced)
 			logger.Infof("🔄 [%s] Binance order+position sync enabled (every 30s)", at.name)
+		}
+	}
+	if at.exchange == "binance" {
+		if err := at.bootstrapBinanceProtectionState(); err != nil {
+			logger.Infof("⚠️ [%s] Binance protection bootstrap failed: %v", at.name, err)
+		}
+		if err := at.bootstrapBinanceScaleOutState(); err != nil {
+			logger.Infof("⚠️ [%s] Binance scale-out bootstrap failed: %v", at.name, err)
+		}
+		if err := at.bootstrapBinanceScaleInState(); err != nil {
+			logger.Infof("⚠️ [%s] Binance scale-in bootstrap failed: %v", at.name, err)
+		}
+		if err := at.bootstrapBinanceProtectionAdjustmentState(); err != nil {
+			logger.Infof("⚠️ [%s] Binance protection adjustment bootstrap failed: %v", at.name, err)
 		}
 	}
 

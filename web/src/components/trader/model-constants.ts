@@ -92,7 +92,7 @@ export const AI_PROVIDER_CONFIG: Record<string, AIProviderConfig> = {
   },
   minimax: {
     defaultModel: 'MiniMax-M2.7',
-    apiUrl: 'https://platform.minimax.io',
+    apiUrl: 'https://platform.minimax.io/docs/token-plan/quickstart',
     apiName: 'MiniMax',
   },
   claw402: {

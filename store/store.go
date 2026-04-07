@@ -18,18 +18,39 @@ type Store struct {
 	driver *DBDriver // Database driver for abstraction (legacy)
 
 	// Sub-stores (lazy initialization)
-	user           *UserStore
-	aiModel        *AIModelStore
-	exchange       *ExchangeStore
-	trader         *TraderStore
-	decision       *DecisionStore
-	position       *PositionStore
-	strategy       *StrategyStore
-	equity         *EquityStore
-	order          *OrderStore
-	grid           *GridStore
-	aiCharge       *AIChargeStore
-	telegramConfig TelegramConfigStore
+	user                         *UserStore
+	aiModel                      *AIModelStore
+	exchange                     *ExchangeStore
+	trader                       *TraderStore
+	decision                     *DecisionStore
+	position                     *PositionStore
+	strategyProfile              *StrategyProfileStore
+	positionAggregate            *PositionAggregateStore
+	orderRegistry                *OrderRegistryStore   // System-owned order truth storage.
+	orderEventLog                *OrderEventLogStore   // Append-only raw order event evidence log.
+	protectionGroup              *ProtectionGroupStore // System-owned protection truth storage.
+	protectionEventLog           *ProtectionEventLogStore
+	protectionGroupBuilder       *ProtectionGroupBuilder
+	trailingRule                 *TrailingRuleStore
+	protectionAdjustmentEventLog *ProtectionAdjustmentEventLogStore
+	protectionAdjustmentBuilder  *ProtectionAdjustmentBuilder
+	orderRegistryBuilder         *OrderRegistryBuilder // Centralized order truth updater.
+	scaleOutPlan                 *ScaleOutPlanStore    // System-owned scale-out plan truth storage.
+	scaleOutPlanLevel            *ScaleOutPlanLevelStore
+	scaleOutEventLog             *ScaleOutEventLogStore
+	scaleOutPlanBuilder          *ScaleOutPlanBuilder // Centralized scale-out truth updater.
+	scaleInPlan                  *ScaleInPlanStore    // System-owned scale-in plan truth storage.
+	scaleInPlanLevel             *ScaleInPlanLevelStore
+	scaleInEventLog              *ScaleInEventLogStore
+	scaleInPlanBuilder           *ScaleInPlanBuilder // Centralized scale-in truth updater.
+	replayFixture                *ReplayFixtureStore
+	schemaMigrationFixture       *SchemaMigrationFixtureStore
+	strategy                     *StrategyStore
+	equity                       *EquityStore
+	order                        *OrderStore
+	grid                         *GridStore
+	aiCharge                     *AIChargeStore
+	telegramConfig               TelegramConfigStore
 
 	mu sync.RWMutex
 }
@@ -146,6 +167,54 @@ func (s *Store) initTables() error {
 	if err := s.Position().InitTables(); err != nil {
 		return fmt.Errorf("failed to initialize position tables: %w", err)
 	}
+	if err := s.StrategyProfile().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize strategy profile tables: %w", err)
+	}
+	if err := s.PositionAggregate().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize position aggregate tables: %w", err)
+	}
+	if err := s.OrderRegistry().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize order registry tables: %w", err)
+	}
+	if err := s.OrderEventLog().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize order event log tables: %w", err)
+	}
+	if err := s.ProtectionGroup().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize protection group tables: %w", err)
+	}
+	if err := s.ProtectionEventLog().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize protection event log tables: %w", err)
+	}
+	if err := s.TrailingRule().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize trailing rule tables: %w", err)
+	}
+	if err := s.ProtectionAdjustmentEventLog().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize protection adjustment event log tables: %w", err)
+	}
+	if err := s.ScaleOutPlan().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize scale-out plan tables: %w", err)
+	}
+	if err := s.ScaleOutPlanLevel().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize scale-out plan level tables: %w", err)
+	}
+	if err := s.ScaleOutEventLog().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize scale-out event log tables: %w", err)
+	}
+	if err := s.ScaleInPlan().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize scale-in plan tables: %w", err)
+	}
+	if err := s.ScaleInPlanLevel().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize scale-in plan level tables: %w", err)
+	}
+	if err := s.ScaleInEventLog().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize scale-in event log tables: %w", err)
+	}
+	if err := s.ReplayFixture().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize replay fixture tables: %w", err)
+	}
+	if err := s.SchemaMigrationFixture().initTables(); err != nil {
+		return fmt.Errorf("failed to initialize schema migration fixture tables: %w", err)
+	}
 	if err := s.Strategy().initTables(); err != nil {
 		return fmt.Errorf("failed to initialize strategy tables: %w", err)
 	}
@@ -245,6 +314,216 @@ func (s *Store) Position() *PositionStore {
 		s.position = NewPositionStore(s.gdb)
 	}
 	return s.position
+}
+
+// StrategyProfile gets strategy profile storage
+func (s *Store) StrategyProfile() *StrategyProfileStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.strategyProfile == nil {
+		s.strategyProfile = NewStrategyProfileStore(s.gdb)
+	}
+	return s.strategyProfile
+}
+
+// PositionAggregate gets position aggregate storage
+func (s *Store) PositionAggregate() *PositionAggregateStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.positionAggregate == nil {
+		s.positionAggregate = NewPositionAggregateStore(s.gdb)
+	}
+	return s.positionAggregate
+}
+
+// OrderRegistry gets the order truth storage.
+func (s *Store) OrderRegistry() *OrderRegistryStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.orderRegistry == nil {
+		s.orderRegistry = NewOrderRegistryStore(s.gdb)
+	}
+	return s.orderRegistry
+}
+
+// OrderEventLog gets the order event log storage.
+func (s *Store) OrderEventLog() *OrderEventLogStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.orderEventLog == nil {
+		s.orderEventLog = NewOrderEventLogStore(s.gdb)
+	}
+	return s.orderEventLog
+}
+
+// ProtectionGroup gets the protection truth storage.
+func (s *Store) ProtectionGroup() *ProtectionGroupStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.protectionGroup == nil {
+		s.protectionGroup = NewProtectionGroupStore(s.gdb)
+	}
+	return s.protectionGroup
+}
+
+// ProtectionEventLog gets the protection event log storage.
+func (s *Store) ProtectionEventLog() *ProtectionEventLogStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.protectionEventLog == nil {
+		s.protectionEventLog = NewProtectionEventLogStore(s.gdb)
+	}
+	return s.protectionEventLog
+}
+
+// ProtectionGroupBuilder gets the centralized protection truth updater.
+func (s *Store) ProtectionGroupBuilder() *ProtectionGroupBuilder {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.protectionGroupBuilder == nil {
+		s.protectionGroupBuilder = NewProtectionGroupBuilder(s)
+	}
+	return s.protectionGroupBuilder
+}
+
+// TrailingRule gets the dynamic protection rule truth storage.
+func (s *Store) TrailingRule() *TrailingRuleStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.trailingRule == nil {
+		s.trailingRule = NewTrailingRuleStore(s.gdb)
+	}
+	return s.trailingRule
+}
+
+// ProtectionAdjustmentEventLog gets the dynamic protection evidence storage.
+func (s *Store) ProtectionAdjustmentEventLog() *ProtectionAdjustmentEventLogStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.protectionAdjustmentEventLog == nil {
+		s.protectionAdjustmentEventLog = NewProtectionAdjustmentEventLogStore(s.gdb)
+	}
+	return s.protectionAdjustmentEventLog
+}
+
+// ProtectionAdjustmentBuilder gets the centralized dynamic protection truth updater.
+func (s *Store) ProtectionAdjustmentBuilder() *ProtectionAdjustmentBuilder {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.protectionAdjustmentBuilder == nil {
+		s.protectionAdjustmentBuilder = NewProtectionAdjustmentBuilder(s)
+	}
+	return s.protectionAdjustmentBuilder
+}
+
+// OrderRegistryBuilder gets the centralized order registry builder.
+func (s *Store) OrderRegistryBuilder() *OrderRegistryBuilder {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.orderRegistryBuilder == nil {
+		s.orderRegistryBuilder = NewOrderRegistryBuilder(s)
+	}
+	return s.orderRegistryBuilder
+}
+
+// ScaleOutPlan gets the scale-out plan storage.
+func (s *Store) ScaleOutPlan() *ScaleOutPlanStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scaleOutPlan == nil {
+		s.scaleOutPlan = NewScaleOutPlanStore(s.gdb)
+	}
+	return s.scaleOutPlan
+}
+
+// ScaleOutPlanLevel gets the scale-out plan level storage.
+func (s *Store) ScaleOutPlanLevel() *ScaleOutPlanLevelStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scaleOutPlanLevel == nil {
+		s.scaleOutPlanLevel = NewScaleOutPlanLevelStore(s.gdb)
+	}
+	return s.scaleOutPlanLevel
+}
+
+// ScaleOutEventLog gets the scale-out event log storage.
+func (s *Store) ScaleOutEventLog() *ScaleOutEventLogStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scaleOutEventLog == nil {
+		s.scaleOutEventLog = NewScaleOutEventLogStore(s.gdb)
+	}
+	return s.scaleOutEventLog
+}
+
+// ScaleInPlan gets the scale-in plan storage.
+func (s *Store) ScaleInPlan() *ScaleInPlanStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scaleInPlan == nil {
+		s.scaleInPlan = NewScaleInPlanStore(s.gdb)
+	}
+	return s.scaleInPlan
+}
+
+// ScaleInPlanLevel gets the scale-in plan level storage.
+func (s *Store) ScaleInPlanLevel() *ScaleInPlanLevelStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scaleInPlanLevel == nil {
+		s.scaleInPlanLevel = NewScaleInPlanLevelStore(s.gdb)
+	}
+	return s.scaleInPlanLevel
+}
+
+// ScaleInEventLog gets the scale-in event log storage.
+func (s *Store) ScaleInEventLog() *ScaleInEventLogStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scaleInEventLog == nil {
+		s.scaleInEventLog = NewScaleInEventLogStore(s.gdb)
+	}
+	return s.scaleInEventLog
+}
+
+// ScaleOutPlanBuilder gets the centralized scale-out truth updater.
+func (s *Store) ScaleOutPlanBuilder() *ScaleOutPlanBuilder {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scaleOutPlanBuilder == nil {
+		s.scaleOutPlanBuilder = NewScaleOutPlanBuilder(s)
+	}
+	return s.scaleOutPlanBuilder
+}
+
+// ScaleInPlanBuilder gets the centralized scale-in truth updater.
+func (s *Store) ScaleInPlanBuilder() *ScaleInPlanBuilder {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.scaleInPlanBuilder == nil {
+		s.scaleInPlanBuilder = NewScaleInPlanBuilder(s)
+	}
+	return s.scaleInPlanBuilder
+}
+
+// ReplayFixture gets the validation replay fixture storage.
+func (s *Store) ReplayFixture() *ReplayFixtureStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.replayFixture == nil {
+		s.replayFixture = NewReplayFixtureStore(s.gdb)
+	}
+	return s.replayFixture
+}
+
+// SchemaMigrationFixture gets the validation schema migration fixture storage.
+func (s *Store) SchemaMigrationFixture() *SchemaMigrationFixtureStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.schemaMigrationFixture == nil {
+		s.schemaMigrationFixture = NewSchemaMigrationFixtureStore(s.gdb)
+	}
+	return s.schemaMigrationFixture
 }
 
 // Strategy gets strategy storage

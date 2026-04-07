@@ -2,6 +2,14 @@ import type {
   TraderInfo,
   TraderConfigData,
   CreateTraderRequest,
+  RuntimeCapabilityPreview,
+  OrderReconcilePreview,
+  ProtectionReconcilePreview,
+  ProtectionAdjustmentPreview,
+  ScaleOutReconcilePreview,
+  ScaleInReconcilePreview,
+  ReplayPreview,
+  RestorePreview,
 } from '../../types'
 import { API_BASE, httpClient } from './helpers'
 import { ApiError } from '../httpClient'
@@ -120,6 +128,150 @@ export const traderApi = {
         result.statusCode
       )
     }
+    return result.data!
+  },
+
+  async getRuntimeCapabilityPreview(
+    traderId: string,
+    symbol?: string,
+    silent: boolean = true
+  ): Promise<RuntimeCapabilityPreview> {
+    const params = new URLSearchParams({ trader_id: traderId })
+    if (symbol) {
+      params.append('symbol', symbol)
+    }
+
+    const result = await httpClient.request<RuntimeCapabilityPreview>(
+      `${API_BASE}/runtime/capabilities/preview?${params.toString()}`,
+      { silent }
+    )
+    if (!result.success) throw new Error('Failed to fetch runtime capability preview')
+    return result.data!
+  },
+
+  async getRuntimeReplayPreview(
+    fixtureId: string,
+    mode?: string,
+    silent: boolean = true
+  ): Promise<ReplayPreview> {
+    const params = new URLSearchParams({ fixture_id: fixtureId })
+    if (mode) {
+      params.append('mode', mode)
+    }
+
+    const result = await httpClient.request<ReplayPreview>(
+      `${API_BASE}/runtime/replay/preview?${params.toString()}`,
+      { silent }
+    )
+    if (!result.success) throw new Error('Failed to fetch runtime replay preview')
+    return result.data!
+  },
+
+  async getRuntimeRestorePreview(
+    traderId: string,
+    symbol?: string,
+    silent: boolean = true
+  ): Promise<RestorePreview> {
+    const params = new URLSearchParams({ trader_id: traderId })
+    if (symbol) {
+      params.append('symbol', symbol)
+    }
+
+    const result = await httpClient.request<RestorePreview>(
+      `${API_BASE}/runtime/restore/preview?${params.toString()}`,
+      { silent }
+    )
+    if (!result.success) throw new Error('Failed to fetch runtime restore preview')
+    return result.data!
+  },
+
+  async getRuntimeOrderPreview(
+    traderId: string,
+    symbol?: string,
+    silent: boolean = true
+  ): Promise<OrderReconcilePreview> {
+    const params = new URLSearchParams({ trader_id: traderId })
+    if (symbol) {
+      params.append('symbol', symbol)
+    }
+
+    const result = await httpClient.request<OrderReconcilePreview>(
+      `${API_BASE}/runtime/orders/preview?${params.toString()}`,
+      { silent }
+    )
+    if (!result.success) throw new Error('Failed to fetch runtime order preview')
+    return result.data!
+  },
+
+  async getRuntimeProtectionPreview(
+    traderId: string,
+    symbol?: string,
+    silent: boolean = true
+  ): Promise<ProtectionReconcilePreview> {
+    const params = new URLSearchParams({ trader_id: traderId })
+    if (symbol) {
+      params.append('symbol', symbol)
+    }
+
+    const result = await httpClient.request<ProtectionReconcilePreview>(
+      `${API_BASE}/runtime/protection/preview?${params.toString()}`,
+      { silent }
+    )
+    if (!result.success) throw new Error('Failed to fetch runtime protection preview')
+    return result.data!
+  },
+
+  async getRuntimeProtectionAdjustmentPreview(
+    traderId: string,
+    symbol?: string,
+    silent: boolean = true
+  ): Promise<ProtectionAdjustmentPreview> {
+    const params = new URLSearchParams({ trader_id: traderId })
+    if (symbol) {
+      params.append('symbol', symbol)
+    }
+
+    const result = await httpClient.request<ProtectionAdjustmentPreview>(
+      `${API_BASE}/runtime/protection-adjustment/preview?${params.toString()}`,
+      { silent }
+    )
+    if (!result.success) throw new Error('Failed to fetch runtime protection adjustment preview')
+    return result.data!
+  },
+
+  async getRuntimeScaleOutPreview(
+    traderId: string,
+    symbol?: string,
+    silent: boolean = true
+  ): Promise<ScaleOutReconcilePreview> {
+    const params = new URLSearchParams({ trader_id: traderId })
+    if (symbol) {
+      params.append('symbol', symbol)
+    }
+
+    const result = await httpClient.request<ScaleOutReconcilePreview>(
+      `${API_BASE}/runtime/scale-out/preview?${params.toString()}`,
+      { silent }
+    )
+    if (!result.success) throw new Error('Failed to fetch runtime scale-out preview')
+    return result.data!
+  },
+
+  async getRuntimeScaleInPreview(
+    traderId: string,
+    symbol?: string,
+    silent: boolean = true
+  ): Promise<ScaleInReconcilePreview> {
+    const params = new URLSearchParams({ trader_id: traderId })
+    if (symbol) {
+      params.append('symbol', symbol)
+    }
+
+    const result = await httpClient.request<ScaleInReconcilePreview>(
+      `${API_BASE}/runtime/scale-in/preview?${params.toString()}`,
+      { silent }
+    )
+    if (!result.success) throw new Error('Failed to fetch runtime scale-in preview')
     return result.data!
   },
 }

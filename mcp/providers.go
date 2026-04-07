@@ -23,7 +23,10 @@ const (
 	DefaultQwenBaseURL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 	DefaultQwenModel   = "qwen3-max"
 
-	// Default MiniMax configuration (used by WithMiniMaxConfig convenience option)
-	DefaultMiniMaxBaseURL = "https://api.minimax.io/v1"
+	// Default MiniMax configuration (used by WithMiniMaxConfig convenience option).
+	// MiniMax token-plan docs expose the Anthropic-compatible base URL as
+	// https://api.minimax.io/anthropic (CN: https://api.minimaxi.com/anthropic).
+	// The provider normalizes this to the internal /v1/messages shape.
+	DefaultMiniMaxBaseURL = "https://api.minimax.io/anthropic/v1"
 	DefaultMiniMaxModel   = "MiniMax-M2.7"
 )

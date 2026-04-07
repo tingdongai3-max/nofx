@@ -18,10 +18,20 @@ var (
 	binanceSyncStateMutex sync.RWMutex
 )
 
-// SyncOrdersFromBinance syncs Binance Futures trade history to local database
+// BinanceTradeSyncCallback is invoked after a Binance trade is synced and the local position state is updated.
+// It is a service-layer hook for downstream truth reconstruction, not a raw exchange callback.
+type BinanceTradeSyncCallback func(trade types.TradeRecord, orderAction string) error
+
+// SyncOrdersFromBinance syncs Binance Futures trade history to local database.
+// It preserves the legacy signature and delegates to the callback-capable variant with no hook.
+func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string, exchangeType string, st *store.Store) error {
+	return t.SyncOrdersFromBinanceWithCallback(traderID, exchangeID, exchangeType, st, nil)
+}
+
+// SyncOrdersFromBinanceWithCallback syncs Binance Futures trade history to local database.
 // Uses COMMISSION detection + fromId for efficient incremental sync
 // Also creates/updates position records to ensure orders/fills/positions data consistency
-func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string, exchangeType string, st *store.Store) error {
+func (t *FuturesTrader) SyncOrdersFromBinanceWithCallback(traderID string, exchangeID string, exchangeType string, st *store.Store, onTradeSynced BinanceTradeSyncCallback) error {
 	if st == nil {
 		return fmt.Errorf("store is nil")
 	}
@@ -264,6 +274,11 @@ func (t *FuturesTrader) SyncOrdersFromBinance(traderID string, exchangeID string
 			logger.Infof("  ⚠️ Failed to sync position for trade %s: %v", trade.TradeID, err)
 		} else {
 			logger.Infof("  📍 Position updated for trade: %s (action: %s, qty: %.6f)", trade.TradeID, orderAction, trade.Quantity)
+			if onTradeSynced != nil {
+				if callbackErr := onTradeSynced(trade, orderAction); callbackErr != nil {
+					logger.Infof("  ⚠️ Binance trade sync callback failed for trade %s: %v", trade.TradeID, callbackErr)
+				}
+			}
 		}
 
 		syncedCount++
@@ -348,12 +363,19 @@ func (t *FuturesTrader) determineOrderAction(side, positionSide string, realized
 	return "open_short"
 }
 
-// StartOrderSync starts background order sync task for Binance
+// StartOrderSync starts background order sync task for Binance.
+// It preserves the legacy signature and delegates to the callback-capable variant with no hook.
 func (t *FuturesTrader) StartOrderSync(traderID string, exchangeID string, exchangeType string, st *store.Store, interval time.Duration) {
+	t.StartOrderSyncWithCallback(traderID, exchangeID, exchangeType, st, interval, nil)
+}
+
+// StartOrderSyncWithCallback starts background order sync task for Binance.
+// The optional callback runs after each confirmed trade has been written into the local truth layers.
+func (t *FuturesTrader) StartOrderSyncWithCallback(traderID string, exchangeID string, exchangeType string, st *store.Store, interval time.Duration, onTradeSynced BinanceTradeSyncCallback) {
 	// Run first sync immediately
 	go func() {
 		logger.Infof("🔄 Running initial Binance order sync...")
-		if err := t.SyncOrdersFromBinance(traderID, exchangeID, exchangeType, st); err != nil {
+		if err := t.SyncOrdersFromBinanceWithCallback(traderID, exchangeID, exchangeType, st, onTradeSynced); err != nil {
 			logger.Infof("⚠️  Initial Binance order sync failed: %v", err)
 		}
 	}()
@@ -362,7 +384,7 @@ func (t *FuturesTrader) StartOrderSync(traderID string, exchangeID string, excha
 	ticker := time.NewTicker(interval)
 	go func() {
 		for range ticker.C {
-			if err := t.SyncOrdersFromBinance(traderID, exchangeID, exchangeType, st); err != nil {
+			if err := t.SyncOrdersFromBinanceWithCallback(traderID, exchangeID, exchangeType, st, onTradeSynced); err != nil {
 				logger.Infof("⚠️  Binance order sync failed: %v", err)
 			}
 		}

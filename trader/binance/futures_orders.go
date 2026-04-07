@@ -6,118 +6,29 @@ import (
 	"nofx/logger"
 	"nofx/trader/types"
 	"strconv"
+	"strings"
 
 	"github.com/adshao/go-binance/v2/futures"
 )
 
 // OpenLong opens a long position
 func (t *FuturesTrader) OpenLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
-	// First cancel all pending orders for this symbol (clean up old stop-loss and take-profit orders)
-	if err := t.CancelAllOrders(symbol); err != nil {
-		logger.Infof("  ⚠ Failed to cancel old pending orders (may not have any): %v", err)
-	}
-
-	// Set leverage
-	if err := t.SetLeverage(symbol, leverage); err != nil {
-		return nil, err
-	}
-
-	// Note: Margin mode should be set by the caller (AutoTrader) before opening position via SetMarginMode
-
-	// Format quantity to correct precision
-	quantityStr, err := t.FormatQuantity(symbol, quantity)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check if formatted quantity is 0 (prevent rounding errors)
-	quantityFloat, parseErr := strconv.ParseFloat(quantityStr, 64)
-	if parseErr != nil || quantityFloat <= 0 {
-		return nil, fmt.Errorf("position size too small, rounded to 0 (original: %.8f → formatted: %s). Suggest increasing position amount or selecting a lower-priced coin", quantity, quantityStr)
-	}
-
-	// Check minimum notional value (Binance requires at least 10 USDT)
-	if err := t.CheckMinNotional(symbol, quantityFloat); err != nil {
-		return nil, err
-	}
-
-	// Create market buy order (using br ID)
-	order, err := t.client.NewCreateOrderService().
-		Symbol(symbol).
-		Side(futures.SideTypeBuy).
-		PositionSide(futures.PositionSideTypeLong).
-		Type(futures.OrderTypeMarket).
-		Quantity(quantityStr).
-		NewClientOrderID(getBrOrderID()).
-		Do(context.Background())
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to open long position: %w", err)
-	}
-
-	logger.Infof("✓ Opened long position successfully: %s quantity: %s", symbol, quantityStr)
-	logger.Infof("  Order ID: %d", order.OrderID)
-
-	result := make(map[string]interface{})
-	result["orderId"] = order.OrderID
-	result["symbol"] = order.Symbol
-	result["status"] = order.Status
-	return result, nil
+	return t.submitMarketEntryOrder(symbol, quantity, leverage, futures.SideTypeBuy, futures.PositionSideTypeLong, true)
 }
 
 // OpenShort opens a short position
 func (t *FuturesTrader) OpenShort(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
-	// First cancel all pending orders for this symbol (clean up old stop-loss and take-profit orders)
-	if err := t.CancelAllOrders(symbol); err != nil {
-		logger.Infof("  ⚠ Failed to cancel old pending orders (may not have any): %v", err)
-	}
+	return t.submitMarketEntryOrder(symbol, quantity, leverage, futures.SideTypeSell, futures.PositionSideTypeShort, true)
+}
 
-	// Set leverage
-	if err := t.SetLeverage(symbol, leverage); err != nil {
-		return nil, err
-	}
+// AddLong submits a same-symbol add-position market order without canceling existing protection orders.
+func (t *FuturesTrader) AddLong(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	return t.submitMarketEntryOrder(symbol, quantity, leverage, futures.SideTypeBuy, futures.PositionSideTypeLong, false)
+}
 
-	// Note: Margin mode should be set by the caller (AutoTrader) before opening position via SetMarginMode
-
-	// Format quantity to correct precision
-	quantityStr, err := t.FormatQuantity(symbol, quantity)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check if formatted quantity is 0 (prevent rounding errors)
-	quantityFloat, parseErr := strconv.ParseFloat(quantityStr, 64)
-	if parseErr != nil || quantityFloat <= 0 {
-		return nil, fmt.Errorf("position size too small, rounded to 0 (original: %.8f → formatted: %s). Suggest increasing position amount or selecting a lower-priced coin", quantity, quantityStr)
-	}
-
-	// Check minimum notional value (Binance requires at least 10 USDT)
-	if err := t.CheckMinNotional(symbol, quantityFloat); err != nil {
-		return nil, err
-	}
-
-	// Create market sell order (using br ID)
-	order, err := t.client.NewCreateOrderService().
-		Symbol(symbol).
-		Side(futures.SideTypeSell).
-		PositionSide(futures.PositionSideTypeShort).
-		Type(futures.OrderTypeMarket).
-		Quantity(quantityStr).
-		NewClientOrderID(getBrOrderID()).
-		Do(context.Background())
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to open short position: %w", err)
-	}
-
-	logger.Infof("✓ Opened short position successfully: %s quantity: %s", symbol, quantityStr)
-	logger.Infof("  Order ID: %d", order.OrderID)
-
-	result := make(map[string]interface{})
-	result["orderId"] = order.OrderID
-	result["symbol"] = order.Symbol
-	result["status"] = order.Status
-	return result, nil
+// AddShort submits a same-symbol add-position market order without canceling existing protection orders.
+func (t *FuturesTrader) AddShort(symbol string, quantity float64, leverage int) (map[string]interface{}, error) {
+	return t.submitMarketEntryOrder(symbol, quantity, leverage, futures.SideTypeSell, futures.PositionSideTypeShort, false)
 }
 
 // CloseLong closes a long position
@@ -228,6 +139,68 @@ func (t *FuturesTrader) CloseShort(symbol string, quantity float64) (map[string]
 	result["symbol"] = order.Symbol
 	result["status"] = order.Status
 	return result, nil
+}
+
+func (t *FuturesTrader) submitMarketEntryOrder(symbol string, quantity float64, leverage int, side futures.SideType, positionSide futures.PositionSideType, cancelWorkingOrders bool) (map[string]interface{}, error) {
+	if cancelWorkingOrders {
+		if err := t.CancelAllOrders(symbol); err != nil {
+			logger.Infof("  ⚠ Failed to cancel old pending orders (may not have any): %v", err)
+		}
+	}
+
+	if err := t.SetLeverage(symbol, leverage); err != nil {
+		return nil, err
+	}
+
+	quantityStr, err := t.FormatQuantity(symbol, quantity)
+	if err != nil {
+		return nil, err
+	}
+
+	quantityFloat, parseErr := strconv.ParseFloat(quantityStr, 64)
+	if parseErr != nil || quantityFloat <= 0 {
+		return nil, fmt.Errorf("position size too small, rounded to 0 (original: %.8f → formatted: %s). Suggest increasing position amount or selecting a lower-priced coin", quantity, quantityStr)
+	}
+
+	if err := t.CheckMinNotional(symbol, quantityFloat); err != nil {
+		return nil, err
+	}
+
+	order, err := t.client.NewCreateOrderService().
+		Symbol(symbol).
+		Side(side).
+		PositionSide(positionSide).
+		Type(futures.OrderTypeMarket).
+		Quantity(quantityStr).
+		NewClientOrderID(getBrOrderID()).
+		Do(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to submit market order: %w", err)
+	}
+
+	actionLabel := "add"
+	if cancelWorkingOrders {
+		actionLabel = "open"
+	}
+	logger.Infof("✓ Submitted %s %s position successfully: %s quantity: %s", actionLabel, strings.ToLower(string(positionSide)), symbol, quantityStr)
+	logger.Infof("  Order ID: %d", order.OrderID)
+
+	result := make(map[string]interface{})
+	result["orderId"] = order.OrderID
+	result["clientOrderId"] = order.ClientOrderID
+	result["symbol"] = order.Symbol
+	result["status"] = order.Status
+	return result, nil
+}
+
+// ReduceLong submits a reduce-only market order that trims a long position without canceling other orders.
+func (t *FuturesTrader) ReduceLong(symbol string, quantity float64) (map[string]interface{}, error) {
+	return t.submitReduceOnlyMarketOrder(symbol, futures.SideTypeSell, futures.PositionSideTypeLong, quantity)
+}
+
+// ReduceShort submits a reduce-only market order that trims a short position without canceling other orders.
+func (t *FuturesTrader) ReduceShort(symbol string, quantity float64) (map[string]interface{}, error) {
+	return t.submitReduceOnlyMarketOrder(symbol, futures.SideTypeBuy, futures.PositionSideTypeShort, quantity)
 }
 
 // CancelStopLossOrders cancels only stop-loss orders (doesn't affect take-profit orders)
@@ -439,11 +412,16 @@ func (t *FuturesTrader) PlaceLimitOrder(req *types.LimitOrderRequest) (*types.Li
 	var side futures.SideType
 	var positionSide futures.PositionSideType
 
-	if req.Side == "BUY" {
+	if strings.EqualFold(strings.TrimSpace(req.Side), "BUY") {
 		side = futures.SideTypeBuy
-		positionSide = futures.PositionSideTypeLong
 	} else {
 		side = futures.SideTypeSell
+	}
+	if normalized := strings.ToUpper(strings.TrimSpace(req.PositionSide)); normalized == "LONG" || normalized == "SHORT" {
+		positionSide = futures.PositionSideType(normalized)
+	} else if req.Side == "BUY" {
+		positionSide = futures.PositionSideTypeLong
+	} else {
 		positionSide = futures.PositionSideTypeShort
 	}
 
@@ -453,6 +431,7 @@ func (t *FuturesTrader) PlaceLimitOrder(req *types.LimitOrderRequest) (*types.Li
 		Side(side).
 		PositionSide(positionSide).
 		Type(futures.OrderTypeLimit).
+		ReduceOnly(req.ReduceOnly).
 		TimeInForce(futures.TimeInForceTypeGTC).
 		Quantity(quantityStr).
 		Price(priceStr).
@@ -477,6 +456,44 @@ func (t *FuturesTrader) PlaceLimitOrder(req *types.LimitOrderRequest) (*types.Li
 		Quantity:     req.Quantity,
 		Status:       string(order.Status),
 	}, nil
+}
+
+func (t *FuturesTrader) submitReduceOnlyMarketOrder(symbol string, side futures.SideType, positionSide futures.PositionSideType, quantity float64) (map[string]interface{}, error) {
+	if quantity <= 0 {
+		return nil, fmt.Errorf("reduce quantity must be greater than 0")
+	}
+
+	quantityStr, err := t.FormatQuantity(symbol, quantity)
+	if err != nil {
+		return nil, err
+	}
+
+	quantityFloat, parseErr := strconv.ParseFloat(quantityStr, 64)
+	if parseErr != nil || quantityFloat <= 0 {
+		return nil, fmt.Errorf("reduce quantity too small, rounded to 0 (original: %.8f → formatted: %s)", quantity, quantityStr)
+	}
+
+	order, err := t.client.NewCreateOrderService().
+		Symbol(symbol).
+		Side(side).
+		PositionSide(positionSide).
+		Type(futures.OrderTypeMarket).
+		ReduceOnly(true).
+		Quantity(quantityStr).
+		NewClientOrderID(getBrOrderID()).
+		Do(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to submit reduce-only market order: %w", err)
+	}
+
+	logger.Infof("✓ Submitted reduce-only market order: %s %s %s quantity=%s", symbol, side, positionSide, quantityStr)
+
+	result := map[string]interface{}{
+		"orderId": order.OrderID,
+		"symbol":  order.Symbol,
+		"status":  order.Status,
+	}
+	return result, nil
 }
 
 // CancelOrder cancels a specific order by ID
@@ -653,6 +670,13 @@ func (t *FuturesTrader) GetOpenOrders(symbol string) ([]types.OpenOrder, error) 
 // SetStopLoss sets stop-loss order using new Algo Order API
 // Binance has migrated stop orders to Algo Order system (error -4120 STOP_ORDER_SWITCH_ALGO)
 func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity, stopPrice float64) error {
+	_, err := t.CreateStopLossOrder(symbol, positionSide, quantity, stopPrice, "")
+	return err
+}
+
+// CreateStopLossOrder submits a stop-loss algo order and returns the client algo id used for correlation.
+// The client algo id is the system-local correlation key for the protection truth layer.
+func (t *FuturesTrader) CreateStopLossOrder(symbol string, positionSide string, quantity, stopPrice float64, clientAlgoID string) (string, error) {
 	var side futures.SideType
 	var posSide futures.PositionSideType
 
@@ -662,6 +686,10 @@ func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity
 	} else {
 		side = futures.SideTypeBuy
 		posSide = futures.PositionSideTypeShort
+	}
+
+	if clientAlgoID == "" {
+		clientAlgoID = getBrOrderID()
 	}
 
 	// Use new Algo Order API
@@ -673,20 +701,27 @@ func (t *FuturesTrader) SetStopLoss(symbol string, positionSide string, quantity
 		TriggerPrice(fmt.Sprintf("%.8f", stopPrice)).
 		WorkingType(futures.WorkingTypeContractPrice).
 		ClosePosition(true).
-		ClientAlgoId(getBrOrderID()).
+		ClientAlgoId(clientAlgoID).
 		Do(context.Background())
 
 	if err != nil {
-		return fmt.Errorf("failed to set stop-loss: %w", err)
+		return "", fmt.Errorf("failed to set stop-loss: %w", err)
 	}
 
 	logger.Infof("  Stop-loss price set (Algo Order): %.4f", stopPrice)
-	return nil
+	return clientAlgoID, nil
 }
 
 // SetTakeProfit sets take-profit order using new Algo Order API
 // Binance has migrated stop orders to Algo Order system (error -4120 STOP_ORDER_SWITCH_ALGO)
 func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quantity, takeProfitPrice float64) error {
+	_, err := t.CreateTakeProfitOrder(symbol, positionSide, quantity, takeProfitPrice, "")
+	return err
+}
+
+// CreateTakeProfitOrder submits a take-profit algo order and returns the client algo id used for correlation.
+// The client algo id is the system-local correlation key for the protection truth layer.
+func (t *FuturesTrader) CreateTakeProfitOrder(symbol string, positionSide string, quantity, takeProfitPrice float64, clientAlgoID string) (string, error) {
 	var side futures.SideType
 	var posSide futures.PositionSideType
 
@@ -698,6 +733,10 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 		posSide = futures.PositionSideTypeShort
 	}
 
+	if clientAlgoID == "" {
+		clientAlgoID = getBrOrderID()
+	}
+
 	// Use new Algo Order API
 	_, err := t.client.NewCreateAlgoOrderService().
 		Symbol(symbol).
@@ -707,15 +746,15 @@ func (t *FuturesTrader) SetTakeProfit(symbol string, positionSide string, quanti
 		TriggerPrice(fmt.Sprintf("%.8f", takeProfitPrice)).
 		WorkingType(futures.WorkingTypeContractPrice).
 		ClosePosition(true).
-		ClientAlgoId(getBrOrderID()).
+		ClientAlgoId(clientAlgoID).
 		Do(context.Background())
 
 	if err != nil {
-		return fmt.Errorf("failed to set take-profit: %w", err)
+		return "", fmt.Errorf("failed to set take-profit: %w", err)
 	}
 
 	logger.Infof("  Take-profit price set (Algo Order): %.4f", takeProfitPrice)
-	return nil
+	return clientAlgoID, nil
 }
 
 // GetOrderStatus gets order status

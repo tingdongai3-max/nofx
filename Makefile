@@ -1,6 +1,6 @@
 # NOFX Makefile for testing and development
 
-.PHONY: help test test-backend test-frontend test-coverage clean
+.PHONY: help test test-backend test-frontend test-coverage clean dev
 
 # Default target
 help:
@@ -15,6 +15,7 @@ help:
 	@echo "Build:"
 	@echo "  make build                - Build backend binary"
 	@echo "  make build-frontend       - Build frontend"
+	@echo "  make dev                  - Rebuild and restart the compose stack"
 	@echo ""
 	@echo "Clean:"
 	@echo "  make clean                - Clean build artifacts and test cache"
@@ -68,6 +69,12 @@ build-frontend:
 # =============================================================================
 # Development
 # =============================================================================
+
+# Rebuild and restart the full compose stack
+dev:
+	@echo "🚀 Rebuilding and restarting development stack..."
+	docker compose up -d --build --force-recreate --remove-orphans
+	@echo "✅ Development stack started"
 
 # Run backend in development mode
 run:

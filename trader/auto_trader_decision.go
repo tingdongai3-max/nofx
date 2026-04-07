@@ -3,11 +3,11 @@ package trader
 import (
 	"fmt"
 	"math"
-	"nofx/telemetry"
 	"nofx/kernel"
 	"nofx/logger"
 	"nofx/market"
 	"nofx/store"
+	"nofx/telemetry"
 	"time"
 )
 
@@ -239,7 +239,7 @@ func (at *AutoTrader) GetPositions() ([]map[string]interface{}, error) {
 }
 
 // recordAndConfirmOrder polls order status for actual fill data and records position
-// action: open_long, open_short, close_long, close_short
+// action: open_long, open_short, add_position, close_long, close_short
 // entryPrice: entry price when closing (0 when opening)
 func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, symbol, action string, quantity float64, price float64, leverage int, entryPrice float64) {
 	if at.store == nil {
@@ -267,7 +267,7 @@ func (at *AutoTrader) recordAndConfirmOrder(orderResult map[string]interface{}, 
 	// Determine positionSide
 	var positionSide string
 	switch action {
-	case "open_long", "close_long":
+	case "open_long", "add_position", "close_long":
 		positionSide = "LONG"
 	case "open_short", "close_short":
 		positionSide = "SHORT"
@@ -363,7 +363,7 @@ func (at *AutoTrader) recordPositionChange(orderID, symbol, side, action string,
 	}
 
 	switch action {
-	case "open_long", "open_short":
+	case "open_long", "open_short", "add_position":
 		// Open position: create new position record
 		nowMs := time.Now().UTC().UnixMilli()
 		pos := &store.TraderPosition{
@@ -414,7 +414,7 @@ func (at *AutoTrader) createOrderRecord(orderID, symbol, action, positionSide st
 	// Determine side (BUY/SELL)
 	var side string
 	switch action {
-	case "open_long", "close_short":
+	case "open_long", "add_position", "close_short":
 		side = "BUY"
 	case "open_short", "close_long":
 		side = "SELL"
@@ -464,7 +464,7 @@ func (at *AutoTrader) recordOrderFill(orderRecordID int64, exchangeOrderID, symb
 	// Determine side (BUY/SELL)
 	var side string
 	switch action {
-	case "open_long", "close_short":
+	case "open_long", "add_position", "close_short":
 		side = "BUY"
 	case "open_short", "close_long":
 		side = "SELL"

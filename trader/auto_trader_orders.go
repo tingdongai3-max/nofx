@@ -6,6 +6,7 @@ import (
 	"nofx/logger"
 	"nofx/market"
 	"nofx/store"
+	"strings"
 	"time"
 )
 
@@ -16,6 +17,8 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *kernel.Decision, actio
 		return at.executeOpenLongWithRecord(decision, actionRecord)
 	case "open_short":
 		return at.executeOpenShortWithRecord(decision, actionRecord)
+	case "add_position":
+		return at.executeAddPositionWithRecord(decision, actionRecord)
 	case "close_long":
 		return at.executeCloseLongWithRecord(decision, actionRecord)
 	case "close_short":
@@ -259,6 +262,132 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 		logger.Infof("  ⚠ Failed to set take profit: %v", err)
 	}
 
+	return nil
+}
+
+// executeAddPositionWithRecord executes same-symbol add-position and records detailed information.
+func (at *AutoTrader) executeAddPositionWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction) error {
+	logger.Infof("  ➕ Add position: %s", decision.Symbol)
+
+	positions, err := at.trader.GetPositions()
+	if err != nil {
+		return fmt.Errorf("failed to get positions: %w", err)
+	}
+
+	var positionSide string
+	currentQty := 0.0
+	currentEntryPrice := 0.0
+	for _, pos := range positions {
+		if pos["symbol"] != decision.Symbol {
+			continue
+		}
+		side, _ := pos["side"].(string)
+		switch strings.ToLower(strings.TrimSpace(side)) {
+		case "long":
+			positionSide = "LONG"
+		case "short":
+			positionSide = "SHORT"
+		}
+		if qty, ok := pos["quantity"].(float64); ok && qty > 0 {
+			currentQty = qty
+		}
+		if entryPrice, ok := pos["entry_price"].(float64); ok && entryPrice > 0 {
+			currentEntryPrice = entryPrice
+		}
+		break
+	}
+	if positionSide == "" {
+		return fmt.Errorf("❌ %s has no existing position to add to", decision.Symbol)
+	}
+
+	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
+	if err != nil {
+		return err
+	}
+	actionRecord.Price = marketData.CurrentPrice
+
+	balance, err := at.trader.GetBalance()
+	if err != nil {
+		return fmt.Errorf("failed to get account balance: %w", err)
+	}
+	availableBalance := 0.0
+	if avail, ok := balance["availableBalance"].(float64); ok {
+		availableBalance = avail
+	}
+
+	equity := 0.0
+	if eq, ok := balance["totalEquity"].(float64); ok && eq > 0 {
+		equity = eq
+	} else if eq, ok := balance["totalWalletBalance"].(float64); ok && eq > 0 {
+		equity = eq
+	} else {
+		equity = availableBalance
+	}
+
+	adjustedPositionSize, wasCapped := at.enforcePositionValueRatio(decision.PositionSizeUSD, equity, decision.Symbol)
+	if wasCapped {
+		decision.PositionSizeUSD = adjustedPositionSize
+	}
+
+	marginFactor := 1.01/float64(decision.Leverage) + 0.001
+	maxAffordablePositionSize := availableBalance / marginFactor
+	actualPositionSize := decision.PositionSizeUSD
+	if actualPositionSize > maxAffordablePositionSize {
+		adjustedSize := maxAffordablePositionSize * 0.98
+		logger.Infof("  ⚠️ Add position size %.2f exceeds max affordable %.2f, auto-reducing to %.2f",
+			actualPositionSize, maxAffordablePositionSize, adjustedSize)
+		actualPositionSize = adjustedSize
+		decision.PositionSizeUSD = actualPositionSize
+	}
+
+	if err := at.enforceMinPositionSize(decision.PositionSizeUSD); err != nil {
+		return err
+	}
+
+	quantity := actualPositionSize / marketData.CurrentPrice
+	actionRecord.Quantity = quantity
+
+	if err := at.trader.SetMarginMode(decision.Symbol, at.config.IsCrossMargin); err != nil {
+		logger.Infof("  ⚠️ Failed to set margin mode: %v", err)
+	}
+
+	if at.scaleInManager == nil {
+		return fmt.Errorf("scale-in manager is not configured")
+	}
+
+	profile, err := at.store.StrategyProfile().GetByTraderID(at.id)
+	if err != nil {
+		return err
+	}
+	if profile == nil {
+		return fmt.Errorf("strategy profile is required for add_position")
+	}
+
+	aggregate := &store.PositionAggregate{
+		TraderID:          at.id,
+		Symbol:            market.Normalize(decision.Symbol),
+		Side:              positionSide,
+		TotalQty:          currentQty,
+		AvgEntryPrice:     currentEntryPrice,
+		ExecutionEligible: true,
+	}
+
+	plan, err := at.scaleInManager.EnsureScaleInPlanForAggregate(aggregate, profile, &ScaleInPlanConfig{
+		FixedQty:     quantity,
+		TargetType:   "market",
+		Leverage:     decision.Leverage,
+		LevelRatios:  []float64{1},
+		TargetPrices: []float64{marketData.CurrentPrice},
+	}, equity)
+	if err != nil {
+		return err
+	}
+
+	logger.Infof("  ✓ Add position plan submitted successfully: plan=%s symbol=%s side=%s qty=%.4f status=%s",
+		plan.ScaleInPlanID, plan.Symbol, plan.Side, quantity, plan.Status)
+
+	posKey := decision.Symbol + "_" + strings.ToLower(positionSide)
+	at.positionFirstSeenTime[posKey] = time.Now().UnixMilli()
 	return nil
 }
 

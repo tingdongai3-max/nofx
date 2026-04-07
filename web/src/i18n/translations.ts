@@ -406,7 +406,7 @@ export const translations = {
     pleaseSelectModel: 'Please select a model',
     customBaseURL: 'Base URL (Optional)',
     customBaseURLPlaceholder:
-      'Custom API base URL, e.g.: https://api.openai.com/v1',
+      'Custom API base URL, e.g.: https://api.openai.com/v1 or https://api.minimax.io/anthropic',
     leaveBlankForDefault: 'Leave blank to use default API address',
     modelConfigInfo1:
       '• For official API, only API Key is required, leave other fields blank',
@@ -1740,7 +1740,7 @@ export const translations = {
     selectModel: '选择AI模型',
     pleaseSelectModel: '请选择模型',
     customBaseURL: 'Base URL (可选)',
-    customBaseURLPlaceholder: '自定义API基础URL，如: https://api.openai.com/v1',
+    customBaseURLPlaceholder: '自定义API基础URL，如: https://api.openai.com/v1 或 https://api.minimax.io/anthropic',
     leaveBlankForDefault: '留空则使用默认API地址',
     modelConfigInfo1: '• 使用官方 API 时，只需填写 API Key，其他字段留空即可',
     modelConfigInfo2:
